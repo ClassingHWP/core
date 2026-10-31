@@ -9,7 +9,7 @@ The C++ document engine of ClassingHWP, a browser-based viewer and editor for Ha
 ## 바로 써 보기
 
 - 편집기: https://ede.kr/hwp/editor
-- 보기 전용: https://ede.kr/hwp/viewer
+- 보기 전용: [https://ede.kr/hwp/viewer](https://ede.kr/hwp/viewer?file=/hwp/samples/math-curriculum.hwp)
 
 두 화면의 쓰는 법과 다른 페이지에 넣는 법은 [ClassingHWP/web](https://github.com/ClassingHWP/web#보기-전용과-편집기) 에 있다.
 
