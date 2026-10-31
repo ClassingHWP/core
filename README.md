@@ -11,9 +11,35 @@ The C++ document engine of ClassingHWP, a browser-based viewer and editor for Ha
 - 편집기: https://ede.kr/hwp/editor
 - 보기 전용: https://ede.kr/hwp/viewer
 
-## 미리 빌드한 WebAssembly
+두 화면의 쓰는 법과 다른 페이지에 넣는 법은 [ClassingHWP/web](https://github.com/ClassingHWP/web#보기-전용과-편집기) 에 있다.
 
-빌드하지 않고 쓰려면 [릴리스](https://github.com/ClassingHWP/core/releases/latest) 의 `classinghwp-wasm-<버전>.zip` 을 받는다. 문서를 열어 쪽을 그리고 글자를 뽑는 예제는 [ClassingHWP/web 의 WASM 사용 예제](https://github.com/ClassingHWP/web#wasm-사용-예제) 에 있다.
+## WASM 사용 예제
+
+엔진은 웹 앱([ClassingHWP/web](https://github.com/ClassingHWP/web))처럼 브라우저에서 바로 부를 수 있다. [examples/wasm/index.html](examples/wasm/index.html) 은 엔진만 불러 문서를 열고, 쪽을 그림으로 그리고, 본문 글자를 뽑는 가장 작은 예제다. 빌드하지 않고 미리 빌드한 엔진으로 돌릴 수 있다.
+
+1. [릴리스](https://github.com/ClassingHWP/core/releases/latest) 에서 `classinghwp-wasm-<버전>.zip` 을 받아 `examples/wasm/` 에 푼다.
+2. 그 폴더를 정적 서버로 띄우고 브라우저로 연다.
+
+```bash
+npx serve examples/wasm
+```
+
+엔진을 부르는 순서는 이렇다.
+
+```js
+import createNotingModule from "./noting-single.mjs";
+
+const noting = await createNotingModule({ canvas: new OffscreenCanvas(64, 64) });
+noting.setFontCatalog(JSON.stringify(catalog));      // 글꼴 서버의 index.json
+const info = noting.openDocument(bytes);              // info.faces: 문서가 쓰는 글꼴
+noting.decodeFont([face], fontBytes);                 // 그 글꼴들을 받아 넣는다
+const plan = JSON.parse(noting.planDocument(true));   // 쪽 나누기. plan.count 쪽
+noting.warmGlyphs(page, percent);                     // 그 배율의 글자 윤곽 준비
+const frame = noting.renderPagePixels(page, 1100);    // RGBA 픽셀 { width, height, pixels }
+const text = noting.extractText(bytes);               // 본문 글자
+```
+
+`noting-single` 은 단일 스레드 판이라 아무 서버에서나 돈다. 여러 스레드 판(`noting.mjs`)은 페이지가 Cross-Origin-Isolation 헤더(`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` 또는 `credentialless`)를 보내야 한다.
 
 ## 구성
 
@@ -21,6 +47,7 @@ The C++ document engine of ClassingHWP, a browser-based viewer and editor for Ha
 |---|---|
 | `core/` | 문서 엔진. HWP·HWPX 읽기·쓰기, 조판, 그리기(Skia) |
 | `bindings/wasm/` | 엔진을 웹에서 부르는 WebAssembly 바인딩 |
+| `examples/wasm/` | 엔진을 브라우저에서 부르는 예제 |
 | `docs/` | 문서 구조 분석과 설계 메모 |
 | `cmake/` | 빌드 설정과 의존성, Skia GN 설정(`cmake/skia/`) |
 

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ClassingHWP WASM 예제</title>
+  <style>
+    body { margin: 16px; font: 14px/1.5 system-ui, sans-serif; background: #eef1f4; color: #1d2328; }
+    #pages canvas { display: block; margin: 12px auto; max-width: 100%; background: #fff; box-shadow: 0 1px 4px #0003; }
+    #text { white-space: pre-wrap; background: #fff; padding: 12px; max-height: 240px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>ClassingHWP WASM 예제</h1>
+  <p>한글 문서(.hwp, .hwpx)를 고르면 쪽마다 그림으로 그리고 본문 글자를 뽑는다.</p>
+  <input type="file" id="file" accept=".hwp,.hwpx" disabled />
+  <span id="status">엔진을 올리는 중...</span>
+  <h2>본문 글자</h2>
+  <div id="text"></div>
+  <h2>쪽</h2>
+  <div id="pages"></div>
+
+  <script type="module">
+    // 릴리스의 noting-single.mjs, noting-single.wasm, noting-single.data 를 이 파일 옆에 둔다.
+    // 단일 스레드 판이라 Cross-Origin-Isolation 헤더 없이도 돈다.
+    import createNotingModule from "./noting-single.mjs";
+
+    // 글꼴 서버. index.json 이 글꼴 이름 → 파일 경로 목록이다.
+    const fontBase = "https://ede.kr/hwp/fonts/";
+    const status = document.getElementById("status");
+
+    const noting = await createNotingModule({ canvas: new OffscreenCanvas(64, 64) });
+
+    const catalog = await fetch(fontBase + "index.json").then((r) => r.json());
+    noting.setFontCatalog(JSON.stringify(catalog));
+    // 라이선스 때문에 대체 글꼴로 보여 주는 글꼴의 원본 OFL 글꼴 목록. 고칠 때 쓴다.
+    noting.setFontLicenseSwaps(JSON.stringify(await fetch(fontBase + "license-swap.json").then((r) => r.json())));
+    // 이름만 다른 같은 글꼴. 받은 뒤 원래 이름을 이 글꼴로 바꿔 단다.
+    const replace = await fetch(fontBase + "replace.json").then((r) => r.json());
+
+    const loaded = new Set();
+
+    function fontUrl(face) {
+      const path = catalog[face];
+      if (typeof path !== "string") return "";
+      // standin/ 은 대체 글꼴이다. 파일은 full/ 에 같이 있다.
+      const [kind, name] = path.startsWith("standin/") ? ["full", path.slice(8)] : path.split(/\/(.*)/s);
+      return kind === "full" || kind === "metrics" ? fontBase + kind + "/" + encodeURIComponent(name) : "";
+    }
+
+    // 문서가 쓰는 글꼴과 기본 글꼴(함초롬)을 받아 엔진에 넣는다. 조판 전에 끝나야 줄 나눔이 맞다.
+    async function loadFonts(faces) {
+      await Promise.all([...new Set([...faces, "함초롬바탕", "함초롬돋움"])].map(async (face) => {
+        if (loaded.has(face)) return;
+        loaded.add(face);
+        const target = typeof replace[face] === "string" ? replace[face] : face;
+        const url = fontUrl(target);
+        if (!url) return;
+        const response = await fetch(url);
+        if (!response.ok) return;
+        noting.decodeFont([target], new Uint8Array(await response.arrayBuffer()));
+        if (target !== face) noting.replaceFontFace(face, target);
+      }));
+    }
+
+    async function open(bytes) {
+      const info = noting.openDocument(bytes);
+      if (!info.ok) throw new Error(info.error);
+      document.getElementById("text").textContent = noting.extractText(bytes);
+
+      await loadFonts(Array.from(info.faces));
+      const plan = JSON.parse(noting.planDocument(true));
+
+      const pages = document.getElementById("pages");
+      pages.replaceChildren();
+      const pixelHeight = 1100;
+      for (let page = 0; page < plan.count; page += 1) {
+        // 그리기 전에 그 배율의 글자 윤곽을 준비한다. 배율은 100% 가 96dpi 이고, 쪽 높이는 HWPUNIT(1/7200 인치)이다.
+        const percent = Math.round((pixelHeight * 7200 * 100) / (plan.pages[page].height * 96));
+        noting.warmGlyphs(page, percent);
+        // 쪽 높이를 픽셀로 준다. 결과는 RGBA 픽셀이다.
+        const frame = noting.renderPagePixels(page, pixelHeight);
+        const canvas = document.createElement("canvas");
+        canvas.width = frame.width;
+        canvas.height = frame.height;
+        const image = new ImageData(new Uint8ClampedArray(frame.pixels), frame.width, frame.height);
+        canvas.getContext("2d").putImageData(image, 0, 0);
+        pages.append(canvas);
+      }
+      return plan.count;
+    }
+
+    const input = document.getElementById("file");
+    input.disabled = false;
+    status.textContent = "문서를 고르세요.";
+    input.addEventListener("change", async () => {
+      const file = input.files[0];
+      if (!file) return;
+      status.textContent = "여는 중...";
+      try {
+        const count = await open(new Uint8Array(await file.arrayBuffer()));
+        status.textContent = `${file.name}: ${count}쪽`;
+      } catch (error) {
+        status.textContent = `열기 실패: ${error.message || error}`;
+      }
+    });
+  </script>
+</body>
+</html>
