@@ -1,0 +1,18 @@
+build/
+out/
+
+# 글꼴 파일은 올리지 않는다. 웹 앱은 글꼴 서버에서 받는다.
+*.ttf
+*.otf
+*.ttc
+*.otc
+*.woff
+*.woff2
+*.eot
+
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+*.user
+compile_commands.json

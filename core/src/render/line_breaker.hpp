@@ -1,0 +1,257 @@
+#pragma once
+
+// 문단 글자를 줄로 나누는 공용 단계.
+// 쪽 조판(layoutColumn)과 편집 뒤 문단 조판이 같은 규칙으로 줄을 끊는다.
+// 원자 만들기는 글꼴을 고르는 scene.cpp 에 있고, 여기서는 원자를 받아 한 줄씩 채운다.
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "noting/model/document.hpp"
+#include "noting/render/scene.hpp"
+
+namespace noting::render::detail {
+
+inline constexpr std::int32_t kSlack = 0;
+inline constexpr std::int32_t kEm = 1000;
+
+bool isHangul(char32_t cp);
+// 한글 음절과 자모. 줄은 이 글자마다 끊고, 글꼴 선택은 음절만 본다.
+bool isHangulWordChar(char32_t cp);
+bool isCjk(char32_t cp);
+bool isLatinWordChar(char32_t cp);
+bool isSmallKana(char32_t cp);
+// 일반 공백, 전각 공백, U+2000–U+200B. 넘어도 그 글자 앞에서 끊지 않는다.
+bool isOverflowGap(char32_t cp);
+// 줄 머리에 두면 안 되는 글자. 줄이 이미 꽉 찼으면 넘쳐도 그 줄에 남긴다.
+bool lineHeadForbidden(char32_t cp);
+void appendUtf8(std::string& out, char32_t cp);
+
+// scene.cpp. 글자 모양의 색·굵기·밑줄을 노드에 옮긴다.
+void paintCharStyle(Node& node, const model::Document& doc, std::uint32_t charShapeId);
+
+struct Atom {
+    char32_t cp = 0;
+    std::int32_t width = 0;
+    int pos = 0;
+    int fontSize = 0;
+    std::uint32_t charShapeId = 0;
+    std::string font;
+    std::int32_t ratio = 100;
+    std::int32_t relSize = 100;
+    std::int32_t spacing = 0;
+    std::int32_t charOffset = 0;
+    std::string markpen;
+    bool space = false;
+    bool tab = false;
+    std::string tabLeader;
+    bool hard = false;
+    bool breakBefore = true;
+    // 머리말·꼬리말·쪽 번호. 본문에는 그리지 않고, 줄에 이미 내용이 있게 만든다.
+    bool occupiesLine = false;
+    std::string noteText;  // 각주·미주 번호. 비어 있으면 본문에 글자를 두지 않는다
+    int inkSize = 0;       // 번호를 그리는 크기. 0이면 fontSize
+    std::int32_t trail = 0;
+    const model::Control* control = nullptr;
+    bool metricsReady = false;
+    bool ignoreSpacing = false;
+};
+
+// 앞 원자를 보고 이 글자 앞에서 줄을 끊을 수 있는지 정한다.
+class BreakClassifier {
+public:
+    explicit BreakClassifier(const model::ParaShape* paraShape);
+    // 글자 원자. atoms 는 아직 이 원자를 넣기 전이다.
+    void classify(Atom& atom, const std::vector<Atom>& atoms);
+    // 개체·번호처럼 글자가 아닌 원자는 영문 단어를 끊는다.
+    void endWord() { latinRun_ = false; }
+
+private:
+    bool latinChar_ = false;
+    bool hyphen_ = false;
+    bool latinRun_ = false;
+};
+
+// 모양이 같은 글자를 Span 하나로 모은다. 모양이 바뀌면 앞 조각을 내보낸다.
+class SpanBuilder {
+public:
+    SpanBuilder(const model::Document& doc, std::vector<Node>& out, bool keepAdvances = true)
+        : doc_(doc), out_(out), keepAdvances_(keepAdvances) {}
+    bool empty() const { return text_.empty(); }
+    void add(const Atom& atom);
+    void flush();
+
+private:
+    const model::Document& doc_;
+    std::vector<Node>& out_;
+    bool keepAdvances_ = true;
+    std::string text_;
+    std::vector<std::int32_t> widths_;
+    std::vector<std::int32_t> inks_;
+    int size_ = 0;
+    std::uint32_t shape_ = 0;
+    std::string font_;
+    std::int32_t ratio_ = 100;
+    std::int32_t rel_ = 100;
+    std::int32_t offset_ = 0;
+    std::int32_t spacing_ = 0;
+    std::string markpen_;
+};
+
+// 탭·빈칸처럼 글자 하나로 된 Span.
+Node glyphSpan(const model::Document& doc, const Atom& atom, const std::string& text);
+
+struct TabMove {
+    std::int32_t width = 0;
+    std::string leader;
+};
+
+// 문단의 탭 정의. 위치는 본문 왼쪽 끝 기준이다.
+class TabRuler {
+public:
+    TabRuler(const model::Document& doc, const model::ParaShape* paraShape, std::int32_t marginLeft,
+             std::int32_t contentWidth, std::int32_t bodyRight, std::int32_t defaultTab);
+
+    // at 은 문단 왼쪽 끝 기준 펜이다. 오른쪽·가운데 탭이면 tail() 로 탭 뒤 글 폭을 잰다.
+    template <typename Tail>
+    TabMove advance(std::int32_t at, Tail&& tail) const {
+        TabMove move;
+        const std::int32_t fromEdge = at + marginLeft_;
+        int align = 0;
+        bool found = false;
+        std::int32_t target = 0;
+        for (const auto& place : stops_) {
+            if (place.pos > fromEdge) {
+                target = place.pos;
+                move.leader = place.leader;
+                align = place.align;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (stops_.empty()) target = ((fromEdge / step_) + 1) * step_;
+            else {
+                target = stops_.back().pos;
+                while (target <= fromEdge) target += step_;
+            }
+        }
+        if (target < 0) target = 0;
+        if (target > bodyRight_) target = bodyRight_;
+        move.width = std::max<std::int32_t>(0, target - fromEdge);
+        if (found && align != 0) {
+            const std::int32_t rest = tail();
+            if (align == 1) move.width -= rest;
+            else move.width -= rest / 2;
+            if (move.width < 0) move.width = 0;
+        }
+        return move;
+    }
+
+    // 저장된 줄의 탭은 그릴 때 정한다. 그때 쓸 탭 정의를 줄에 남긴다.
+    void deferTo(Node& line) const;
+
+private:
+    struct Stop {
+        std::int32_t pos = 0;
+        int align = 0;  // 0 왼쪽, 1 오른쪽, 2 가운데
+        std::string leader;
+    };
+    std::vector<Stop> stops_;
+    std::int32_t marginLeft_ = 0;
+    std::int32_t bodyRight_ = 0;
+    std::int32_t step_ = 4000;
+};
+
+// 줄 채우기가 부르는 쪽 정보.
+class LineHost {
+public:
+    virtual ~LineHost() = default;
+    // 폭을 아직 재지 않은 원자를 잰다.
+    virtual void measure(Atom& atom) = 0;
+    // 글자처럼 취급한 개체 노드. 가로 위치는 pen 이다.
+    virtual Node inlineObject(const Atom& atom, std::int32_t pen) = 0;
+};
+
+template <typename Measure, typename Object>
+class LineHostFor final : public LineHost {
+public:
+    LineHostFor(Measure measure, Object object) : measure_(std::move(measure)), object_(std::move(object)) {}
+    void measure(Atom& atom) override { measure_(atom); }
+    Node inlineObject(const Atom& atom, std::int32_t pen) override { return object_(atom, pen); }
+
+private:
+    Measure measure_;
+    Object object_;
+};
+
+template <typename Measure, typename Object>
+LineHostFor<Measure, Object> makeLineHost(Measure measure, Object object) {
+    return LineHostFor<Measure, Object>(std::move(measure), std::move(object));
+}
+
+using Gap = std::pair<std::int32_t, std::int32_t>;
+
+struct LineSpec {
+    const model::Document* doc = nullptr;
+    const model::ParaShape* paraShape = nullptr;
+    const TabRuler* tabs = nullptr;
+    std::vector<Gap> gaps;  // 글을 놓을 수 있는 가로 칸. 하나 이상이다
+    // 저장된 줄(lineseg)대로 끊는다. 폭은 재지 않고 lineLimit 앞에서 줄을 끝낸다.
+    bool storedBreaks = false;
+    int lineLimit = std::numeric_limits<int>::max();
+    bool deferText = false;     // 글자 Span 은 그 쪽을 그릴 때 채운다
+    bool keepAdvances = true;   // Span 에 글자별 advance 를 남긴다
+    int firstPos = -1;          // 줄 시작 글자 위치를 미리 안다면 그 값
+};
+
+struct LineFill {
+    Node line;
+    std::size_t gapIndex = 0;
+    std::int32_t lineX = 0;
+    int start = -1;
+    int end = 0;
+    std::int32_t textHeight = 0;
+    std::int32_t shapeHeight = 0;  // 개체까지 넣은 그 줄 글자 모양 중 가장 큰 크기. 줄 간격을 정한다
+    bool endedByLineBreak = false;
+    std::string text;
+};
+
+// cursor 부터 한 줄을 채운다. 끝나면 cursor 는 다음 줄 첫 원자다.
+// fill.line 은 종류·문단·y·글꼴 같은 머리 값만 채워 넘긴다. 나머지 fill 값은 여기서 정한다.
+// 개체 안 조판이 이 함수를 거쳐 다시 들어오므로 Node 를 값으로 주고받지 않는다. WASM 스택은 작다.
+void fillLine(const LineSpec& spec, std::vector<Atom>& atoms, std::size_t& cursor, LineFill& fill, LineHost& host);
+
+// 채운 줄에 x·글자 범위·글자 상자를 적는다. 개체 x 는 줄 기준으로 바꾼다. 글자 상자 높이를 돌려준다.
+std::int32_t closeLine(LineFill& fill);
+
+// 같은 글자에서 줄을 못 만들고 맴돌 때 그 글자 하나만 담은 줄. 위치·높이는 부르는 쪽이 정한다.
+Node singleAtomLine(const model::Document& doc, const Atom& atom, Node object);
+
+// 글꼴에 어울리는 줄 높이. 글자마다 글꼴의 위·아래 상자를 재고,
+// 줄의 기준선과 글자 상자는 그 줄 글자 중 가장 큰 값이다. 글자가 없으면 기준선이 음수.
+struct SpanFontBox {
+    std::int32_t baseline = -1;
+    std::int32_t height = 0;
+};
+SpanFontBox spanFontBox(const std::vector<Node>& spans);
+// 켜져 있으면 줄 기준선을 그 값으로 두고, 글자 상자는 글자 크기와 그 상자 중 큰 값으로 올린다.
+// 비율 줄간격의 추가분은 이 글자 상자에 비율을 곱하므로 함께 바뀐다.
+void applyFontBaseline(Node& line, const model::ParaShape* paraShape);
+
+// 글자처럼 취한 개체와 캡션이 줄 밖으로 나간 만큼 줄 비트맵을 늘린다. 다음 줄 자리는 그대로다.
+void markInlineOverflow(Node& line);
+
+// 편집으로 글자 위치가 밀린 줄. 머리 표시는 그대로 둔다.
+void shiftSpanOffsets(Node& line, int delta);
+void shiftLineOffsets(Node& line, int delta);
+
+void placeOccupyingNote(Node& line, const Atom& atom, const model::Document& doc, std::int32_t& pen,
+                        std::string& lineText);
+
+}  // namespace noting::render::detail
