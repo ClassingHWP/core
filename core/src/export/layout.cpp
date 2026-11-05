@@ -14,18 +14,13 @@
 #include <unordered_set>
 #include <utility>
 
-#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
 #include <thread>
-#endif
-#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
-#include <emscripten/threading.h>
-#endif
 
-namespace noting::layout {
+namespace chwp::layout {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 bool nextCodePoint(std::string_view text, std::size_t& index, char32_t& out) {
     if (index >= text.size()) return false;
@@ -1317,22 +1312,30 @@ void measureParagraph(const Document& doc, const Paragraph& para, ScaleMap& seen
     }
 }
 
+namespace {
+// 셸 Host 가 정적 초기화 중에 넣을 수 있으니 상수로 초기화되는 원자 값이다.
+std::atomic<int> gWorkerCores{-1};
+std::atomic<int> gWorkerMin{8};
+std::atomic<int> gWorkerMax{0};
+}  // namespace
+
+void setWorkerLimits(const WorkerLimits& limits) {
+    gWorkerCores.store(limits.cores);
+    gWorkerMin.store(std::max(1, limits.minWorkers));
+    gWorkerMax.store(std::max(0, limits.maxWorkers));
+}
+
 int workerCount(int jobs) {
     if (jobs <= 1) return 1;
-#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-    return 1;
-#else
-    unsigned cores = std::thread::hardware_concurrency();
-#if defined(__EMSCRIPTEN__)
-    const int logical = emscripten_num_logical_cores();
-    if (logical > 0) cores = static_cast<unsigned>(logical);
-    const int coreCount = cores == 0 ? 4 : static_cast<int>(cores);
-    return std::min(std::clamp(coreCount - 1, 1, 3), jobs);
-#else
-    const int coreCount = cores == 0 ? 8 : static_cast<int>(cores);
-    return std::min(std::max(8, coreCount - 1), jobs);
-#endif
-#endif
+    int cores = gWorkerCores.load();
+    if (cores == 0) return 1;
+    if (cores < 0) {
+        const unsigned hardware = std::thread::hardware_concurrency();
+        cores = hardware == 0 ? 8 : static_cast<int>(hardware);
+    }
+    int workers = std::max(gWorkerMin.load(), cores - 1);
+    if (const int most = gWorkerMax.load(); most > 0) workers = std::min(workers, most);
+    return std::min(workers, jobs);
 }
 
 void prepareParagraphGlyphs(const Document& doc) {
@@ -1365,7 +1368,6 @@ void prepareParagraphGlyphs(const Document& doc) {
         gScaleCacheOn.store(true);
         return;
     }
-#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
     std::vector<ScaleMap> workerMaps(static_cast<std::size_t>(threads));
     std::vector<std::thread> pool;
     pool.reserve(static_cast<std::size_t>(threads));
@@ -1394,7 +1396,6 @@ void prepareParagraphGlyphs(const Document& doc) {
             for (auto& item : map) gScaleCache.emplace(std::move(item.first), item.second);
         }
     }
-#endif
     gScaleCacheOn.store(true);
 }
 
@@ -1430,7 +1431,7 @@ std::vector<std::string> paginate(const Document& doc, const TextOptions& option
     flow.lineRanges = lineRanges;
     int ordinal = 0;
     for (const auto& section : doc.sections) {
-        const PageDef page = section.page.value_or(PageDef{});
+        const PageDef page = section.flowPage(1);
         flow.pageWidth = static_cast<std::int32_t>(page.width);
         flow.pageHeight = static_cast<std::int32_t>(page.height);
         flow.contentWidth = flow.pageWidth - static_cast<std::int32_t>(page.marginLeft) -
@@ -1507,4 +1508,4 @@ model::Lang hancomCharLang(char32_t codePoint, bool drawing) {
     return static_cast<model::Lang>(drawing ? found->drawn : found->plain);
 }
 
-}  // namespace noting::layout
+}  // namespace chwp::layout

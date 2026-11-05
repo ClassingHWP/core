@@ -1,9 +1,14 @@
-#include "noting/render/cache_budget.hpp"
-#include "noting/render/decorate.hpp"
-#include "noting/render/glyph_path.hpp"
-#include "noting/render/paint.hpp"
+#include "chwp/render/cache_budget.hpp"
+#include "chwp/render/decorate.hpp"
+#include "chwp/render/glyph_path.hpp"
+#include "chwp/render/frame_cache.hpp"
+#include "chwp/render/paint.hpp"
+#include "chwp/render/frame_phase.hpp"
+#include "chwp/render/screen_ops.hpp"
+#include "render/screen_op_canvas.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,9 +21,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
 #include <thread>
-#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -31,18 +34,20 @@
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
 #include "miniz.h"
-#include "noting/common/unicode.hpp"
-#include "noting/reader.hpp"
-#include "noting/render/scene.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/unit.hpp"
+#include "chwp/render/scene.hpp"
+#include "chwp/render/view.hpp"
 #include "render/equation_raster.hpp"
+#include "render/line_breaker.hpp"
+#include "render/page_texture_cache.hpp"
 #include "render/paint_detail.hpp"
 #include "render/painter.hpp"
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkBlendMode.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColorFilter.h"
@@ -63,10 +68,14 @@
 #include "include/core/SkVertices.h"
 #include "include/effects/SkColorMatrix.h"
 #include "include/effects/SkRuntimeEffect.h"
-#endif
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
+#if CHWP_HAS_GPU
+#if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
+#else
+#include "dawn/dawn_proc.h"
+#include "dawn/native/DawnNative.h"
+#endif
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -83,7 +92,7 @@
 #include "src/gpu/graphite/RendererProvider.h"
 #endif
 
-namespace noting::render {
+namespace chwp::render {
 
 using namespace paint_detail;
 
@@ -117,9 +126,28 @@ std::list<Face> gOpenFaces;
 std::unordered_map<std::string, Face*> gOpenByName;
 std::shared_mutex gFaceMu;
 
+// 접힌 글꼴을 다시 연다. gFaceMu 를 단독으로 잡고 부른다.
+bool reopenFaceLocked(Face& face) {
+    if (!face.ok) return false;
+    if (!face.folded) return true;
+    const std::string asked = face.fallbackOutline ? std::string("함초롬바탕") : (face.name ? *face.name : std::string());
+    int offset = 0;
+    if (asked.empty() || !layout::fontFaceBytes(asked, face.bytes, offset)) return false;
+    face.info = stbtt_fontinfo{};
+    if (!openFace(face, offset)) {
+        face.bytes.reset();
+        return false;
+    }
+    face.offset = offset;
+    face.folded = false;
+    return true;
+}
+
 Face* openCachedFaceBody(const std::string& key) {
     if (const auto found = gOpenByName.find(key); found != gOpenByName.end()) {
-        return found->second->ok ? found->second : nullptr;
+        Face* face = found->second;
+        if (face->ok && face->folded && !reopenFaceLocked(*face)) return nullptr;
+        return face->ok ? face : nullptr;
     }
     Face face;
     int offset = 0;
@@ -128,6 +156,7 @@ Face* openCachedFaceBody(const std::string& key) {
     gOpenFaces.push_back(std::move(face));
     Face* stored = &gOpenFaces.back();
     stored->ok = have && openFace(*stored, offset);
+    stored->offset = offset;
     if (!stored->ok && key != "함초롬바탕") {
         const layout::FontLoadStep ham("없는글꼴대체");
         (void)ham;
@@ -136,6 +165,7 @@ Face* openCachedFaceBody(const std::string& key) {
         if (layout::fontFaceBytes("함초롬바탕", alt.bytes, altOffset)) {
             *stored = std::move(alt);
             stored->ok = openFace(*stored, altOffset);
+            stored->offset = altOffset;
             stored->fallbackOutline = stored->ok;
         }
     }
@@ -143,6 +173,34 @@ Face* openCachedFaceBody(const std::string& key) {
     (void)inserted;
     stored->name = &it->first;
     return stored->ok ? stored : nullptr;
+}
+
+// 잊은 이름. 옛 Face 는 GlyphMem 이 계속 가리키므로 이름 글을 여기 옮겨 살려 둔다.
+std::list<std::string> gRetiredFaceNames;
+
+// 글꼴이 없어 대체 글꼴로 열었거나 열지 못한 이름을 잊는다. 그 글꼴이 나중에 들어오면 다시 연다.
+// 글꼴이 없을 때 레이아웃은 그 이름에 대체 글꼴 바이트를 주므로, 지금 받는 바이트와 다르면 대체로 연 것이다.
+// 옛 Face 는 리스트에 남겨 둔다(이미 구운 글자가 가리킨다). gFaceMu 를 단독으로 잡고 부른다.
+void forgetMissingFacesLocked() {
+    for (auto it = gOpenByName.begin(); it != gOpenByName.end();) {
+        Face* face = it->second;
+        // 지금 그 이름으로 받는 바이트가 열어 둔 것과 다를 때만 잊는다. 그대로 없는 글꼴은 남겨 둬서
+        // 지울 때마다 새로 열어 쌓이지 않게 한다.
+        bool stale = false;
+        if (!face->folded) {
+            std::shared_ptr<const std::vector<std::uint8_t>> now;
+            int offset = 0;
+            const bool have = layout::fontFaceBytes(it->first, now, offset);
+            stale = face->ok ? (!have || now != face->bytes) : have;
+        }
+        if (!stale) {
+            ++it;
+            continue;
+        }
+        gRetiredFaceNames.push_back(it->first);
+        face->name = &gRetiredFaceNames.back();
+        it = gOpenByName.erase(it);
+    }
 }
 
 
@@ -667,21 +725,21 @@ struct FtSink {
     int upem = 1000;
 };
 
-extern "C" int notingFtMove(const FT_Vector* to, void* user) {
+extern "C" int chwpFtMove(const FT_Vector* to, void* user) {
     auto* sink = static_cast<FtSink*>(user);
     sink->commands->push_back(
         {GlyphVerb::Move, {ftToEm(to->x, sink->upem), ftToEm(to->y, sink->upem)}, {}, {}});
     return 0;
 }
 
-extern "C" int notingFtLine(const FT_Vector* to, void* user) {
+extern "C" int chwpFtLine(const FT_Vector* to, void* user) {
     auto* sink = static_cast<FtSink*>(user);
     sink->commands->push_back(
         {GlyphVerb::Line, {ftToEm(to->x, sink->upem), ftToEm(to->y, sink->upem)}, {}, {}});
     return 0;
 }
 
-extern "C" int notingFtConic(const FT_Vector* control, const FT_Vector* to, void* user) {
+extern "C" int chwpFtConic(const FT_Vector* control, const FT_Vector* to, void* user) {
     auto* sink = static_cast<FtSink*>(user);
     sink->commands->push_back({GlyphVerb::Quad,
                                {ftToEm(to->x, sink->upem), ftToEm(to->y, sink->upem)},
@@ -690,7 +748,7 @@ extern "C" int notingFtConic(const FT_Vector* control, const FT_Vector* to, void
     return 0;
 }
 
-extern "C" int notingFtCubic(const FT_Vector* control1, const FT_Vector* control2, const FT_Vector* to, void* user) {
+extern "C" int chwpFtCubic(const FT_Vector* control1, const FT_Vector* control2, const FT_Vector* to, void* user) {
     auto* sink = static_cast<FtSink*>(user);
     sink->commands->push_back({GlyphVerb::Cubic,
                                {ftToEm(to->x, sink->upem), ftToEm(to->y, sink->upem)},
@@ -707,10 +765,10 @@ bool ftDecompose(FtSlot& slot, char32_t cp, std::vector<GlyphCommand>& commands)
     if (slot.face->glyph->format != FT_GLYPH_FORMAT_OUTLINE) return false;
     FtSink sink{&commands, static_cast<int>(slot.face->units_per_EM)};
     FT_Outline_Funcs funcs{};
-    funcs.move_to = notingFtMove;
-    funcs.line_to = notingFtLine;
-    funcs.conic_to = notingFtConic;
-    funcs.cubic_to = notingFtCubic;
+    funcs.move_to = chwpFtMove;
+    funcs.line_to = chwpFtLine;
+    funcs.conic_to = chwpFtConic;
+    funcs.cubic_to = chwpFtCubic;
     if (FT_Outline_Decompose(&slot.face->glyph->outline, &funcs, &sink) != 0) {
         commands.clear();
         return false;
@@ -789,15 +847,57 @@ bool designedBoldFace(const std::string& face, bool bold) {
     return designed;
 }
 
+// 기울임·합성 굵기를 입히기 전 윤곽(1000 em). 글꼴 파일에서 한 번만 뽑고, 글꼴을 접어도 여기서 스타일을 입힌다.
+struct BaseOutlineKey {
+    const Face* face = nullptr;
+    char32_t cp = 0;
+    int index = 0;
+    bool heavy = false;  // 굵은 파일에서 뽑은 윤곽
+    bool operator<(const BaseOutlineKey& other) const {
+        if (face != other.face) return face < other.face;
+        if (cp != other.cp) return cp < other.cp;
+        if (index != other.index) return index < other.index;
+        return !heavy && other.heavy;
+    }
+};
+
+std::map<BaseOutlineKey, std::vector<GlyphCommand>> gBaseOutlines;
+
+std::vector<GlyphCommand> baseGlyphCommands(const GlyphMem* mem, bool bold, bool designedBold) {
+    const BaseOutlineKey key{mem->face, mem->cp, mem->index, bold && designedBold};
+    {
+        std::shared_lock lock(gOutlineMu);
+        if (const auto found = gBaseOutlines.find(key); found != gBaseOutlines.end()) return found->second;
+    }
+    std::vector<GlyphCommand> commands;
+    {
+        // 뽑는 동안 글꼴이 접히지 않게 잡는다. 접혀 있으면 먼저 다시 연다.
+        std::shared_lock faceLock(gFaceMu);
+        if (mem->face->folded) {
+            faceLock.unlock();
+            {
+                std::unique_lock reopen(gFaceMu);
+                reopenFaceLocked(*mem->face);
+            }
+            faceLock.lock();
+        }
+        const std::string& face = glyphFaceName(mem);
+        if (!ftCommands(face, mem->cp, bold, designedBold, commands) && !mem->face->folded) {
+            commands = commandsFromGlyph(&mem->face->info, mem->index);
+        }
+    }
+    std::unique_lock lock(gOutlineMu);
+    const auto [it, _] = gBaseOutlines.emplace(key, std::move(commands));
+    return it->second;
+}
+
 std::vector<GlyphCommand> styledGlyphCommands(const GlyphMem* mem, bool bold, bool italic, int ppem) {
     std::vector<GlyphCommand> commands;
     if (!mem || !mem->face) return commands;
     const std::string& face = glyphFaceName(mem);
     const bool designedBold = designedBoldFace(face, bold);
     const int syntheticPpem = bold && !designedBold && ppem > 0 ? ppem : 0;
-    if (ftCommands(face, mem->cp, bold, designedBold, commands))
-        return styleGlyphCommands(std::move(commands), italic, syntheticPpem);
-    return styleGlyphCommands(commandsFromGlyph(&mem->face->info, mem->index), italic, syntheticPpem);
+    return styleGlyphCommands(baseGlyphCommands(mem, bold, designedBold), italic, syntheticPpem);
 }
 
 const std::vector<GlyphCommand>& hangulCommands(const GlyphMem* mem, bool bold, bool italic, int ppem) {
@@ -822,7 +922,6 @@ void clearHangulCommands() {
     gCommands.clear();
 }
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
 std::map<OutlineKey, std::vector<GlyphCommand>> gCurves;
 
 // GPU 경로는 곡선을 펴지 않는다. 키는 글꼴, 글리프, 굵기, 기울임, 합성 굵기 픽셀 크기다.
@@ -869,93 +968,22 @@ SkPath glyphPath(const std::vector<GlyphCommand>& commands, float emPx, int rati
     }
     return path.detach();
 }
-#endif
 
-std::vector<std::vector<GlyphPoint>> contoursFromCommands(const std::vector<GlyphCommand>& commands) {
-    std::vector<std::vector<GlyphPoint>> out;
-    std::vector<GlyphPoint> contour;
-    auto flush = [&]() {
-        if (contour.size() >= 2) out.push_back(std::move(contour));
-        contour.clear();
-    };
-    for (const GlyphCommand& command : commands) {
-        if (command.verb == GlyphVerb::Move) {
-            flush();
-            contour.push_back(command.to);
-            continue;
-        }
-        if (command.verb != GlyphVerb::Line) return flattenHangulGlyph(commands, false, 0);
-        contour.push_back(command.to);
+std::vector<std::uint8_t> glyphAlpha(const std::vector<GlyphCommand>& commands, float emPx, float penX, float baseY,
+                                     int width, int height) {
+    Painter painter;
+    painter.bitmap.width = width;
+    painter.bitmap.height = height;
+    painter.bitmap.clipR = width;
+    painter.bitmap.clipB = height;
+    // 흰 바탕에 검게 칠해 어두워진 만큼을 알파로 읽는다.
+    painter.bitmap.px.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u, 255);
+    painter.paintGlyph(commands, emPx, 100, 1000, 1000, penX, baseY, 0, 0, 0);
+    std::vector<std::uint8_t> alpha(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (std::size_t i = 0; i < alpha.size(); ++i) {
+        alpha[i] = static_cast<std::uint8_t>(255 - painter.bitmap.px[i * 4u]);
     }
-    flush();
-    return out;
-}
-
-void paintFlatGlyph(Bitmap& bitmap, const std::vector<std::vector<GlyphPoint>>& contours, float emPx, int ratio, int fitX,
-                    int fitY, float penX, float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
-    if (contours.empty() || emPx <= 0.f) return;
-    const float unit = emPx / 1000.f;
-    const float sy = unit * static_cast<float>(std::max(1, fitY)) / 1000.f;
-    const float sx = unit * static_cast<float>(std::max(1, ratio)) / 100.f * static_cast<float>(std::max(1, fitX)) / 1000.f;
-    struct V {
-        float x;
-        float y;
-    };
-    std::vector<std::vector<V>> polys;
-    float minY = 1.e9f;
-    float maxY = -1.e9f;
-    for (const auto& contour : contours) {
-        std::vector<V> poly;
-        poly.reserve(contour.size());
-        for (const GlyphPoint& point : contour) {
-            V v{penX + static_cast<float>(point.x) * sx, baseY - static_cast<float>(point.y) * sy};
-            minY = std::min(minY, v.y);
-            maxY = std::max(maxY, v.y);
-            poly.push_back(v);
-        }
-        if (poly.size() >= 3) polys.push_back(std::move(poly));
-    }
-    if (polys.empty()) return;
-    const int y0 = clampi(static_cast<int>(std::floor(minY)), 0, bitmap.height);
-    const int y1 = clampi(static_cast<int>(std::ceil(maxY)), 0, bitmap.height);
-    struct Hit {
-        float x;
-        int dir;
-    };
-    for (int y = y0; y < y1; ++y) {
-        const float scan = static_cast<float>(y) + 0.5f;
-        std::vector<Hit> hits;
-        for (const auto& poly : polys) {
-            const std::size_t count = poly.size();
-            for (std::size_t i = 0; i < count; ++i) {
-                const V& a = poly[i];
-                const V& c = poly[(i + 1) % count];
-                if (a.y == c.y) continue;
-                const float lo = std::min(a.y, c.y);
-                const float hi = std::max(a.y, c.y);
-                if (scan < lo || scan >= hi) continue;
-                const float t = (scan - a.y) / (c.y - a.y);
-                hits.push_back({a.x + (c.x - a.x) * t, c.y > a.y ? 1 : -1});
-            }
-        }
-        std::stable_sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& c) { return a.x < c.x; });
-        int wind = 0;
-        for (std::size_t i = 0; i < hits.size(); ++i) {
-            if (wind != 0 && i > 0) {
-                const float xa = hits[i - 1].x;
-                const float xb = hits[i].x;
-                const int left = static_cast<int>(std::floor(xa));
-                const int right = static_cast<int>(std::ceil(xb));
-                for (int x = left; x < right; ++x) {
-                    const float cover = std::min(xb, static_cast<float>(x + 1)) - std::max(xa, static_cast<float>(x));
-                    if (cover <= 0.f) continue;
-                    const int alpha = std::min(255, static_cast<int>(cover * 255.f + 0.5f));
-                    blend(bitmap, x, y, r, g, b, static_cast<std::uint8_t>(alpha));
-                }
-            }
-            wind += hits[i].dir;
-        }
-    }
+    return alpha;
 }
 
 // 칸 선은 경계 한가운데라 바깥 절반이 표 상자 밖에 있다. 픽셀로 반올림해도 잘리지 않게 선 굵기만큼 여유를 둔다.
@@ -968,18 +996,19 @@ std::int32_t tableBorderBleed(const Node& node) {
     };
     for (const Node& child : node.children) {
         if (child.kind != NodeKind::Cell) continue;
-        take(child.borderLeft);
-        take(child.borderRight);
-        take(child.borderTop);
-        take(child.borderBottom);
+        take(child.ext().borderLeft);
+        take(child.ext().borderRight);
+        take(child.ext().borderTop);
+        take(child.ext().borderBottom);
     }
     return bleed;
 }
 
 
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-// 웹은 Dawn 네이티브가 아니라 브라우저 WebGPU 장치를 Graphite에 넘긴다.
+#if CHWP_HAS_GPU
+// GPU 장치는 Graphite 에 넘기는 WebGPU 장치 하나다. 웹은 브라우저 WebGPU, 네이티브는 Dawn(D3D12·Metal·Vulkan)이 준다.
+// 플랫폼마다 다른 것은 아래 gpu_platform 의 호출뿐이고, 장치를 고르고 Graphite 를 세우는 차례는 같다.
 // 글자 진행 폭은 여기 없다. 줄 비트맵은 조판 advance로 이미 그려져 있다.
 struct GpuSlot {
     wgpu::Instance instance;
@@ -996,9 +1025,6 @@ struct GpuSlot {
     bool ready = false;
     bool failed = false;
     bool raster = false;
-    int rasterW = 0;
-    int rasterH = 0;
-    std::vector<std::uint8_t> rasterPixels;
     // 경로 테셀레이션이 될 때만 글자 제어점을 GPU에 올린다. 아니면 줄 비트맵이다.
     bool vectors = false;
 };
@@ -1007,6 +1033,87 @@ GpuSlot& gpuSlot() {
     static GpuSlot slot;
     return slot;
 }
+
+namespace gpu_platform {
+
+#if defined(__EMSCRIPTEN__)
+// 화면은 캔버스 표면에 그린다. 표면이 없으면 GPU 화면을 쓰지 않는다.
+constexpr bool kScreenNeedsSurface = true;
+
+bool available() {
+    EM_ASM({
+        if (typeof specialHTMLTargets !== "undefined" && Module["canvas"]) {
+            specialHTMLTargets["!canvas"] = Module["canvas"];
+        }
+    });
+    return EM_ASM_INT({
+               return (typeof navigator !== "undefined" && !!navigator.gpu &&
+                       typeof navigator.gpu.requestAdapter === "function")
+                          ? 1
+                          : 0;
+           }) != 0;
+}
+
+wgpu::Instance makeInstance() { return wgpu::CreateInstance(nullptr); }
+
+wgpu::Surface makeSurface(const wgpu::Instance& instance) {
+    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasDesc;
+    canvasDesc.selector = "!canvas";
+    wgpu::SurfaceDescriptor surfaceDesc;
+    surfaceDesc.nextInChain = &canvasDesc;
+    return instance.CreateSurface(&surfaceDesc);
+}
+
+// 2D 폴백 그림판(캔버스 2d)이 있는가.
+bool rasterTarget() {
+    return EM_ASM_INT({
+               const canvas = Module["canvas"];
+               if (!canvas || typeof canvas.getContext !== "function") return 0;
+               let ctx = canvas._chwp2dCtx;
+               if (!ctx) {
+                   try {
+                       ctx = canvas.getContext("2d");
+                   } catch (e) {
+                       ctx = null;
+                   }
+                   if (ctx) canvas._chwp2dCtx = ctx;
+               }
+               return ctx ? 1 : 0;
+           }) != 0;
+}
+
+// 브라우저가 콜백을 스스로 부른다.
+void pump(const wgpu::Instance&) {}
+#else
+// 창 표면은 셸이 창을 줄 때 붙인다. 창이 없어도(시험·agent) 장치만으로 화면 밖 표면에 그린다.
+constexpr bool kScreenNeedsSurface = false;
+
+bool available() { return true; }
+
+wgpu::Instance makeInstance() {
+    static const bool procsSet = [] {
+        static const DawnProcTable procs = dawn::native::GetProcs();
+        dawnProcSetProcs(&procs);
+        return true;
+    }();
+    (void)procsSet;
+    static const auto kTimedWaitAny = wgpu::InstanceFeatureName::TimedWaitAny;
+    wgpu::InstanceDescriptor desc{};
+    desc.requiredFeatureCount = 1;
+    desc.requiredFeatures = &kTimedWaitAny;
+    return wgpu::CreateInstance(&desc);
+}
+
+wgpu::Surface makeSurface(const wgpu::Instance&) { return nullptr; }
+
+// 2D 화면 그림 목록은 셸이 받는다(screenOpSink). 받을 곳은 presentScreen 이 본다.
+bool rasterTarget() { return true; }
+
+// Dawn 네이티브는 이벤트를 돌려야 콜백이 온다.
+void pump(const wgpu::Instance& instance) { instance.ProcessEvents(); }
+#endif
+
+}  // namespace gpu_platform
 
 bool enableRasterFallback(GpuSlot& slot, const char* reason) {
     slot.recorder.reset();
@@ -1021,23 +1128,10 @@ bool enableRasterFallback(GpuSlot& slot, const char* reason) {
     slot.surfaceH = 0;
     slot.vectors = false;
     slot.failed = true;
-    const int ok = EM_ASM_INT({
-        const canvas = Module["canvas"];
-        if (!canvas || typeof canvas.getContext !== "function") return 0;
-        let ctx = canvas._noting2dCtx;
-        if (!ctx) {
-            try {
-                ctx = canvas.getContext("2d");
-            } catch (e) {
-                ctx = null;
-            }
-            if (ctx) canvas._noting2dCtx = ctx;
-        }
-        return ctx ? 1 : 0;
-    });
-    slot.raster = (ok != 0);
+    noteScreenFailed(true);
+    slot.raster = gpu_platform::rasterTarget();
     slot.ready = slot.raster;
-    std::fprintf(stderr, "[noting] %s -> 2d fallback %s\n", reason ? reason : "Skia Dawn off",
+    std::fprintf(stderr, "[ClassingHWP] %s -> 2d fallback %s\n", reason ? reason : "Skia Dawn off",
                  slot.raster ? "on" : "off");
     return slot.raster;
 }
@@ -1064,43 +1158,29 @@ void finishDawnDevice(wgpu::Device device) {
         enableRasterFallback(slot, "Skia Dawn recorder off");
         return;
     }
-    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasDesc;
-    canvasDesc.selector = "!canvas";
-    wgpu::SurfaceDescriptor surfaceDesc;
-    surfaceDesc.nextInChain = &canvasDesc;
-    slot.surface = slot.instance.CreateSurface(&surfaceDesc);
-    if (!slot.surface) {
+    slot.surface = gpu_platform::makeSurface(slot.instance);
+    if (slot.surface) {
+        wgpu::SurfaceCapabilities caps;
+        slot.surface.GetCapabilities(slot.adapter, &caps);
+        slot.format = caps.formatCount > 0 ? caps.formats[0] : wgpu::TextureFormat::BGRA8Unorm;
+    } else if (gpu_platform::kScreenNeedsSurface) {
         enableRasterFallback(slot, "Skia Dawn surface off");
         return;
     }
-    wgpu::SurfaceCapabilities caps;
-    slot.surface.GetCapabilities(slot.adapter, &caps);
-    slot.format = caps.formatCount > 0 ? caps.formats[0] : wgpu::TextureFormat::BGRA8Unorm;
     slot.raster = false;
     slot.vectors = true;
     slot.ready = true;
-    std::fprintf(stderr, "[noting] Skia Dawn glyph atlas\n");
+    std::fprintf(stderr, "[ClassingHWP] Skia Dawn glyph atlas\n");
 }
 
 bool beginDawnSurface() {
     GpuSlot& slot = gpuSlot();
     if (slot.tried) return slot.ready || !slot.failed;
     slot.tried = true;
-    EM_ASM({
-        if (typeof specialHTMLTargets !== "undefined" && Module["canvas"]) {
-            specialHTMLTargets["!canvas"] = Module["canvas"];
-        }
-    });
-    const int hasWebGpu = EM_ASM_INT({
-        return (typeof navigator !== "undefined" && !!navigator.gpu &&
-                typeof navigator.gpu.requestAdapter === "function")
-                   ? 1
-                   : 0;
-    });
-    if (!hasWebGpu) {
+    if (!gpu_platform::available()) {
         return enableRasterFallback(slot, "Skia Dawn navigator.gpu off");
     }
-    slot.instance = wgpu::CreateInstance(nullptr);
+    slot.instance = gpu_platform::makeInstance();
     if (!slot.instance) {
         return enableRasterFallback(slot, "Skia Dawn instance off");
     }
@@ -1111,24 +1191,31 @@ bool beginDawnSurface() {
         [](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
             GpuSlot& slot = gpuSlot();
             if (status != wgpu::RequestAdapterStatus::Success || !adapter) {
-                std::fprintf(stderr, "[noting] Skia Dawn adapter off (status=%d, msg=%.*s)\n",
+                std::fprintf(stderr, "[ClassingHWP] Skia Dawn adapter off (status=%d, msg=%.*s)\n",
                              static_cast<int>(status), static_cast<int>(message.length),
                              message.data ? message.data : "");
                 enableRasterFallback(slot, "Skia Dawn adapter off");
+                return;
+            }
+            // Null 은 그리지 않는 장치다(Vulkan 드라이버를 못 연 리눅스 등). GPU 가 없는 것으로 보고 CPU 로 그린다.
+            wgpu::AdapterInfo adapterInfo;
+            adapter.GetInfo(&adapterInfo);
+            if (adapterInfo.backendType == wgpu::BackendType::Null) {
+                enableRasterFallback(slot, "Skia Dawn null adapter");
                 return;
             }
             slot.adapter = std::move(adapter);
             wgpu::DeviceDescriptor deviceDesc;
             deviceDesc.SetUncapturedErrorCallback(
                 [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView errMsg) {
-                    std::fprintf(stderr, "[noting] WebGPU uncaptured error (type=%d): %.*s\n",
+                    std::fprintf(stderr, "[ClassingHWP] WebGPU uncaptured error (type=%d): %.*s\n",
                                  static_cast<int>(type), static_cast<int>(errMsg.length),
                                  errMsg.data ? errMsg.data : "");
                 });
             deviceDesc.SetDeviceLostCallback(
                 wgpu::CallbackMode::AllowSpontaneous,
                 [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView lostMsg) {
-                    std::fprintf(stderr, "[noting] WebGPU device lost (reason=%d): %.*s\n",
+                    std::fprintf(stderr, "[ClassingHWP] WebGPU device lost (reason=%d): %.*s\n",
                                  static_cast<int>(reason), static_cast<int>(lostMsg.length),
                                  lostMsg.data ? lostMsg.data : "");
                 });
@@ -1136,7 +1223,7 @@ bool beginDawnSurface() {
                 &deviceDesc, wgpu::CallbackMode::AllowSpontaneous,
                 [](wgpu::RequestDeviceStatus status, wgpu::Device device, wgpu::StringView devMsg) {
                     if (status != wgpu::RequestDeviceStatus::Success) {
-                        std::fprintf(stderr, "[noting] Skia Dawn device off (status=%d, msg=%.*s)\n",
+                        std::fprintf(stderr, "[ClassingHWP] Skia Dawn device off (status=%d, msg=%.*s)\n",
                                      static_cast<int>(status), static_cast<int>(devMsg.length),
                                      devMsg.data ? devMsg.data : "");
                         enableRasterFallback(gpuSlot(), "Skia Dawn device off");
@@ -1145,6 +1232,10 @@ bool beginDawnSurface() {
                     finishDawnDevice(std::move(device));
                 });
         });
+    // 네이티브는 콜백이 끝날 때까지 이벤트를 돌린다. 웹은 브라우저가 나중에 부르므로 곧바로 돌아간다.
+    for (int spin = 0; spin < 2000 && !slot.ready && !slot.failed && !gpu_platform::kScreenNeedsSurface; ++spin) {
+        gpu_platform::pump(slot.instance);
+    }
     return true;
 }
 
@@ -1164,12 +1255,36 @@ void clearDawnSlot() {
     slot.ready = false;
     slot.failed = false;
     slot.raster = false;
-    slot.rasterW = 0;
-    slot.rasterH = 0;
-    slot.rasterPixels.clear();
     slot.vectors = false;
+    noteScreenFailed(false);
 }
+#endif
 
+// 화면 사각형. 그리는 쪽은 SkRect 로 옮겨 쓴다.
+struct GlyphRect {
+    float l = 0.f;
+    float t = 0.f;
+    float r = 0.f;
+    float b = 0.f;
+    static GlyphRect xywh(float x, float y, float w, float h) { return GlyphRect{x, y, x + w, y + h}; }
+    float width() const { return r - l; }
+    float height() const { return b - t; }
+    bool empty() const { return !(l < r && t < b); }
+    bool intersects(float left, float top, float right, float bottom) const {
+        return !empty() && l < right && left < r && t < bottom && top < b;
+    }
+    void join(const GlyphRect& other) {
+        if (other.empty()) return;
+        if (empty()) {
+            *this = other;
+            return;
+        }
+        l = std::min(l, other.l);
+        t = std::min(t, other.t);
+        r = std::max(r, other.r);
+        b = std::max(b, other.b);
+    }
+};
 
 struct SpriteMaskState {
     int zoom = 0;
@@ -1189,12 +1304,15 @@ struct LocalGlyphQuad {
     float bearingY = 0.f;
     int drawnPpem = 0;
     int unclampedWant = 0;
-    SkRect tex{};
-    SkColor color = 0;
+    GlyphRect tex;
+    std::uint32_t color = 0;
     int atlasPage = 0;
     std::uint64_t seq = 0;
     std::uint32_t glyphIndex = 0;
     bool stretched = false;
+    bool turn = false;  // 세로쓰기에서 눕힌 글자. 펜을 축으로 시계 방향 90° 돌려 찍는다
+    float penRelX = 0.f;
+    float penRelY = 0.f;
 };
 
 struct CachedSpriteQuads {
@@ -1215,8 +1333,8 @@ struct CachedSpriteQuads {
 
 void clearScreenGlyphs();
 
-std::unordered_map<int, std::vector<FrameGlyph>>& frameGlyphs() {
-    static std::unordered_map<int, std::vector<FrameGlyph>> glyphs;
+std::unordered_map<int, FrameGlyphs>& frameGlyphs() {
+    static std::unordered_map<int, FrameGlyphs> glyphs;
     return glyphs;
 }
 
@@ -1245,13 +1363,26 @@ std::mutex& frameGlyphMutex() {
     return mu;
 }
 
-bool screenVectors() { return !gpuSlot().failed; }
+namespace {
+// 화면이 글자·그림·테두리를 칸 비트맵 대신 직접 그리는가. 셸이 Host 로 켜고, GPU 를 못 쓰게 되면 끈다.
+std::atomic<bool> gScreenVectors{false};
+std::atomic<bool> gScreenFailed{false};
+}  // namespace
 
-void storeFrameGlyphs(int id, std::vector<FrameGlyph> glyphs) {
+bool screenVectors() { return gScreenVectors.load() && !gScreenFailed.load(); }
+
+ScreenOpSink& screenOpSink() {
+    static ScreenOpSink sink;
+    return sink;
+}
+void enableScreenVectors(bool on) { gScreenVectors.store(on); }
+void noteScreenFailed(bool failed) { gScreenFailed.store(failed); }
+
+void storeFrameGlyphs(int id, FrameGlyphs glyphs) {
     std::lock_guard lock(frameGlyphMutex());
     spriteMaskReady().erase(id);
     cachedSpriteQuads().erase(id);
-    if (id == 0 || glyphs.empty()) {
+    if (id == 0 || glyphs.glyphs.empty()) {
         frameGlyphs().erase(id);
         return;
     }
@@ -1276,8 +1407,6 @@ void clearFrameGlyphs() {
     clearFrameBorders();
 }
 
-#endif
-
 
 std::string linePlaceKey(const FrameDesc& frame) {
     std::string key = std::to_string(frame.page) + "/" + std::to_string(frame.kind);
@@ -1285,13 +1414,16 @@ std::string linePlaceKey(const FrameDesc& frame) {
     return key;
 }
 
-struct HashedLinePlaces {
+// 한 줄 칸에 적어 둔 글자 자리. 글자 offset 은 lineStart 에서 시작한 줄의 문단 안 위치다.
+// 칸 키와 내용 해시 두 표가 같은 자리를 함께 가리킨다.
+struct LinePlaces {
     int lineStart = -1;
     std::vector<GlyphSpot> spots;
 };
+using SharedLinePlaces = std::shared_ptr<const LinePlaces>;
 
-std::unordered_map<std::uint64_t, HashedLinePlaces>& linePlacesByHash() {
-    static std::unordered_map<std::uint64_t, HashedLinePlaces> byHash;
+std::unordered_map<std::uint64_t, SharedLinePlaces>& linePlacesByHash() {
+    static std::unordered_map<std::uint64_t, SharedLinePlaces> byHash;
     return byHash;
 }
 
@@ -1300,8 +1432,8 @@ std::unordered_set<std::string>& linePlaceSeen() {
     return seen;
 }
 
-std::unordered_map<std::string, std::vector<GlyphSpot>>& linePlaces() {
-    static std::unordered_map<std::string, std::vector<GlyphSpot>> places;
+std::unordered_map<std::string, SharedLinePlaces>& linePlaces() {
+    static std::unordered_map<std::string, SharedLinePlaces> places;
     return places;
 }
 
@@ -1311,16 +1443,6 @@ std::unordered_map<int, std::unordered_set<std::string>>& linePlacePages() {
 }
 
 
-
-std::map<const Node*, SpanMeasure>& spanMeasures() {
-    static std::map<const Node*, SpanMeasure> measures;
-    return measures;
-}
-
-std::map<const Node*, TabMeasure>& tabMeasures() {
-    static std::map<const Node*, TabMeasure> measures;
-    return measures;
-}
 
 std::unordered_map<std::string, std::unordered_map<char32_t, GlyphMem*>>& resolvedFaces() {
     static std::unordered_map<std::string, std::unordered_map<char32_t, GlyphMem*>> faces;
@@ -1363,8 +1485,13 @@ GlyphMem* glyphMemory(const std::string& font, char32_t cp) {
     std::unique_lock lock(gFaceMu);
     auto& known = resolvedFaces()[font];
     if (const auto cached = known.find(cp); cached != known.end()) return cached->second;
-    auto has = [](Face* face, char32_t code, int& index) {
-        if (!face) return false;
+    auto has = [&font](Face* face, char32_t code, int& index) {
+        if (face && face->folded) {
+            // 접은 글꼴을 그리기가 다시 연다. 미리 뽑지 못한 글자라 어떤 글자인지 남긴다.
+            std::printf("{\"글꼴다시열기그리기\":\"%s\",\"코드\":%u}\n", font.c_str(), static_cast<unsigned>(code));
+            std::fflush(stdout);
+        }
+        if (!face || !reopenFaceLocked(*face)) return false;
         index = stbtt_FindGlyphIndex(&face->info, static_cast<int>(code));
         return index != 0;
     };
@@ -1392,7 +1519,14 @@ GlyphMem* glyphMemory(const std::string& font, char32_t cp) {
         known.emplace(cp, nullptr);
         return nullptr;
     }
-    gGlyphMem.push_back(GlyphMem{face, index, cp, fitX, fitY});
+    float advance1000 = 0.f;
+    if (reopenFaceLocked(*face)) {
+        int adv = 0;
+        int lsb = 0;
+        stbtt_GetGlyphHMetrics(&face->info, index, &adv, &lsb);
+        advance1000 = static_cast<float>(adv) * stbtt_ScaleForMappingEmToPixels(&face->info, 1000.f);
+    }
+    gGlyphMem.push_back(GlyphMem{face, index, cp, fitX, fitY, advance1000});
     GlyphMem* mem = &gGlyphMem.back();
     known.emplace(cp, mem);
     return mem;
@@ -1500,32 +1634,15 @@ void clearDocumentGlyphs() {
 // 줄 캐시로 가른 글자 폭. 쪽을 쌓을 때는 비어 있고, 처음 그릴 때 재서 여기 남긴다.
 std::shared_mutex gSpanMu;
 
-bool spanMeasureMatches(const SpanMeasure& measured, const Node& slot, int size, int ratio) {
-    return measured.text == slot.text && measured.charShapeId == slot.charShapeId && measured.fontSize == size &&
-           measured.ratio == ratio;
-}
-
-const SpanMeasure& rememberSpanMeasure(const Node& slot, const model::Document* doc) {
+void measureText(const model::Document* doc, std::string_view text, std::uint32_t charShapeId, int size, int ratio,
+                 std::vector<std::int32_t>& advances, std::vector<std::int32_t>& inks) {
     layout::retainGlyphScaleCache();
-    const int size = slot.fontSize > 0 ? slot.fontSize : 1000;
-    const int ratio = slot.ratio > 0 ? slot.ratio : 100;
-    {
-        std::shared_lock lock(gSpanMu);
-        const auto found = spanMeasures().find(&slot);
-        if (found != spanMeasures().end() && spanMeasureMatches(found->second, slot, size, ratio)) return found->second;
-    }
-    SpanMeasure measured;
-    measured.text = slot.text;
-    measured.charShapeId = slot.charShapeId;
-    measured.fontSize = size;
-    measured.ratio = ratio;
     const model::CharShape* shape = nullptr;
-    if (slot.charShapeId < doc->header.charShapes.size() &&
-        doc->header.charShapes[slot.charShapeId].id == slot.charShapeId) {
-        shape = &doc->header.charShapes[slot.charShapeId];
+    if (charShapeId < doc->header.charShapes.size() && doc->header.charShapes[charShapeId].id == charShapeId) {
+        shape = &doc->header.charShapes[charShapeId];
     } else {
         for (const auto& item : doc->header.charShapes) {
-            if (item.id == slot.charShapeId) {
+            if (item.id == charShapeId) {
                 shape = &item;
                 break;
             }
@@ -1537,28 +1654,24 @@ const SpanMeasure& rememberSpanMeasure(const Node& slot, const model::Document* 
     const model::CharShape* measure = shape ? shape : &fallback;
     std::size_t scan = 0;
     char32_t code = 0;
-    while (nextCp(slot.text, scan, code)) {
+    while (nextCp(text, scan, code)) {
         std::int32_t width = 0;
         std::int32_t ink = 0;
-        if (takeTextAdvance(slot.charShapeId, code, width, ink)) {
-            measured.advances.push_back(width);
-            measured.inks.push_back(ink);
+        if (takeTextAdvance(charShapeId, code, width, ink)) {
+            advances.push_back(width);
+            inks.push_back(ink);
             continue;
         }
         const bool hangul = code >= 0xAC00 && code <= 0xD7A3;
         const model::Lang lang = hangul ? model::Lang::Hangul : model::Lang::Latin;
-        const std::int32_t advance = noting::layout::glyphAdvance(code, *measure, lang, doc);
-        const std::int32_t trail = noting::layout::glyphTrail(code, *measure, lang, doc);
+        const std::int32_t advance = chwp::layout::glyphAdvance(code, *measure, lang, doc);
+        const std::int32_t trail = chwp::layout::glyphTrail(code, *measure, lang, doc);
         width = advance > 0 ? advance : 0;
         ink = std::max<std::int32_t>(0, width - trail);
-        keepTextAdvance(slot.charShapeId, code, width, ink);
-        measured.advances.push_back(width);
-        measured.inks.push_back(ink);
+        keepTextAdvance(charShapeId, code, width, ink);
+        advances.push_back(width);
+        inks.push_back(ink);
     }
-    std::unique_lock lock(gSpanMu);
-    const auto found = spanMeasures().find(&slot);
-    if (found != spanMeasures().end() && spanMeasureMatches(found->second, slot, size, ratio)) return found->second;
-    return spanMeasures().insert_or_assign(&slot, std::move(measured)).first->second;
 }
 
 std::shared_mutex gPlaceMu;
@@ -1589,8 +1702,6 @@ void clearLinePlaces() {
     linePlaces().clear();
     linePlacesByHash().clear();
     linePlacePages().clear();
-    spanMeasures().clear();
-    tabMeasures().clear();
     lineBlockCache().clear();
     resolvedFaces().clear();
     layout::clearGlyphScaleCache();
@@ -1598,12 +1709,7 @@ void clearLinePlaces() {
 }
 
 void evictNodeMeasuresUnlocked(const Node& node) {
-    if (node.kind == NodeKind::Line) {
-        lineBlockCache().erase(&node);
-    } else if (node.kind == NodeKind::Span) {
-        spanMeasures().erase(&node);
-        tabMeasures().erase(&node);
-    }
+    if (node.kind == NodeKind::Line) lineBlockCache().erase(&node);
     for (const Node& child : node.children) {
         evictNodeMeasuresUnlocked(child);
     }
@@ -1674,50 +1780,57 @@ bool matchesAnyInvalidationKey(const std::string& key, const std::vector<FrameIn
     return false;
 }
 
-bool takeLinePlaces(const FrameDesc& frame, std::vector<GlyphSpot>& out) {
+// 이 칸에 적어 둔 글자 자리를 찾는다. 칸 키로 적었으면 비어 있어도 찾은 것이다.
+bool findLinePlaces(const FrameDesc& frame, SharedLinePlaces& out) {
     if (frame.kind != 0) return false;
     const std::string key = linePlaceKey(frame);
-    {
-        std::shared_lock lock(gPlaceMu);
-        if (linePlaceSeen().count(key)) {
-            const auto found = linePlaces().find(key);
-            out = found == linePlaces().end() ? std::vector<GlyphSpot>{} : found->second;
+    std::shared_lock lock(gPlaceMu);
+    if (linePlaceSeen().count(key)) {
+        const auto found = linePlaces().find(key);
+        out = found == linePlaces().end() ? nullptr : found->second;
+        return true;
+    }
+    if (frame.contentHash != 0) {
+        const auto byHash = linePlacesByHash().find(frame.contentHash);
+        if (byHash != linePlacesByHash().end()) {
+            out = byHash->second;
             return true;
-        }
-        if (frame.contentHash != 0) {
-            const auto byHash = linePlacesByHash().find(frame.contentHash);
-            if (byHash != linePlacesByHash().end()) {
-                out = byHash->second.spots;
-                const int deltaOff =
-                    (frame.lineStart >= 0 && byHash->second.lineStart >= 0)
-                        ? (frame.lineStart - byHash->second.lineStart)
-                        : 0;
-                for (GlyphSpot& spot : out) {
-                    if (frame.lineStory >= 0) spot.story = frame.lineStory;
-                    if (frame.lineParagraph >= 0) spot.paragraph = frame.lineParagraph;
-                    if (deltaOff != 0 && spot.offset >= 0) spot.offset += deltaOff;
-                }
-                return true;
-            }
         }
     }
     return false;
 }
 
-void keepLinePlaces(const FrameDesc& frame, const std::vector<GlyphSpot>& spots) {
+// 적어 둔 자리를 지금 칸의 줄로 옮긴다. 글자가 같은 줄이 문단·시작 위치만 바뀌어도 블록 판단이 맞게 한다.
+bool takeLinePlaces(const FrameDesc& frame, std::vector<GlyphSpot>& out) {
+    SharedLinePlaces places;
+    if (!findLinePlaces(frame, places)) return false;
+    out = places ? places->spots : std::vector<GlyphSpot>{};
+    const int deltaOff =
+        (places && frame.lineStart >= 0 && places->lineStart >= 0) ? (frame.lineStart - places->lineStart) : 0;
+    for (GlyphSpot& spot : out) {
+        if (frame.lineStory >= 0) spot.story = frame.lineStory;
+        if (frame.lineParagraph >= 0) spot.paragraph = frame.lineParagraph;
+        if (deltaOff != 0 && spot.offset >= 0) spot.offset += deltaOff;
+    }
+    return true;
+}
+
+void keepLinePlaces(const FrameDesc& frame, std::vector<GlyphSpot> spots) {
     if (frame.kind != 0) return;
     const std::string key = linePlaceKey(frame);
+    const bool empty = spots.empty();
+    const SharedLinePlaces places = std::make_shared<const LinePlaces>(LinePlaces{frame.lineStart, std::move(spots)});
     std::unique_lock lock(gPlaceMu);
     linePlaceSeen().insert(key);
-    if (spots.empty()) linePlaces().erase(key);
-    else linePlaces()[key] = spots;
+    if (empty) linePlaces().erase(key);
+    else linePlaces()[key] = places;
     int placePage = -1;
     int placeKind = 0;
     std::vector<int> placePath;
     if (parseLinePlaceKey(key, placePage, placeKind, placePath)) linePlacePages()[placePage].insert(key);
     if (frame.contentHash != 0) {
         if (linePlacesByHash().size() > 32768) linePlacesByHash().clear();
-        linePlacesByHash()[frame.contentHash] = HashedLinePlaces{frame.lineStart, spots};
+        linePlacesByHash()[frame.contentHash] = places;
     }
 }
 
@@ -1726,7 +1839,6 @@ void spotsToPage(std::vector<GlyphSpot>& spots, const FrameDesc&, std::int32_t p
     for (GlyphSpot& spot : spots) {
         spot.huX = spot.huX - padHu;
         spot.baseline = spot.baseline - padHu;
-        spot.hostCount = 0;
     }
 }
 
@@ -1743,31 +1855,42 @@ std::vector<GlyphSpot> spotsInFrame(const std::vector<GlyphSpot>& spots, const F
 
 void releaseGpuImages() {}
 
-// 줄 캐시 탭의 앞뒤 글자 폭. 배치 때는 비어 있고, 이 줄을 그릴 때 채운다.
-std::int32_t spanContentWidth(const Node& slot, const model::Document* doc) {
-    if (slot.kind == NodeKind::Object) return slot.width + slot.marginLeft + slot.marginRight;
-    if (slot.kind != NodeKind::Span || slot.text == "\t") return 0;
-    if (!slot.advances.empty()) {
+// 줄 글자 표 한 구간의 글자 폭 합. 탭은 0 이다. 폭을 안 잰 구간은 재서 더한다.
+std::int32_t runContentWidth(const Node& line, const LineGlyphs& glyphs, const LineRun& run,
+                             const model::Document* doc) {
+    if (run.kind == RunKind::Object) {
+        const Node& slot = line.children[run.slot];
+        return slot.width + slot.marginLeft + slot.marginRight;
+    }
+    if (run.kind == RunKind::Tab || run.kind == RunKind::Note) return 0;
+    if (run.advanceCount > 0) {
         std::int32_t sum = 0;
-        for (const std::int32_t width : slot.advances) sum += width;
+        for (std::uint32_t i = 0; i < run.advanceCount; ++i) sum += glyphs.advances[run.advanceAt + i];
         return sum;
     }
-    if (slot.width > 0 || slot.text.empty() || !doc) return slot.width;
-    const SpanMeasure& measured = rememberSpanMeasure(slot, doc);
+    if (run.width > 0 || run.textEnd == run.textBegin || !doc) return run.width;
+    std::vector<std::int32_t> advances;
+    std::vector<std::int32_t> inks;
+    const std::string_view text(line.text().data() + run.textBegin, run.textEnd - run.textBegin);
+    measureText(doc, text, run.charShapeId, run.style->fontSize > 0 ? run.style->fontSize : 1000,
+                run.style->ratio > 0 ? run.style->ratio : 100,
+                advances, inks);
     std::int32_t sum = 0;
-    for (const std::int32_t width : measured.advances) sum += width;
+    for (const std::int32_t width : advances) sum += width;
     return sum;
 }
 
+namespace {
 
-// 탭 위치는 본문 왼쪽 끝 기준이다. pen 은 줄 원점에서의 글자 폭이고, 줄의 x 와 문단 왼쪽 여백을 더한다.
-TabGap tabGapAt(const Node& line, std::int32_t pen, std::size_t index, const model::Document* doc) {
+// 탭 자리. 칸이 정해지면 그 칸까지의 폭과 채움을 준다. tail 은 오른쪽·가운데 탭이 미는 뒤 글 폭을 늦게 잰다.
+template <typename Tail>
+TabGap tabGapFor(const Node& line, std::int32_t pen, Tail&& tail) {
     TabGap gap;
-    const std::int32_t fromEdge = pen + line.x + line.indent + line.tabMargin;
+    const std::int32_t fromEdge = pen + line.x + line.indent + line.lineData().tabMargin;
     int align = 0;
     bool found = false;
     std::int32_t target = 0;
-    for (const LineTab& place : line.tabStops) {
+    for (const LineTab& place : line.lineData().tabStops) {
         if (place.pos > fromEdge) {
             target = place.pos;
             gap.leader = place.leader;
@@ -1776,29 +1899,39 @@ TabGap tabGapAt(const Node& line, std::int32_t pen, std::size_t index, const mod
             break;
         }
     }
-    const std::int32_t step = line.tabStep > 0 ? line.tabStep : 4000;
+    const std::int32_t step = line.lineData().tabStep > 0 ? line.lineData().tabStep : 4000;
     if (!found) {
-        if (line.tabStops.empty()) target = ((fromEdge / step) + 1) * step;
+        if (line.lineData().tabStops.empty()) target = ((fromEdge / step) + 1) * step;
         else {
-            target = line.tabStops.back().pos;
+            target = line.lineData().tabStops.back().pos;
             while (target <= fromEdge) target += step;
         }
     }
     if (target < 0) target = 0;
-    if (target > line.tabBodyRight) target = line.tabBodyRight;
+    if (target > line.lineData().tabBodyRight) target = line.lineData().tabBodyRight;
     gap.width = std::max<std::int32_t>(0, target - fromEdge);
     if (found && align != 0) {
-        std::int32_t tail = 0;
-        for (std::size_t i = index + 1; i < line.children.size(); ++i) {
-            const Node& next = line.children[i];
-            if (next.kind == NodeKind::Span && next.text == "\t") break;
-            tail += spanContentWidth(next, doc);
-        }
-        if (align == 1) gap.width -= tail;
-        else gap.width -= tail / 2;
+        const std::int32_t behind = tail();
+        if (align == 1) gap.width -= behind;
+        else gap.width -= behind / 2;
         if (gap.width < 0) gap.width = 0;
     }
     return gap;
+}
+
+}  // namespace
+
+TabGap tabGapAtRun(const Node& line, const LineGlyphs& glyphs, std::int32_t pen, std::size_t runIndex,
+                   const model::Document* doc) {
+    return tabGapFor(line, pen, [&] {
+        std::int32_t tail = 0;
+        for (std::size_t i = runIndex + 1; i < glyphs.runs.size(); ++i) {
+            const LineRun& next = glyphs.runs[i];
+            if (next.kind == RunKind::Tab) break;
+            tail += runContentWidth(line, glyphs, next, doc);
+        }
+        return tail;
+    });
 }
 
 
@@ -1825,7 +1958,7 @@ std::vector<std::pair<std::int32_t, std::int32_t>> columnRuleSpans(const Node* p
     auto subtractObject = [&](const Node& obj, std::int32_t baseX, std::int32_t baseY) {
         // 쪽 테두리는 본문 전체를 두르는 선이라 단 구분선을 끊지 않는다.
         if (obj.kind != NodeKind::Object || obj.treatAsChar || obj.role == "caption" || obj.role == "pageBorder") return;
-        if (obj.textWrap == "BEHIND_TEXT" || obj.textWrap == "IN_FRONT_OF_TEXT") return;
+        if (obj.ext().obj().textWrap == "BEHIND_TEXT" || obj.ext().obj().textWrap == "IN_FRONT_OF_TEXT") return;
         const std::int32_t boxL = baseX + obj.x - obj.marginLeft;
         const std::int32_t boxR = baseX + obj.x + obj.width + obj.marginRight;
         if (boxR <= lineL || boxL >= lineR) return;
@@ -1907,69 +2040,11 @@ namespace {
 void clearHangulOutlineCache() {
     clearHangulCommands();
     clearLinePlaces();
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     clearHangulCurves();
-#endif
 }
 
 bool drawnCode(char32_t cp) {
     return cp != 0 && cp != ' ' && cp != '\t' && cp != '\n' && cp != 0x2007 && cp != 0x00A0;
-}
-
-struct PageGlyph {
-    std::string font;
-    char32_t cp = 0;
-    bool bold = false;
-    bool italic = false;
-    int fontSize = 1000;
-};
-
-void collectPageGlyphs(const Node& node, const std::string& inherited, std::vector<std::string>& faces,
-                       std::unordered_set<std::string>& seenFaces, std::vector<PageGlyph>& uses,
-                       std::unordered_set<std::string>& seenUses) {
-    const std::string font = node.font.empty() ? inherited : node.font;
-    if (node.kind == NodeKind::Span && !node.text.empty()) {
-        const std::string face = font.empty() ? std::string("함초롬바탕") : font;
-        if (seenFaces.insert(face).second) faces.push_back(face);
-        if (node.bold) {
-            const std::string heavy = face + " Bold";
-            const std::string hangulHeavy = face + " 볼드";
-            if (seenFaces.insert(heavy).second) faces.push_back(heavy);
-            if (seenFaces.insert(hangulHeavy).second) faces.push_back(hangulHeavy);
-        }
-        std::size_t index = 0;
-        char32_t cp = 0;
-        const int nominal = node.fontSize > 0 ? node.fontSize : 1000;
-        const int rel = node.relSize > 0 ? node.relSize : 100;
-        int size = rel == 100 ? nominal
-                              : static_cast<int>((static_cast<std::int64_t>(nominal) * rel + 50) / 100);
-        if (node.superscript || node.subscript) {
-            size = static_cast<int>((static_cast<std::int64_t>(size) * 16 + 12) / 25);
-        }
-        while (nextCp(node.text, index, cp)) {
-            if (!drawnCode(cp)) continue;
-            std::string key = face;
-            key.push_back('\n');
-            key += std::to_string(static_cast<std::uint32_t>(cp));
-            key.push_back(node.bold ? 'b' : 'r');
-            key.push_back(node.italic ? 'i' : 'n');
-            key.push_back('\n');
-            key += std::to_string(size);
-            if (!seenUses.insert(key).second) continue;
-            uses.push_back(PageGlyph{face, cp, node.bold, node.italic, size});
-        }
-    }
-    for (const Node& child : node.children) collectPageGlyphs(child, font, faces, seenFaces, uses, seenUses);
-}
-
-void rememberOutline(const std::string& font, char32_t cp, bool bold, bool italic, int ppem, std::unordered_set<std::string>& loaded) {
-    GlyphMem* mem = glyphMemory(font, cp);
-    if (!mem || !mem->face) return;
-    loaded.insert(glyphFaceName(mem));
-    hangulCommands(mem, bold, italic, ppem);
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-    hangulCurves(mem, bold, italic, ppem);
-#endif
 }
 
 std::uint32_t pageHeightOf(const model::Section& section) {
@@ -2198,13 +2273,13 @@ void gatherDocumentGlyphs(const model::Document& doc) {
         std::shared_lock lock(gAdvanceMu);
         advanceCount = static_cast<int>(textAdvances().size());
     }
-    std::fprintf(stderr, "[noting] 글자 전진폭 %d 마스크 %d\n", advanceCount, maskCount);
+    std::fprintf(stderr, "[ClassingHWP] 글자 전진폭 %d 마스크 %d\n", advanceCount, maskCount);
 }
 
 }  // namespace
 
 PageBitmap renderPageBitmap(const model::Document& doc, const Node& page, int pixelHeight, int viewX, int viewY,
-                            int viewW, int viewH, PaintLayer layer, int pageIndex) {
+                            int viewW, int viewH, PaintLayer layer, int pageIndex, std::uint8_t background) {
     PageBitmap bitmap;
     if (pixelHeight < 32 || page.width <= 0 || page.height <= 0) return bitmap;
     Painter painter;
@@ -2212,6 +2287,7 @@ PageBitmap renderPageBitmap(const model::Document& doc, const Node& page, int pi
     painter.pageNode = &page;
     painter.pageIndex = pageIndex;
     painter.pass = layer;
+    painter.floatCaptions = true;
     painter.scale = static_cast<float>(pixelHeight) / static_cast<float>(page.height);
     const int fullW = std::max(1, static_cast<int>(page.width * painter.scale + 0.5f));
     const int fullH = std::max(1, pixelHeight);
@@ -2238,7 +2314,10 @@ PageBitmap renderPageBitmap(const model::Document& doc, const Node& page, int pi
     painter.bitmap.height = std::max(1, viewH);
     const bool layered = layer != PaintLayer::All;
     painter.bitmap.px.assign(static_cast<std::size_t>(painter.bitmap.width) * painter.bitmap.height * 4u,
-                             layered ? 0 : 255);
+                             layered ? 0 : background);
+    if (!layered && background != 255) {
+        for (std::size_t i = 3; i < painter.bitmap.px.size(); i += 4) painter.bitmap.px[i] = 255;
+    }
     painter.bitmap.clipR = painter.bitmap.width;
     painter.bitmap.clipB = painter.bitmap.height;
     painter.walk(page, -shiftX, -shiftY);
@@ -2270,7 +2349,7 @@ bool frameBehind(const Node& node) {
     const bool masterFront = node.fromMaster && node.masterOnTop;
     if (masterFront) return false;
     if (masterBack) return true;
-    return node.textWrap == "BEHIND_TEXT";
+    return node.ext().obj().textWrap == "BEHIND_TEXT";
 }
 
 // 쪽 개체는 zOrder가 큰 쪽이 위다. 같은 값이면 뒤에 나온 쪽이 위다.
@@ -2284,38 +2363,39 @@ bool edgeHasStroke(const BorderEdge& edge) {
 }
 
 bool cellHasDiagonalStroke(const Node& cell) {
-    if (!edgeHasStroke(cell.borderDiagonal)) return false;
-    const bool hasSlash = !cell.slash.type.empty() && cell.slash.type != "NONE";
-    const bool hasBackSlash = !cell.backSlash.type.empty() && cell.backSlash.type != "NONE";
-    const bool hasCenter = !cell.centerLine.empty() && cell.centerLine != "NONE";
+    if (!edgeHasStroke(cell.ext().borderDiagonal)) return false;
+    const bool hasSlash = !cell.ext().slash.type.empty() && cell.ext().slash.type != "NONE";
+    const bool hasBackSlash = !cell.ext().backSlash.type.empty() && cell.ext().backSlash.type != "NONE";
+    const bool hasCenter = !cell.ext().centerLine.empty() && cell.ext().centerLine != "NONE";
     return hasSlash || hasBackSlash || hasCenter;
 }
 
 bool cellHasAnyBorder(const Node& cell) {
-    return edgeHasStroke(cell.borderTop) || edgeHasStroke(cell.borderBottom) ||
-           edgeHasStroke(cell.borderLeft) || edgeHasStroke(cell.borderRight) ||
+    return edgeHasStroke(cell.ext().borderTop) || edgeHasStroke(cell.ext().borderBottom) ||
+           edgeHasStroke(cell.ext().borderLeft) || edgeHasStroke(cell.ext().borderRight) ||
            cellHasDiagonalStroke(cell);
 }
 
 bool cellHasFillInk(const Node& cell) {
-    if (!cell.fillColor.empty() && cell.fillColor != "none") return true;
-    if (cell.imageFillMode >= 0 && !cell.binItemId.empty()) return true;
+    if (!cell.ext().fillColor.empty() && cell.ext().fillColor != "none") return true;
+    if (!cell.ext().hatchStyle.empty()) return true;
+    if (cell.ext().obj().imageFillMode >= 0 && !cell.ext().obj().binItemId.empty()) return true;
     return false;
 }
 
 bool tableBoxHasInk(const Node& table) {
-    if (!table.fillColor.empty() && table.fillColor != "none") return true;
-    if (edgeHasStroke(table.borderLeft)) return true;
+    if (!table.ext().fillColor.empty() && table.ext().fillColor != "none") return true;
+    if (edgeHasStroke(table.ext().borderLeft)) return true;
     return false;
 }
 
 bool pictureFitsBaseFrame(const Node& node, float baseScale) {
-    if (node.role != "picture" || node.binItemId.empty()) return false;
-    if (edgeHasStroke(node.borderLeft)) return false;
-    if (!node.fillColor.empty() && node.fillColor != "none") return false;
+    if (node.role != "picture" || node.ext().obj().binItemId.empty()) return false;
+    if (edgeHasStroke(node.ext().borderLeft)) return false;
+    if (!node.ext().fillColor.empty() && node.ext().fillColor != "none") return false;
     const int baseW = std::max(1, framePx(node.x + node.width, baseScale) - framePx(node.x, baseScale));
     const int baseH = std::max(1, framePx(node.y + node.height, baseScale) - framePx(node.y, baseScale));
-    const std::shared_ptr<const CachedPicture> picture = peekPicture(node.binItemId);
+    const std::shared_ptr<const CachedPicture> picture = peekPicture(node.ext().obj().binItemId);
     if (!picture) return false;
     return picture->width > 0 && picture->height > 0 && picture->width <= baseW && picture->height <= baseH;
 }
@@ -2323,17 +2403,12 @@ bool pictureFitsBaseFrame(const Node& node, float baseScale) {
 // 테두리 없는 그림 개체는 칸에 픽셀이 없고 화면이 텍스처로 그린다. 확대해도 다시 구울 것이 없다.
 // objectBox 가 그림으로 그리는 모양만 해당한다. 둥근 모서리나 다각형은 예전처럼 굽는다.
 bool pictureDrawsOnScreen(const Node& node) {
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-    if (node.role != "picture" || node.binItemId.empty() || !screenVectors()) return false;
-    if (node.shapeType == "ellipse" || node.shapeType == "arc" || node.points.size() >= 2) return false;
-    if (node.cornerRatio > 0 && node.cornerRatio <= 50) return false;
-    if (edgeHasStroke(node.borderLeft)) return false;
-    const std::shared_ptr<const CachedPicture> picture = peekPicture(node.binItemId);
+    if (node.role != "picture" || node.ext().obj().binItemId.empty() || !screenVectors()) return false;
+    if (node.ext().obj().shapeType == "ellipse" || node.ext().obj().shapeType == "arc" || node.ext().obj().points.size() >= 2) return false;
+    if (node.ext().obj().cornerRatio > 0 && node.ext().obj().cornerRatio <= 50) return false;
+    if (edgeHasStroke(node.ext().borderLeft)) return false;
+    const std::shared_ptr<const CachedPicture> picture = peekPicture(node.ext().obj().binItemId);
     return !picture || (picture->width <= kMaxPictureTexture && picture->height <= kMaxPictureTexture);
-#else
-    (void)node;
-    return false;
-#endif
 }
 
 inline std::uint64_t fnvMix64(std::uint64_t h, std::uint64_t v) {
@@ -2376,19 +2451,106 @@ inline void unionHuBox(std::int32_t& x, std::int32_t& y, std::int32_t& w, std::i
     h = std::max<std::int32_t>(0, bottom - y);
 }
 
+// 쪽 칸 상자를 잡는 동안의 세로쓰기 틀. FrameWalk::visit 과 같이 돌린 틀은 부모 자리를 원점으로 (0, 0) 부터 재고,
+// 세운 개체 상자 안은 종이 자리로 잰다.
+struct HuTurn {
+    bool on = false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t span = 0;
+};
+thread_local HuTurn gHuTurn;
+thread_local std::int32_t gHuPaperW = 0;
+
+// 줄 글자 표를 줄 내용 해시에 섞는다. 그리기 모양은 글자 모양에서 읽어 함께 섞는다.
+std::uint64_t mixLineGlyphs(std::uint64_t h, const Node& line, const model::Document* doc) {
+    const LineGlyphs& glyphs = lineGlyphs(line);
+    if (const HeadingRun* head = glyphs.heading.get()) {
+        h = fnvMix64(h, 0x48454144ULL);
+        h = fnvMix64(h, static_cast<std::uint64_t>(head->x));
+        h = fnvMix64(h, static_cast<std::uint64_t>(head->width));
+        h = fnvMix64(h, static_cast<std::uint64_t>(head->charShapeId));
+        h = fnvMix64(h, static_cast<std::uint64_t>(head->fontSize));
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint16_t>(head->ratio)) |
+                            (static_cast<std::uint64_t>(static_cast<std::uint16_t>(head->relSize)) << 16));
+        h = fnvMix64(h, static_cast<std::uint64_t>((head->bold ? 1 : 0) | (head->italic ? 2 : 0) |
+                                                   (head->superscript ? 4 : 0) | (head->subscript ? 8 : 0)));
+        h = fnvMixStr64(h, head->text);
+        h = fnvMixStr64(h, head->font);
+        h = fnvMixStr64(h, head->color);
+        for (const std::int32_t advance : head->advances) h = fnvMix64(h, static_cast<std::uint64_t>(advance));
+    }
+    for (const LineRun& run : glyphs.runs) {
+        h = fnvMix64(h, static_cast<std::uint64_t>(run.kind) | (run.synthetic ? 16ULL : 0ULL));
+        if (run.kind == RunKind::Object) {
+            h = fnvMix64(h, run.slot);
+            continue;
+        }
+        h = fnvMixStr64(h, std::string(line.text(), run.textBegin, run.textEnd - run.textBegin));
+        h = fnvMix64(h, static_cast<std::uint64_t>(run.width));
+        h = fnvMix64(h, static_cast<std::uint64_t>(run.charShapeId));
+        h = fnvMix64(h, static_cast<std::uint64_t>(run.style->fontSize));
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint16_t>(run.style->ratio)) |
+                            (static_cast<std::uint64_t>(static_cast<std::uint16_t>(run.style->relSize)) << 16) |
+                            (static_cast<std::uint64_t>(static_cast<std::uint16_t>(run.style->spacing)) << 32) |
+                            (static_cast<std::uint64_t>(static_cast<std::uint16_t>(run.style->charOffset)) << 48));
+        h = fnvMixStr64(h, run.style->font ? *run.style->font : std::string{});
+        h = fnvMixStr64(h, run.style->markpen ? *run.style->markpen : std::string{});
+        h = fnvMixStr64(h, run.style->tabLeader ? *run.style->tabLeader : std::string{});
+        for (std::uint32_t i = 0; i < run.advanceCount; ++i) {
+            h = fnvMix64(h, static_cast<std::uint64_t>(glyphs.advances[run.advanceAt + i]));
+        }
+        if (doc) {
+            const detail::CharPaint paint = detail::charPaint(*doc, run.charShapeId);
+            h = fnvMixStr64(h, paint.color);
+            h = fnvMixStr64(h, paint.shade);
+            h = fnvMixStr64(h, paint.fillColor);
+            h = fnvMixStr64(h, paint.hatchStyle);
+            h = fnvMixStr64(h, paint.hatchColor);
+            h = fnvMixStr64(h, paint.underline);
+            h = fnvMix64(h, static_cast<std::uint64_t>((paint.bold ? 1 : 0) | (paint.italic ? 2 : 0) |
+                                                       (paint.strikeout ? 4 : 0) | (paint.superscript ? 16 : 0) |
+                                                       (paint.subscript ? 32 : 0) | (paint.bitmapDeco ? 64 : 0)));
+        }
+    }
+    return h;
+}
+
 void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inObject, bool isPage,
                          const model::Document* doc, std::int32_t& pageSerial) {
+    if (isPage) gHuPaperW = node.width;
+    struct TurnRestore {
+        HuTurn saved = gHuTurn;
+        ~TurnRestore() { gHuTurn = saved; }
+    } turnRestore;
+    if (node.turned != 0) {
+        gHuTurn = {true, ox, oy, node.turnSpan > 0 ? node.turnSpan : gHuPaperW};
+        ox = 0;
+        oy = 0;
+    }
+    if (node.upright && gHuTurn.on) {
+        const std::int32_t paperX = gHuTurn.x + gHuTurn.span - (oy + node.y) - node.height;
+        const std::int32_t paperY = gHuTurn.y + ox + node.x;
+        gHuTurn = {};
+        for (Node& child : node.children) computeNodeHuBounds(child, paperX, paperY, true, false, doc, pageSerial);
+        node.huX = ox + node.x;
+        node.huY = oy + node.y;
+        node.huW = node.width;
+        node.huH = node.height;
+        node.huBoundsReady = true;
+        return;
+    }
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
     const std::int32_t y = oy + node.y;
 
     if (!isPage && node.kind == NodeKind::Line) {
         std::int32_t top = y;
-        std::int32_t height = node.height > 0 ? node.height : node.textHeight;
-        if (node.auditRise > 0) {
-            top -= node.auditRise;
-            height += node.auditRise;
+        std::int32_t height = node.height > 0 ? node.height : node.lineData().textHeight;
+        if (node.lineData().auditRise > 0) {
+            top -= node.lineData().auditRise;
+            height += node.lineData().auditRise;
         }
-        height += std::max<std::int32_t>(0, node.auditBelow);
+        height += std::max<std::int32_t>(0, node.editContent().auditBelow);
         std::vector<InlineBorder> borders;
         const bool seated = treatAsCharBorders(node, doc, borders);
         std::int32_t extraLeft = 0;
@@ -2411,22 +2573,25 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
             }
         }
         const std::int32_t slide = std::max<std::int32_t>(0, node.indent);
-        std::int32_t coveredAbove = std::max<std::int32_t>(0, node.auditRise);
+        std::int32_t coveredAbove = std::max<std::int32_t>(0, node.editContent().auditRise);
         std::int32_t coveredBelow =
-            (node.height > 0 ? node.height : node.textHeight) + std::max<std::int32_t>(0, node.auditBelow);
-        for (const Node& child : node.children) {
-            if (!child.headingMark) continue;
-            std::int32_t left = slide + child.x;
-            std::int32_t right = left + std::max(child.width, 0);
-            if (child.kind == NodeKind::Span && !child.advances.empty()) {
+            (node.height > 0 ? node.height : node.editContent().textHeight) + std::max<std::int32_t>(0, node.editContent().auditBelow);
+        if (const HeadingRun* head = lineGlyphs(node).heading.get()) {
+            const std::int32_t left = slide + head->x;
+            std::int32_t right = left + std::max(head->width, 0);
+            if (!head->advances.empty()) {
                 right = left;
-                for (const std::int32_t width : child.advances) right += width;
-            } else if (child.kind == NodeKind::Object) {
-                right = left + child.width;
+                for (const std::int32_t width : head->advances) right += width;
             }
             if (left < 0) extraLeft = std::max(extraLeft, -left);
             if (right > node.width) extraRight = std::max(extraRight, right - node.width);
-            if (child.kind != NodeKind::Object) continue;
+        }
+        for (const Node& child : node.children) {
+            if (!child.headingMark || child.kind != NodeKind::Object) continue;
+            const std::int32_t left = slide + child.x;
+            const std::int32_t right = left + child.width;
+            if (left < 0) extraLeft = std::max(extraLeft, -left);
+            if (right > node.width) extraRight = std::max(extraRight, right - node.width);
             if (child.y < -coveredAbove) {
                 const std::int32_t more = -child.y - coveredAbove;
                 top -= more;
@@ -2439,58 +2604,34 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
                 coveredBelow = bottom;
             }
         }
-        node.lineBoxX = x - extraLeft;
-        node.lineBoxY = top;
-        node.lineBoxW = std::max<std::int32_t>(0, node.width + extraLeft + extraRight);
-        node.lineBoxH = std::max<std::int32_t>(0, height);
-        node.huX = node.lineBoxX;
-        node.huY = node.lineBoxY;
-        node.huW = node.lineBoxW;
-        node.huH = node.lineBoxH;
+        node.editContent().lineBoxX = x - extraLeft;
+        node.editContent().lineBoxY = top;
+        node.editContent().lineBoxW = std::max<std::int32_t>(0, node.width + extraLeft + extraRight);
+        node.editContent().lineBoxH = std::max<std::int32_t>(0, height);
+        node.huX = node.lineData().lineBoxX;
+        node.huY = node.lineData().lineBoxY;
+        node.huW = node.lineData().lineBoxW;
+        node.huH = node.lineData().lineBoxH;
 
         std::uint64_t h = 14695981039346656037ULL;
         h = fnvMix64(h, 1001ULL);
         h = fnvMix64(h, static_cast<std::uint64_t>(node.width));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.height));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.textHeight));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.lineBaseline));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.lineData().textHeight));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.lineData().lineBaseline));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.marginTop));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.indent));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.auditRise));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.auditBelow));
-        h = fnvMix64(h, static_cast<std::uint64_t>((node.lastLine ? 1 : 0) | (node.lineBreak ? 2 : 0) |
-                                                   (node.deferTabs ? 4 : 0) | (node.matchFontBaseline ? 8 : 0)));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.lineData().auditRise));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.lineData().auditBelow));
+        h = fnvMix64(h, static_cast<std::uint64_t>((node.lineData().lastLine ? 1 : 0) | (node.lineData().lineBreak ? 2 : 0) |
+                                                   (node.lineData().deferTabs ? 4 : 0) | (node.lineData().matchFontBaseline ? 8 : 0)));
         h = fnvMixStr64(h, node.align);
         h = fnvMixStr64(h, node.vertAlign);
 
         for (int i = 0; i < static_cast<int>(node.children.size()); ++i) {
             Node& child = node.children[static_cast<std::size_t>(i)];
-            if (child.kind == NodeKind::Span) {
-                std::uint64_t sh = 14695981039346656037ULL;
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.x));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.y));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.width));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.height));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.charShapeId));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.fontSize));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.ratio));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.relSize));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.spacing));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>(child.charOffset));
-                sh = fnvMix64(sh, static_cast<std::uint64_t>((child.bold ? 1 : 0) | (child.italic ? 2 : 0) |
-                                                             (child.strikeout ? 4 : 0) | (child.headingMark ? 8 : 0) |
-                                                             (child.superscript ? 16 : 0) | (child.subscript ? 32 : 0) |
-                                                             (child.bitmapDeco ? 64 : 0)));
-                sh = fnvMixStr64(sh, child.text);
-                sh = fnvMixStr64(sh, child.font);
-                sh = fnvMixStr64(sh, child.color);
-                sh = fnvMixStr64(sh, child.shade);
-                sh = fnvMixStr64(sh, child.markpen);
-                sh = fnvMixStr64(sh, child.underline);
-                sh = fnvMixStr64(sh, child.tabLeader);
-                child.contentHash = sh;
-                h = fnvMix64(h, sh);
-            } else if (child.kind == NodeKind::Object && child.treatAsChar) {
+            // 본문 글자와 머리 번호 글자는 줄 글자 표로 섞는다(아래 mixLineGlyphs).
+            if (child.kind == NodeKind::Object && child.treatAsChar) {
                 std::int32_t childOx = x + child.marginLeft;
                 std::int32_t effX = child.x;
                 if (seated && borders[static_cast<std::size_t>(i)].ok) {
@@ -2513,9 +2654,10 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
                 h = fnvMix64(h, static_cast<std::uint64_t>(child.y));
                 h = fnvMix64(h, static_cast<std::uint64_t>(child.width));
                 h = fnvMix64(h, static_cast<std::uint64_t>(child.height));
-                h = fnvMixStr64(h, child.binItemId);
+                h = fnvMixStr64(h, child.ext().obj().binItemId);
             }
         }
+        h = mixLineGlyphs(h, node, doc);
         node.contentHash = node.spansLater ? 0ULL : (h == 0ULL ? 1ULL : h);
         node.huBoundsReady = true;
         return;
@@ -2523,9 +2665,9 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
 
     if (!isPage && node.kind == NodeKind::Object) {
         if (!inObject && !node.treatAsChar) {
-            node.objectPageSerial = pageSerial++;
+            node.extMut().objMut().objectPageSerial = pageSerial++;
         } else {
-            node.objectPageSerial = -1;
+            node.extMut().objMut().objectPageSerial = -1;
         }
         const std::int32_t bleed = tableBorderBleed(node);
         node.huX = x - bleed;
@@ -2538,21 +2680,21 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         h = fnvMix64(h, static_cast<std::uint64_t>(node.width));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.height));
         h = fnvMixStr64(h, node.role);
-        h = fnvMixStr64(h, node.shapeType);
-        h = fnvMixStr64(h, node.fillColor);
-        h = fnvMixStr64(h, node.gradColor);
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.gradAngle));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.cornerRatio));
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.imageFillMode));
-        h = fnvMixStr64(h, node.binItemId);
-        h = fnvMixStr64(h, node.script);
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.cellSpacing));
+        h = fnvMixStr64(h, node.ext().obj().shapeType);
+        h = fnvMixStr64(h, node.ext().fillColor);
+        h = fnvMixStr64(h, node.ext().gradColor);
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().gradAngle));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().cornerRatio));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().imageFillMode));
+        h = fnvMixStr64(h, node.ext().obj().binItemId);
+        h = fnvMixStr64(h, node.ext().obj().script);
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().cellSpacing));
         h = fnvMix64(h, static_cast<std::uint64_t>((node.flipHorizontal ? 1 : 0) | (node.flipVertical ? 2 : 0)));
-        h = fnvMixEdge64(h, node.borderLeft);
-        h = fnvMixEdge64(h, node.borderRight);
-        h = fnvMixEdge64(h, node.borderTop);
-        h = fnvMixEdge64(h, node.borderBottom);
-        for (const auto& pt : node.points) {
+        h = fnvMixEdge64(h, node.ext().borderLeft);
+        h = fnvMixEdge64(h, node.ext().borderRight);
+        h = fnvMixEdge64(h, node.ext().borderTop);
+        h = fnvMixEdge64(h, node.ext().borderBottom);
+        for (const auto& pt : node.ext().obj().points) {
             h = fnvMix64(h, static_cast<std::uint64_t>(pt.x));
             h = fnvMix64(h, static_cast<std::uint64_t>(pt.y));
         }
@@ -2587,31 +2729,33 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
     h = fnvMix64(h, static_cast<std::uint64_t>(node.width));
     h = fnvMix64(h, static_cast<std::uint64_t>(node.height));
     if (node.kind == NodeKind::Cell || node.kind == NodeKind::Paragraph) {
-        h = fnvMixStr64(h, node.fillColor);
-        h = fnvMixStr64(h, node.gradColor);
-        h = fnvMix64(h, static_cast<std::uint64_t>(node.imageFillMode));
-        h = fnvMixStr64(h, node.binItemId);
-        h = fnvMixEdge64(h, node.borderLeft);
-        h = fnvMixEdge64(h, node.borderRight);
-        h = fnvMixEdge64(h, node.borderTop);
-        h = fnvMixEdge64(h, node.borderBottom);
-        h = fnvMixEdge64(h, node.borderDiagonal);
+        h = fnvMixStr64(h, node.ext().fillColor);
+        h = fnvMixStr64(h, node.ext().hatchStyle);
+        h = fnvMixStr64(h, node.ext().hatchColor);
+        h = fnvMixStr64(h, node.ext().gradColor);
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().imageFillMode));
+        h = fnvMixStr64(h, node.ext().obj().binItemId);
+        h = fnvMixEdge64(h, node.ext().borderLeft);
+        h = fnvMixEdge64(h, node.ext().borderRight);
+        h = fnvMixEdge64(h, node.ext().borderTop);
+        h = fnvMixEdge64(h, node.ext().borderBottom);
+        h = fnvMixEdge64(h, node.ext().borderDiagonal);
         if (node.kind == NodeKind::Paragraph) {
-            h = fnvMix64(h, static_cast<std::uint64_t>(node.borderOffsetLeft));
-            h = fnvMix64(h, static_cast<std::uint64_t>(node.borderOffsetRight));
-            h = fnvMix64(h, static_cast<std::uint64_t>(node.borderOffsetTop));
-            h = fnvMix64(h, static_cast<std::uint64_t>(node.borderOffsetBottom));
-            h = fnvMix64(h, static_cast<std::uint64_t>((node.borderConnect ? 1 : 0) | (node.borderIgnoreMargin ? 2 : 0)));
-            const bool chrome = (!node.fillColor.empty() && node.fillColor != "none") ||
-                                edgeHasStroke(node.borderLeft) || edgeHasStroke(node.borderRight) ||
-                                edgeHasStroke(node.borderTop) || edgeHasStroke(node.borderBottom);
+            h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().borderOffsetLeft));
+            h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().borderOffsetRight));
+            h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().borderOffsetTop));
+            h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().borderOffsetBottom));
+            h = fnvMix64(h, static_cast<std::uint64_t>((node.ext().borderConnect ? 1 : 0) | (node.ext().borderIgnoreMargin ? 2 : 0)));
+            const bool chrome = (!node.ext().fillColor.empty() && node.ext().fillColor != "none") || !node.ext().hatchStyle.empty() ||
+                                edgeHasStroke(node.ext().borderLeft) || edgeHasStroke(node.ext().borderRight) ||
+                                edgeHasStroke(node.ext().borderTop) || edgeHasStroke(node.ext().borderBottom);
             if (chrome) {
-                const std::int32_t padL = std::max<std::int32_t>(0, node.borderOffsetLeft) +
-                                          (node.borderIgnoreMargin ? node.marginLeft : 0) + 120;
-                const std::int32_t padR = std::max<std::int32_t>(0, node.borderOffsetRight) +
-                                          (node.borderIgnoreMargin ? node.marginRight : 0) + 120;
-                const std::int32_t padT = std::max<std::int32_t>(0, node.borderOffsetTop) + 120;
-                const std::int32_t padB = std::max<std::int32_t>(0, node.borderOffsetBottom) + 120;
+                const std::int32_t padL = std::max<std::int32_t>(0, node.ext().borderOffsetLeft) +
+                                          (node.ext().borderIgnoreMargin ? node.marginLeft : 0) + 120;
+                const std::int32_t padR = std::max<std::int32_t>(0, node.ext().borderOffsetRight) +
+                                          (node.ext().borderIgnoreMargin ? node.marginRight : 0) + 120;
+                const std::int32_t padT = std::max<std::int32_t>(0, node.ext().borderOffsetTop) + 120;
+                const std::int32_t padB = std::max<std::int32_t>(0, node.ext().borderOffsetBottom) + 120;
                 unionHuBox(node.huX, node.huY, node.huW, node.huH, x - padL, y - padT, node.width + padL + padR,
                            std::max(node.height, 0) + padT + padB);
             }
@@ -2631,7 +2775,7 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
     }
     for (int i = 0; i < count; ++i) {
         const Node& column = node.children[static_cast<std::size_t>(i)];
-        if (column.kind != NodeKind::Column || !edgeHasStroke(column.borderRight)) continue;
+        if (column.kind != NodeKind::Column || !edgeHasStroke(column.ext().borderRight)) continue;
         const Node* next = nullptr;
         for (int j = i + 1; j < count; ++j) {
             const Node& other = node.children[static_cast<std::size_t>(j)];
@@ -2647,7 +2791,7 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         const std::int32_t top = y + column.y;
         const std::int32_t span = std::max(column.height, next->height);
         if (span <= 0) continue;
-        const std::int32_t bleed = std::max<std::int32_t>(column.borderRight.width, 100);
+        const std::int32_t bleed = std::max<std::int32_t>(column.ext().borderRight.width, 100);
         unionHuBox(node.huX, node.huY, node.huW, node.huH, mid - bleed, top - bleed, bleed * 2, span + bleed * 2);
     }
     node.contentHash = node.spansLater ? 0ULL : (h == 0ULL ? 1ULL : h);
@@ -2666,10 +2810,26 @@ struct FrameWalk {
     std::int64_t pageSerial = 0;
     // 머리말·꼬리말 띠 안을 지나는 중이다. 한글처럼 그 안 개체는 글 뒤 층이고, 본문 글 뒤 개체보다는 위다.
     int bandDepth = 0;
+    // 세로쓰기 틀(turned) 안이다. 노드 좌표는 돌린 틀이라 종이 좌표로 바꿔 자르고 칸을 놓는다.
+    // 틀 원점은 종이의 (turnX, turnY), 가로 폭은 turnSpan 이다. 틀의 (x, y) 는 종이의 (turnX + turnSpan − y, turnY + x) 다.
+    bool turned = false;
+    std::int32_t turnX = 0;
+    std::int32_t turnY = 0;
+    std::int32_t turnSpan = 0;
+
+    // 돌린 틀의 상자 → 종이 상자.
+    void toPaper(std::int32_t& x, std::int32_t& y, std::int32_t& w, std::int32_t& h) const {
+        if (!turned) return;
+        const std::int32_t paperX = turnX + turnSpan - y - h;
+        y = turnY + x;
+        x = paperX;
+        std::swap(w, h);
+    }
 
     // 크기를 모르는 노드는 건너뛰지 않는다. 자식이 그 상자 밖에 있을 수 있다.
     bool misses(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h) const {
         if (!cull.on || w <= 0 || h <= 0) return false;
+        toPaper(x, y, w, h);
         return x >= cull.x + cull.w || y >= cull.y + cull.h || x + w <= cull.x || y + h <= cull.y;
     }
 
@@ -2677,10 +2837,12 @@ struct FrameWalk {
               std::int32_t originX, std::int32_t originY, int layer, std::int64_t z, const std::vector<int>& path,
               bool inObject, bool baseOnly = false) {
         if (w <= 0 || h <= 0 || !out) return;
-        const int left = framePx(x, scale) - kFramePad;
-        const int top = framePx(y, scale) - kFramePad;
-        const int right = framePx(x + w, scale) + kFramePad;
-        const int bottom = framePx(y + h, scale) + kFramePad;
+        std::int32_t paperX = x, paperY = y, paperW = w, paperH = h;
+        toPaper(paperX, paperY, paperW, paperH);
+        const int left = framePx(paperX, scale) - kFramePad;
+        const int top = framePx(paperY, scale) - kFramePad;
+        const int right = framePx(paperX + paperW, scale) + kFramePad;
+        const int bottom = framePx(paperY + paperH, scale) + kFramePad;
         FrameDesc frame;
         frame.page = pageIndex;
         frame.layer = layer;
@@ -2701,6 +2863,7 @@ struct FrameWalk {
         frame.huH = h;
         frame.originX = originX;
         frame.originY = originY;
+        frame.turned = turned;
         if (owner.contentHash != 0) {
             frame.contentHash = (kind >= 3) ? fnvMix64(owner.contentHash, static_cast<std::uint64_t>(kind))
                                             : owner.contentHash;
@@ -2734,8 +2897,8 @@ struct FrameWalk {
                 else front.push_back(i);
             }
             const auto byZ = [&](int a, int b) {
-                return node.children[static_cast<std::size_t>(a)].zOrder <
-                       node.children[static_cast<std::size_t>(b)].zOrder;
+                return node.children[static_cast<std::size_t>(a)].ext().obj().zOrder <
+                       node.children[static_cast<std::size_t>(b)].ext().obj().zOrder;
             };
             std::stable_sort(behind.begin(), behind.end(), byZ);
             std::stable_sort(front.begin(), front.end(), byZ);
@@ -2779,7 +2942,7 @@ struct FrameWalk {
         }
         for (int i = 0; i < count; ++i) {
             const Node& column = node.children[static_cast<std::size_t>(i)];
-            if (column.kind != NodeKind::Column || !edgeHasStroke(column.borderRight)) continue;
+            if (column.kind != NodeKind::Column || !edgeHasStroke(column.ext().borderRight)) continue;
             const Node* next = nullptr;
             for (int j = i + 1; j < count; ++j) {
                 const Node& other = node.children[static_cast<std::size_t>(j)];
@@ -2795,9 +2958,9 @@ struct FrameWalk {
             const std::int32_t top = y + column.y;
             const std::int32_t span = std::max(column.height, next->height);
             if (span <= 0) continue;
-            const std::int32_t bleed = std::max<std::int32_t>(column.borderRight.width, 100);
+            const std::int32_t bleed = std::max<std::int32_t>(column.ext().borderRight.width, 100);
             const std::int32_t bw = bleed * 2;
-            const std::int32_t halfW = std::max<std::int32_t>(column.borderRight.width / 2, 1);
+            const std::int32_t halfW = std::max<std::int32_t>(column.ext().borderRight.width / 2, 1);
             path.push_back(i);
             int stripIdx = 0;
             for (const auto& seg : columnRuleSpans(pageNode, node, x, y, mid, halfW, top, top + span)) {
@@ -2822,6 +2985,43 @@ struct FrameWalk {
 
     void visit(const Node& node, std::int32_t ox, std::int32_t oy, std::vector<int>& path, int layer, std::int64_t z,
                std::int64_t step, bool inObject, bool isPage, bool force = false) {
+        // 틀을 바꾸면 나올 때 되돌린다. 돌린 틀은 부모 자리가 원점이고, 세운 개체 상자는 다시 종이 그대로다.
+        struct TurnScope {
+            FrameWalk& walk;
+            bool turned;
+            std::int32_t x, y, span;
+            explicit TurnScope(FrameWalk& w)
+                : walk(w), turned(w.turned), x(w.turnX), y(w.turnY), span(w.turnSpan) {}
+            ~TurnScope() {
+                walk.turned = turned;
+                walk.turnX = x;
+                walk.turnY = y;
+                walk.turnSpan = span;
+            }
+        } turnScope(*this);
+        if (node.turned != 0) {
+            turned = true;
+            turnX = ox;
+            turnY = oy;
+            turnSpan = node.turnSpan > 0 ? node.turnSpan : (pageNode ? pageNode->width : 0);
+            ox = 0;
+            oy = 0;
+        }
+        if (node.upright && turned) {
+            // 세운 개체. 틀의 상자 (x, y, 너비, 높이) 는 종이에서 (turnX + turnSpan − y − 높이, turnY + x) 부터다.
+            const std::int32_t bx = ox + node.x;
+            const std::int32_t by = oy + node.y;
+            const std::int32_t paperX = turnX + turnSpan - by - node.height;
+            const std::int32_t paperY = turnY + bx;
+            turned = false;
+            for (int i = 0; i < static_cast<int>(node.children.size()); ++i) {
+                path.push_back(i);
+                visit(node.children[static_cast<std::size_t>(i)], paperX, paperY, path, layer, z, step, true, false,
+                      force);
+                path.pop_back();
+            }
+            return;
+        }
         if (!isPage && !force && node.huBoundsReady && misses(node.huX, node.huY, node.huW, node.huH)) {
             return;
         }
@@ -2839,8 +3039,8 @@ struct FrameWalk {
         bool nextIn = inObject;
         if (!isPage && node.kind == NodeKind::Line) {
             if (node.huBoundsReady) {
-                if (!misses(node.lineBoxX, node.lineBoxY, node.lineBoxW, node.lineBoxH)) {
-                    emit(node, 0, node.lineBoxX, node.lineBoxY, node.lineBoxW, node.lineBoxH, x, y, layer, z, path,
+                if (!misses(node.lineData().lineBoxX, node.lineData().lineBoxY, node.lineData().lineBoxW, node.lineData().lineBoxH)) {
+                    emit(node, 0, node.lineData().lineBoxX, node.lineData().lineBoxY, node.lineData().lineBoxW, node.lineData().lineBoxH, x, y, layer, z, path,
                          inObject);
                 }
                 bool hasInlineObj = false;
@@ -2866,12 +3066,12 @@ struct FrameWalk {
                 return;
             }
             std::int32_t top = y;
-            std::int32_t height = node.height > 0 ? node.height : node.textHeight;
-            if (node.auditRise > 0) {
-                top -= node.auditRise;
-                height += node.auditRise;
+            std::int32_t height = node.height > 0 ? node.height : node.lineData().textHeight;
+            if (node.lineData().auditRise > 0) {
+                top -= node.lineData().auditRise;
+                height += node.lineData().auditRise;
             }
-            height += std::max<std::int32_t>(0, node.auditBelow);
+            height += std::max<std::int32_t>(0, node.lineData().auditBelow);
             std::vector<InlineBorder> borders;
             const bool seated = treatAsCharBorders(node, doc, borders);
             std::int32_t extraLeft = 0;
@@ -2895,22 +3095,25 @@ struct FrameWalk {
             }
             // 문단 번호·글머리는 줄 왼쪽 밖에 매달린다. 칸이 그 글자를 잘라 내지 않게 늘린다.
             const std::int32_t slide = std::max<std::int32_t>(0, node.indent);
-            std::int32_t coveredAbove = std::max<std::int32_t>(0, node.auditRise);
+            std::int32_t coveredAbove = std::max<std::int32_t>(0, node.lineData().auditRise);
             std::int32_t coveredBelow =
-                (node.height > 0 ? node.height : node.textHeight) + std::max<std::int32_t>(0, node.auditBelow);
-            for (const Node& child : node.children) {
-                if (!child.headingMark) continue;
-                std::int32_t left = slide + child.x;
-                std::int32_t right = left + std::max(child.width, 0);
-                if (child.kind == NodeKind::Span && !child.advances.empty()) {
+                (node.height > 0 ? node.height : node.lineData().textHeight) + std::max<std::int32_t>(0, node.lineData().auditBelow);
+            if (const HeadingRun* head = lineGlyphs(node).heading.get()) {
+                const std::int32_t left = slide + head->x;
+                std::int32_t right = left + std::max(head->width, 0);
+                if (!head->advances.empty()) {
                     right = left;
-                    for (const std::int32_t width : child.advances) right += width;
-                } else if (child.kind == NodeKind::Object) {
-                    right = left + child.width;
+                    for (const std::int32_t width : head->advances) right += width;
                 }
                 if (left < 0) extraLeft = std::max(extraLeft, -left);
                 if (right > node.width) extraRight = std::max(extraRight, right - node.width);
-                if (child.kind != NodeKind::Object) continue;
+            }
+            for (const Node& child : node.children) {
+                if (!child.headingMark || child.kind != NodeKind::Object) continue;
+                const std::int32_t left = slide + child.x;
+                const std::int32_t right = left + child.width;
+                if (left < 0) extraLeft = std::max(extraLeft, -left);
+                if (right > node.width) extraRight = std::max(extraRight, right - node.width);
                 if (child.y < -coveredAbove) {
                     const std::int32_t more = -child.y - coveredAbove;
                     top -= more;
@@ -2945,8 +3148,8 @@ struct FrameWalk {
                 const bool fill = node.role == "pageFill";
                 std::int32_t bleed = 0;
                 if (!fill) {
-                    bleed = std::max({node.borderLeft.width, node.borderRight.width, node.borderTop.width,
-                                      node.borderBottom.width, static_cast<std::int32_t>(0)});
+                    bleed = std::max({node.ext().borderLeft.width, node.ext().borderRight.width, node.ext().borderTop.width,
+                                      node.ext().borderBottom.width, static_cast<std::int32_t>(0)});
                     bleed = bleed / 2 + 40;
                 }
                 const std::int32_t boxW = node.width + bleed * 2;
@@ -2977,9 +3180,9 @@ struct FrameWalk {
             std::int64_t myStep = step > 0 ? step : 1;
             // 쪽 위의 개체만 문서 zOrder를 쓴다. 묶음 안에서는 부모가 준 칸이 순서다.
             if (!inObject && !node.treatAsChar) {
-                const std::int64_t zo = node.zOrder;
+                const std::int64_t zo = node.ext().obj().zOrder;
                 const std::int64_t clamped = zo < -1000000 ? -1000000 : (zo > 1000000 ? 1000000 : zo);
-                const std::int64_t serial = node.objectPageSerial >= 0 ? node.objectPageSerial : pageSerial++;
+                const std::int64_t serial = node.ext().obj().objectPageSerial >= 0 ? node.ext().obj().objectPageSerial : pageSerial++;
                 myZ = (clamped + 1000000LL) * kFrameZGap + serial * kFrameZSlot;
                 // 띠 개체는 글 뒤 층의 맨 위 칸을 쓴다. 문서 zOrder 가 커도 본문 글 앞 개체를 덮지 않는다.
                 if (bandDepth > 0) myZ = (2000001LL + clamped + 1000000LL) * kFrameZGap + serial * kFrameZSlot;
@@ -3032,7 +3235,7 @@ struct FrameWalk {
                             bool straddles = false;
                             for (const Node& child : node.children) {
                                 if (child.kind != NodeKind::Cell) continue;
-                                if (node.cellSpacing <= 0 && !cellHasDiagonalStroke(child)) continue;
+                                if (node.ext().cellSpacing <= 0 && !cellHasDiagonalStroke(child)) continue;
                                 if (child.y < cand && child.y + child.height > cand) {
                                     straddles = true;
                                     break;
@@ -3072,16 +3275,16 @@ struct FrameWalk {
         if (!isPage && node.kind == NodeKind::Paragraph) {
             std::int32_t left = 0, top = 0, right = 0, bottom = 0;
             paragraphBorderBox(node, ox, oy, left, top, right, bottom);
-            const bool face = !node.fillColor.empty() && node.fillColor != "none";
-            const bool side = !node.borderLeft.type.empty() && node.borderLeft.type != "NONE";
+            const bool face = (!node.ext().fillColor.empty() && node.ext().fillColor != "none") || !node.ext().hatchStyle.empty();
+            const bool side = !node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE";
             const bool any = face || side ||
-                             (!node.borderRight.type.empty() && node.borderRight.type != "NONE") ||
-                             (!node.borderTop.type.empty() && node.borderTop.type != "NONE") ||
-                             (!node.borderBottom.type.empty() && node.borderBottom.type != "NONE");
+                             (!node.ext().borderRight.type.empty() && node.ext().borderRight.type != "NONE") ||
+                             (!node.ext().borderTop.type.empty() && node.ext().borderTop.type != "NONE") ||
+                             (!node.ext().borderBottom.type.empty() && node.ext().borderBottom.type != "NONE");
             if (any && right > left && bottom > top) {
                 const std::int32_t bleed =
-                    std::max({node.borderLeft.width, node.borderRight.width, node.borderTop.width,
-                              node.borderBottom.width, static_cast<std::int32_t>(80)}) +
+                    std::max({node.ext().borderLeft.width, node.ext().borderRight.width, node.ext().borderTop.width,
+                              node.ext().borderBottom.width, static_cast<std::int32_t>(80)}) +
                     40;
                 int join = 0;
                 if (!path.empty() && pageNode) {
@@ -3117,40 +3320,58 @@ const Node* frameNode(const Node& page, const std::vector<int>& path) {
 }
 
 bool lineHasGlyphSource(const Node& line) {
+    if (lineGlyphs(line).heading && !lineGlyphs(line).heading->text.empty()) return true;
     for (const Node& child : line.children) {
-        if (child.kind == NodeKind::Span && !child.text.empty()) return true;
         if (child.kind == NodeKind::Object) return true;
-        if (child.noteMark && !child.text.empty()) return true;
+    }
+    for (const LineRun& run : lineGlyphs(line).runs) {
+        if (run.kind == RunKind::Object || run.textEnd > run.textBegin) return true;
     }
     return false;
 }
 
-bool lineHasBitmapInk(const Node& line) {
-    if (line.auditLine) return true;
+bool lineHasBitmapInk(const Node& line, const model::Document* doc) {
+    if (line.lineData().auditLine) return true;
+    const auto set = [](const std::string* name, const char* none) { return name && *name != none; };
+    for (const LineRun& run : lineGlyphs(line).runs) {
+        if (run.kind == RunKind::Object) continue;
+        if (set(run.style->markpen, "none")) return true;
+        if (run.kind == RunKind::Tab && (line.lineData().deferTabs || set(run.style->tabLeader, "NONE"))) return true;
+        if (!doc) continue;
+        const detail::CharPaint paint = detail::charPaint(*doc, run.charShapeId);
+        if (!paint.fillColor.empty() || !paint.hatchStyle.empty()) return true;
+        if (!paint.shade.empty() && paint.shade != "none") return true;
+        if (paint.bitmapDeco || !paint.underline.empty() || paint.strikeout) return true;
+    }
     for (const Node& slot : line.children) {
         if (slot.headingMark && slot.kind == NodeKind::Object) return true;
-        if (!slot.fillColor.empty() && slot.fillColor != "none") return true;
-        if (!slot.shade.empty() && slot.shade != "none") return true;
-        if (!slot.markpen.empty() && slot.markpen != "none") return true;
-        if (slot.bitmapDeco) return true;
-        if (!slot.underline.empty() && slot.underline != "NONE") return true;
-        if (slot.strikeout) return true;
-        if (slot.text == "\t" && (line.deferTabs || (!slot.tabLeader.empty() && slot.tabLeader != "NONE"))) return true;
+        if (!slot.ext().fillColor.empty() && slot.ext().fillColor != "none") return true;
+        if (!slot.ext().hatchStyle.empty()) return true;
     }
     return false;
 }
 
 }  // namespace
 
+namespace {
+std::atomic<int> gZoomedFrameSide{0};
+std::atomic<std::int64_t> gZoomedFramePixels{0};
+}  // namespace
+
+void setZoomedFrameLimit(int side, std::int64_t pixels) {
+    gZoomedFrameSide.store(std::max(0, side));
+    gZoomedFramePixels.store(std::max<std::int64_t>(0, pixels));
+}
+
 bool canBakeFrame(const FrameDesc& frame) {
     if (frame.w <= 0 || frame.h <= 0 || frame.w > 8192 || frame.h <= 0 || frame.h > 8192) return false;
     if (frame.baseOnly && frame.percent > 100) return false;
-#if defined(__EMSCRIPTEN__)
     if (frame.percent > 100 && frame.kind != 0) {
-        if (frame.w > 2048 || frame.h > 2048) return false;
-        if (static_cast<std::int64_t>(frame.w) * static_cast<std::int64_t>(frame.h) > 2048LL * 1536LL) return false;
+        const int side = gZoomedFrameSide.load();
+        if (side > 0 && (frame.w > side || frame.h > side)) return false;
+        const std::int64_t pixels = gZoomedFramePixels.load();
+        if (pixels > 0 && static_cast<std::int64_t>(frame.w) * static_cast<std::int64_t>(frame.h) > pixels) return false;
     }
-#endif
     return true;
 }
 
@@ -3203,6 +3424,45 @@ std::vector<FrameDesc> collectFrames(const Node& page, int pageIndex, int pixelH
     return frames;
 }
 
+namespace {
+
+// 돌린 틀의 비트맵을 시계 방향으로 돌린다. 종이 칸 (x, y) 는 틀의 (y, w − 1 − x) 다.
+std::vector<std::uint8_t> turnedPixels(const Bitmap& source, int w, int h) {
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u, 0);
+    if (source.px.size() < out.size() || source.width != h || source.height != w) return out;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const std::uint8_t* from = source.px.data() + (static_cast<std::size_t>(w - 1 - x) * h + y) * 4u;
+            std::memcpy(out.data() + (static_cast<std::size_t>(y) * w + x) * 4u, from, 4);
+        }
+    }
+    return out;
+}
+
+// 돌린 틀에서 적은 글자 자리를 종이 칸으로 옮긴다. 틀의 점 (x, y) 는 칸의 (w − y, x) 다.
+// 눕힌 글자는 펜을 옮기고 마스크를 돌려 찍게 한다. 세운 글자는 틀에서 돌린 만큼 다시 돌아와 마스크를 그대로 찍는다.
+void turnFrameGlyphs(std::vector<FrameGlyph>& glyphs, int w) {
+    const float right = static_cast<float>(w);
+    for (FrameGlyph& glyph : glyphs) {
+        if (glyph.upright) {
+            const float cx = right - glyph.turnCy;
+            const float cy = glyph.turnCx;
+            const float penX = cx + (glyph.penX - glyph.turnCx) - glyph.turnDy;
+            const float penY = cy + (glyph.penY - glyph.turnCy) + glyph.turnDx;
+            glyph.penX = penX;
+            glyph.penY = penY;
+            glyph.turn = 0;
+        } else {
+            const float penX = right - glyph.penY;
+            glyph.penY = glyph.penX;
+            glyph.penX = penX;
+            glyph.turn = 1;
+        }
+    }
+}
+
+}  // namespace
+
 PageBitmap renderFrame(const model::Document& doc, const Node& page, const FrameDesc& frame) {
     PageBitmap bitmap;
     const Node* node = frameNode(page, frame.path);
@@ -3212,64 +3472,62 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
     painter.pageIndex = frame.page;
     painter.pass = PaintLayer::All;
     painter.scale = static_cast<float>(frame.pixelHeight) / static_cast<float>(page.height);
-    painter.bitmap.width = frame.w;
-    painter.bitmap.height = frame.h;
-    painter.bitmap.clipR = frame.w;
-    painter.bitmap.clipB = frame.h;
+    // 세로쓰기 칸은 돌린 틀(가로 = 종이 세로)로 그린 뒤 시계 방향으로 돌린다. 줄 자리 캐시는 쓰지 않는다.
+    const bool turned = frame.turned;
+    painter.bitmap.width = turned ? frame.h : frame.w;
+    painter.bitmap.height = turned ? frame.w : frame.h;
+    painter.bitmap.clipR = painter.bitmap.width;
+    painter.bitmap.clipB = painter.bitmap.height;
     const std::int32_t padHu = static_cast<std::int32_t>(std::lround(static_cast<double>(kFramePad) / painter.scale));
     painter.framePadHu = padHu;
     std::vector<GlyphSpot> spots;
-    bool placed = takeLinePlaces(frame, spots);
+    bool placed = !turned && takeLinePlaces(frame, spots);
     // 글자를 다 지운 줄은 이전에 적어 둔 글자 자리를 다시 그리지 않는다.
     if (placed && frame.kind == 0 && !lineHasGlyphSource(*node)) {
         placed = false;
         spots.clear();
     }
     std::vector<GlyphSpot> recorded;
-    if (!placed) painter.placeSink = &recorded;
+    if (!placed && !turned) painter.placeSink = &recorded;
     if (placed) painter.skipGlyphs = true;
     painter.skipInlineObjects = true;
     painter.seedObjectHosts(page, frame.path);
     const bool clippedByAncestor =
         painter.seedAncestorClips(page, frame.path, padHu, frame.huX, frame.huY, frame.huW, frame.huH);
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-    std::vector<FrameGlyph> captured;
+    FrameGlyphs captured;
     if (!placed && screenVectors() && !clippedByAncestor) painter.glyphSink = &captured;
     // 개체 칸의 그림은 굽지 않고 화면이 텍스처로 그린다. 조상이 자르는 범위는 그림마다 적어 둔다.
     std::vector<FramePicture> pictures;
-    if (frame.kind == 1 && screenVectors()) painter.pictureSink = &pictures;
-#endif
+    if (frame.kind == 1 && screenVectors() && !turned) painter.pictureSink = &pictures;
     // 표와 쪽 테두리 칸은 선을 칠하지 않고 적어 두었다가 화면 셰이더가 그린다. 대각선은 비트맵에 남는다.
     std::vector<BorderPiece> borders;
     const bool tableStroke = (frame.kind >= 3 && frame.kind < 100 && node->kind != NodeKind::Column) || frame.kind >= 700;
-    if (tableStroke && bordersOnScreen()) painter.borderSink = &borders;
-    const bool needPaintPiece = !placed || frame.kind != 0 || lineHasBitmapInk(*node) || clippedByAncestor;
+    if (tableStroke && bordersOnScreen() && !turned) painter.borderSink = &borders;
+    const bool needPaintPiece = !placed || frame.kind != 0 || lineHasBitmapInk(*node, &doc) || clippedByAncestor;
     if (needPaintPiece) {
         std::int32_t stripY0 = 0;
         std::int32_t stripY1 = -1;
+        std::int32_t stripX0 = 0;
+        std::int32_t stripX1 = -1;
         if (frame.kind >= 3 && node->role == "table") {
             const std::int32_t bleed = tableBorderBleed(*node);
             stripY0 = std::max<std::int32_t>(0, (frame.huY - frame.originY) + bleed);
             stripY1 = stripY0 + std::max<std::int32_t>(0, frame.huH - bleed * 2);
+            stripX0 = std::max<std::int32_t>(0, (frame.huX - frame.originX) + bleed);
+            stripX1 = stripX0 + std::max<std::int32_t>(0, frame.huW - bleed * 2);
         } else if (frame.kind >= 3 && node->kind == NodeKind::Column) {
-            const std::int32_t bleed = std::max<std::int32_t>(node->borderRight.width, 100);
+            const std::int32_t bleed = std::max<std::int32_t>(node->ext().borderRight.width, 100);
             stripY0 = 0;
             stripY1 = std::max<std::int32_t>(0, frame.huH - bleed * 2);
         }
         painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.huX, padHu + frame.originY - frame.huY,
-                           frame.inObject, stripY0, stripY1);
+                           frame.inObject, stripY0, stripY1, stripX0, stripX1);
     }
-    if (!placed) {
+    if (!placed && !turned) {
         spotsToPage(recorded, frame, padHu);
-        keepLinePlaces(frame, recorded);
+        keepLinePlaces(frame, std::move(recorded));
     }
     std::vector<GlyphSpot> local = placed ? spotsInFrame(spots, frame, padHu) : std::vector<GlyphSpot>{};
-    if (placed && painter.objectHostCount > 0) {
-        for (GlyphSpot& spot : local) {
-            if (spot.hostCount == 0) painter.stampHosts(spot.hosts, spot.hostCount);
-        }
-    }
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     if (placed && screenVectors() && !clippedByAncestor) {
         painter.skipGlyphs = false;
         painter.glyphSink = &captured;
@@ -3282,6 +3540,7 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
         dropFrameGlyphs(frame.id);
     } else if (painter.glyphSink) {
         painter.glyphSink = nullptr;
+        if (turned) turnFrameGlyphs(captured.glyphs, frame.w);
         storeFrameGlyphs(frame.id, std::move(captured));
     } else {
         dropFrameGlyphs(frame.id);
@@ -3289,19 +3548,16 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
     painter.pictureSink = nullptr;
     const bool hasPictures = !pictures.empty();
     storeFramePictures(frame.id, std::move(pictures));
-#else
-    if (placed) {
-        painter.skipGlyphs = false;
-        painter.replaySpots(local);
-    }
-#endif
     painter.borderSink = nullptr;
     storeFrameBorders(frame.id, painter.scale, std::move(borders));
     bitmap.width = frame.w;
     bitmap.height = frame.h;
-    bitmap.rgba = std::move(painter.bitmap.px);
+    if (turned) {
+        bitmap.rgba = turnedPixels(painter.bitmap, frame.w, frame.h);
+    } else {
+        bitmap.rgba = std::move(painter.bitmap.px);
+    }
     bitmap.incomplete = painter.pictureMissed;
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     // 그림만 있는 칸은 비트맵이 다 투명하다. 올리지 않게 비운다. 크기는 남겨 화면 배율을 잰다.
     if (hasPictures) {
         bool ink = false;
@@ -3316,78 +3572,7 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
             bitmap.rgba.shrink_to_fit();
         }
     }
-#endif
     return bitmap;
-}
-
-std::vector<std::string> pageFaceNames(const Node& page) {
-    std::vector<std::string> faces;
-    std::unordered_set<std::string> seenFaces;
-    std::vector<PageGlyph> uses;
-    std::unordered_set<std::string> seenUses;
-    collectPageGlyphs(page, {}, faces, seenFaces, uses, seenUses);
-    return faces;
-}
-
-std::vector<std::string> documentFaceNames(const std::vector<Node>& pages) {
-    std::vector<std::string> faces;
-    std::unordered_set<std::string> seenFaces;
-    std::vector<PageGlyph> uses;
-    std::unordered_set<std::string> seenUses;
-    for (const Node& page : pages) collectPageGlyphs(page, {}, faces, seenFaces, uses, seenUses);
-    return faces;
-}
-
-GlyphWarm warmDocumentGlyphs(const std::vector<Node>& pages, int percent) {
-    GlyphWarm warm;
-    const int zoom = percent > 0 ? percent : 100;
-    std::vector<std::string> faces;
-    std::unordered_set<std::string> seenFaces;
-    std::vector<PageGlyph> uses;
-    std::unordered_set<std::string> seenUses;
-    for (const Node& page : pages) {
-        if (page.height <= 0) continue;
-        collectPageGlyphs(page, {}, faces, seenFaces, uses, seenUses);
-    }
-    float scale = 1.f;
-    for (const Node& page : pages) {
-        if (page.height <= 0) continue;
-        scale = static_cast<float>(pagePixelHeight(page.height, zoom)) / static_cast<float>(page.height);
-        break;
-    }
-    std::unordered_set<std::string> loaded;
-    for (const PageGlyph& item : uses) {
-        const float pixel = std::max(1.f, static_cast<float>(item.fontSize) * scale);
-        const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
-        rememberOutline(item.font, item.cp, item.bold, item.italic, ppem, loaded);
-    }
-    warm.faces = static_cast<int>(loaded.size());
-    warm.glyphs = static_cast<int>(uses.size());
-    std::fprintf(stderr, "[noting] 글꼴 %d종 글리프 %d개\n", warm.faces, warm.glyphs);
-    return warm;
-}
-
-GlyphWarm warmPageGlyphs(const Node& page, int pageIndex, int percent) {
-    GlyphWarm warm;
-    if (page.height <= 0) return warm;
-    const int zoom = percent > 0 ? percent : 100;
-    const int pixelH = pagePixelHeight(page.height, zoom);
-    const float scale = static_cast<float>(pixelH) / static_cast<float>(page.height);
-    std::vector<std::string> faces;
-    std::unordered_set<std::string> seenFaces;
-    std::vector<PageGlyph> uses;
-    std::unordered_set<std::string> seenUses;
-    collectPageGlyphs(page, {}, faces, seenFaces, uses, seenUses);
-    std::unordered_set<std::string> loaded;
-    for (const PageGlyph& item : uses) {
-        const float pixel = std::max(1.f, static_cast<float>(item.fontSize) * scale);
-        const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
-        rememberOutline(item.font, item.cp, item.bold, item.italic, ppem, loaded);
-    }
-    warm.faces = static_cast<int>(loaded.size());
-    warm.glyphs = static_cast<int>(uses.size());
-    std::fprintf(stderr, "[noting] %d쪽 글꼴 %d종 글리프 %d개\n", pageIndex + 1, warm.faces, warm.glyphs);
-    return warm;
 }
 
 // 윤곽은 굽지 않고, 이 줄의 전진폭과 글자 자리만 남긴다.
@@ -3419,12 +3604,12 @@ void writeLinePlace(const model::Document& doc, const Node& page, const FrameDes
     painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.huX, padHu + frame.originY - frame.huY,
                        frame.inObject);
     spotsToPage(spots, frame, padHu);
-    keepLinePlaces(frame, spots);
+    keepLinePlaces(frame, std::move(spots));
 }
 
 bool linePlaceKept(const FrameDesc& frame) {
-    std::vector<GlyphSpot> spots;
-    return takeLinePlaces(frame, spots);
+    SharedLinePlaces places;
+    return findLinePlaces(frame, places);
 }
 
 int cachePageLines(const model::Document& doc, const Node& page, int pageIndex, int percent) {
@@ -3440,7 +3625,7 @@ int cachePageLines(const model::Document& doc, const Node& page, int pageIndex, 
         if (!takeLinePlaces(frame, existing)) writeLinePlace(doc, page, frame, pixelH);
         ++kept;
     }
-    std::fprintf(stderr, "[noting] %d쪽 줄 자리 %d\n", pageIndex + 1, kept);
+    std::fprintf(stderr, "[ClassingHWP] %d쪽 줄 자리 %d\n", pageIndex + 1, kept);
     return kept;
 }
 
@@ -3519,11 +3704,6 @@ LineNote cacheIdleLines(const model::Document& doc, std::vector<Node>& pages, in
     const int jobCount = static_cast<int>(jobs.size());
     int usedThreads = 1;
     if (jobCount > 0) {
-#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-        for (const LineJob& job : jobs) {
-            writeLinePlace(doc, pages[static_cast<std::size_t>(job.page)], job.frame, job.pixelH);
-        }
-#else
         const int threads = layout::workerCount(jobCount);
         if (threads <= 1) {
             for (const LineJob& job : jobs) {
@@ -3546,10 +3726,9 @@ LineNote cacheIdleLines(const model::Document& doc, std::vector<Node>& pages, in
             }
             for (std::thread& worker : pool) worker.join();
         }
-#endif
         note.recorded += jobCount;
         out.made = jobCount;
-        std::string line = "[noting] 스레드 " + std::to_string(usedThreads) + " 줄 " + std::to_string(jobCount);
+        std::string line = "[ClassingHWP] 스레드 " + std::to_string(usedThreads) + " 줄 " + std::to_string(jobCount);
         for (const PageTally& tally : tallies) {
             if (tally.lines <= 0 || tally.placed <= 0) continue;
             line += " · " + std::to_string(tally.page + 1) + "쪽 " + std::to_string(tally.placed) + "/" +
@@ -3569,7 +3748,7 @@ LineNote cacheIdleLines(const model::Document& doc, std::vector<Node>& pages, in
     }
     if (!remain) {
         note.told = true;
-        if (note.recorded > 0) std::fprintf(stderr, "[noting] 줄 전진폭을 다 적었다\n");
+        if (note.recorded > 0) std::fprintf(stderr, "[ClassingHWP] 줄 전진폭을 다 적었다\n");
     } else {
         out.more = true;
     }
@@ -3581,13 +3760,49 @@ void noteDocumentGlyphs(const model::Document& doc) { gatherDocumentGlyphs(doc);
 void clearGlyphWarm() {
     clearDocumentGlyphs();
     clearHangulOutlineCache();
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     clearScreenGlyphs();
-#endif
+    // 그사이 들어온 글꼴이 있을 수 있다. 없어서 대체로 열어 둔 글꼴과 굵기 판단을 다시 본다.
+    {
+        std::unique_lock lock(gFaceMu);
+        forgetMissingFacesLocked();
+        // 이름별로 고른 글자(대체 글자 포함)도 다시 고른다. 글자 자체는 gGlyphMem 에 남아 다시 쓴다.
+        resolvedFaces().clear();
+    }
+    {
+        // FreeType 윤곽도 글꼴 이름으로 연다. 대체 글꼴로 열어 둔 이름이 있을 수 있어 모두 닫고 쓸 때 다시 연다.
+        std::lock_guard ft(gFtMutex);
+        for (auto& [key, slot] : gFtFaces) {
+            if (slot.face) FT_Done_Face(slot.face);
+        }
+        gFtFaces.clear();
+    }
+    std::lock_guard lock(gBoldMu);
+    gBoldFace.clear();
 }
 
 PageBitmap renderPageBitmap(const model::Document& doc, const Node& page, int pixelHeight) {
     return renderPageBitmap(doc, page, pixelHeight, 0, 0, 0, 0);
+}
+
+namespace {
+std::atomic<bool> gPageImageGpu{true};
+}  // namespace
+
+void setPageImageGpu(bool on) { gPageImageGpu.store(on, std::memory_order_relaxed); }
+
+bool pageImageGpu() { return gPageImageGpu.load(std::memory_order_relaxed); }
+
+PageImage encodePageImage(const PageBitmap& bitmap) {
+    PageImage image;
+    if (bitmap.rgba.empty()) return image;
+    image.width = bitmap.width;
+    image.height = bitmap.height;
+    Bitmap raw;
+    raw.width = bitmap.width;
+    raw.height = bitmap.height;
+    raw.px = bitmap.rgba;
+    image.png = encodePng(raw);
+    return image;
 }
 
 PageImage renderPagePng(const model::Document& doc, const Node& page, int pixelHeight) {
@@ -3786,7 +4001,7 @@ CaretPlace caretInStory(const model::Document& doc, const std::vector<Node>& pag
         if (targetPage.spansLater) ensurePageSpans(doc, const_cast<Node&>(targetPage));
         const PageStoryLinesSlot& slot = ensurePageStoryLines(painter, doc, targetPage, page, story);
         if (const Painter::StoryLine* line = painter.nearestLine(slot.lines, x, y)) {
-            place = painter.placeOnLine(*line, x, drag, anchorParagraph, anchorOffset);
+            place = painter.placeOnLine(*line, Painter::alongLine(*line, x, y), drag, anchorParagraph, anchorOffset);
             if (place.hit) place.page = page;
             return place;
         }
@@ -3881,7 +4096,6 @@ std::vector<BlockBox> blockBoxes(const model::Document& doc, const std::vector<N
 void invertOpaqueColors(std::vector<std::uint8_t>& rgba, int width, int height) {
     const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
     if (width <= 0 || height <= 0 || rgba.size() < bytes) return;
-#if NOTING_HAS_SKIA
     std::vector<std::uint8_t> src = rgba;
     const SkImageInfo info = SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
     const SkPixmap pixmap(info, src.data(), static_cast<std::size_t>(width) * 4u);
@@ -3896,7 +4110,6 @@ void invertOpaqueColors(std::vector<std::uint8_t>& rgba, int width, int height) 
         surface->getCanvas()->drawImage(image.get(), 0, 0, SkSamplingOptions(), &paint);
         return;
     }
-#endif
     for (std::size_t i = 0; i + 3 < bytes; i += 4) {
         rgba[i] = static_cast<std::uint8_t>(255 - rgba[i]);
         rgba[i + 1] = static_cast<std::uint8_t>(255 - rgba[i + 1]);
@@ -3916,7 +4129,6 @@ void fillCaret(std::vector<std::uint8_t>& rgba, int width, int height, bool ligh
     const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
     rgba.assign(bytes, 0);
     if (width <= 0 || height <= 0) return;
-#if NOTING_HAS_SKIA
     const SkImageInfo info = SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
     const sk_sp<SkSurface> surface = SkSurfaces::WrapPixels(info, rgba.data(), static_cast<std::size_t>(width) * 4u);
     if (surface) {
@@ -3925,7 +4137,6 @@ void fillCaret(std::vector<std::uint8_t>& rgba, int width, int height, bool ligh
         surface->getCanvas()->drawRect(SkRect::MakeWH(static_cast<float>(width), static_cast<float>(height)), paint);
         return;
     }
-#endif
     const std::uint8_t value = light ? 255 : 0;
     for (std::size_t i = 0; i + 3 < bytes; i += 4) {
         rgba[i] = value;
@@ -4046,9 +4257,16 @@ std::vector<SelectionImage> paintSelection(const model::Document& doc, const std
         cursor.pageH = pixelH;
         cursor.x = std::clamp(scaleHu(caret.x, page.width, pixelW), 0, std::max(0, pixelW - 1));
         cursor.y = std::clamp(scaleHu(caret.y, page.height, pixelH), 0, std::max(0, pixelH - 1));
-        cursor.width = 1;
-        const int cursorH = std::max(1, scaleHu(caret.height, page.height, pixelH));
-        cursor.height = std::min(cursorH, std::max(1, pixelH - cursor.y));
+        if (caret.turned) {
+            // 세로쓰기 커서는 누운 막대다.
+            const int cursorW = std::max(1, scaleHu(caret.height, page.width, pixelW));
+            cursor.width = std::min(cursorW, std::max(1, pixelW - cursor.x));
+            cursor.height = 1;
+        } else {
+            cursor.width = 1;
+            const int cursorH = std::max(1, scaleHu(caret.height, page.height, pixelH));
+            cursor.height = std::min(cursorH, std::max(1, pixelH - cursor.y));
+        }
         fillCaret(cursor.rgba, cursor.width, cursor.height, !local.empty());
         images.push_back(std::move(cursor));
     }
@@ -4093,21 +4311,21 @@ CaretPlace caretForCursor(const model::Document& doc, const std::vector<Node>& p
                 hasFallback = true;
                 if (pos.offset >= line.node->start && pos.offset <= maxOff) {
                     const bool startsWithObject =
-                        !line.node->children.empty() && line.node->children.front().kind == NodeKind::Object;
+                        lineStartsWithObject(*line.node);
                     const PointerHold& hold = pointerHold();
                     const bool caretWasOnThisLine =
                         hold.caret.hit && hold.caretPage == pageIndex &&
                         std::abs(hold.caret.y - (line.y + line.node->marginTop)) <= 4;
                     if (best.hit && !prevLineBreak && pos.offset == line.node->start && pos.offset == prevMaxOff &&
                         startsWithObject && !caretWasOnThisLine) {
-                        prevLineBreak = line.node->lineBreak;
+                        prevLineBreak = line.node->lineData().lineBreak;
                         prevMaxOff = maxOff;
                         continue;
                     }
                     best = painter.placeOnLineAtOffset(line, pos.offset);
                     best.page = pageIndex;
                 }
-                prevLineBreak = line.node->lineBreak;
+                prevLineBreak = line.node->lineData().lineBreak;
                 prevMaxOff = maxOff;
             }
         });
@@ -4193,6 +4411,87 @@ CursorStyle cursorStyleForCaret(const model::Document& doc, const CaretPlace& ca
     return st;
 }
 
+namespace {
+
+// 블록이 덮는 문단과 글자 구간을 훑어 값이 섞였는지 적는다. 문단 값(스타일·정렬·줄 간격)은 블록이 지나는 문단,
+// 글자 값은 블록 안 글자가 있는 구간만 본다. 블록이 다음 문단 맨 앞에서 끝나면 그 문단은 넣지 않는다.
+void markMixed(const model::Document& doc, const std::vector<Node>& pages, const PointerCursor& cur, CursorStyle& st) {
+    const std::vector<model::Paragraph>* paras = storyParagraphs(doc, cur.story);
+    if (!paras) return;
+    const int last = static_cast<int>(paras->size()) - 1;
+    const int firstPara = std::clamp(cur.startParagraph, 0, last);
+    const int lastPara = std::clamp(cur.endParagraph, 0, last);
+    const int startChar = offsetToCharIndex(doc, pages, cur.story, firstPara, cur.startOffset);
+    const int endChar = offsetToCharIndex(doc, pages, cur.story, lastPara, cur.endOffset);
+    std::unordered_map<std::uint32_t, CursorStyle> charStyles;
+    const auto charStyle = [&](std::uint32_t id) -> const CursorStyle& {
+        auto found = charStyles.find(id);
+        if (found == charStyles.end()) {
+            CaretPlace probe;
+            probe.charShapeId = id;
+            found = charStyles.emplace(id, cursorStyleForCaret(doc, probe)).first;
+        }
+        return found->second;
+    };
+    const auto codePoints = [](const std::string& text) {
+        int count = 0;
+        for (unsigned char c : text) {
+            if ((c & 0xC0) != 0x80) ++count;
+        }
+        return count;
+    };
+    for (int p = firstPara; p <= lastPara; ++p) {
+        const model::Paragraph& para = (*paras)[static_cast<std::size_t>(p)];
+        const int from = p == firstPara ? startChar : 0;
+        const int to = p == lastPara ? endChar : std::numeric_limits<int>::max();
+        if (p == lastPara && p != firstPara && endChar <= 0) break;
+        CaretPlace paraProbe;
+        paraProbe.styleId = para.styleId;
+        paraProbe.paraShapeId = para.paraShapeId;
+        const CursorStyle paraStyle = cursorStyleForCaret(doc, paraProbe);
+        st.mixed.style = st.mixed.style || paraStyle.styleId != st.styleId;
+        st.mixed.align = st.mixed.align || paraStyle.align != st.align;
+        st.mixed.lineSpacing = st.mixed.lineSpacing || paraStyle.lineSpacing != st.lineSpacing ||
+                               paraStyle.lineSpacingType != st.lineSpacingType;
+        int pos = 0;
+        for (const model::Run& run : para.runs) {
+            int length = 0;
+            for (const model::InlineItem& item : run.items) {
+                if (item.type == model::InlineItem::Type::Text) length += codePoints(item.text);
+                else if (isCaretCharControl(item.control)) ++length;
+            }
+            const int runFrom = pos;
+            pos += length;
+            if (length <= 0 || pos <= from || runFrom >= to) continue;
+            const CursorStyle& cs = charStyle(run.charShapeId);
+            st.mixed.font = st.mixed.font || cs.font != st.font;
+            st.mixed.fontSize = st.mixed.fontSize || cs.fontSize != st.fontSize;
+            st.mixed.bold = st.mixed.bold || cs.bold != st.bold;
+            st.mixed.italic = st.mixed.italic || cs.italic != st.italic;
+            st.mixed.underline = st.mixed.underline || cs.underlineType != st.underlineType;
+            st.mixed.strikeout = st.mixed.strikeout || cs.strikeout != st.strikeout;
+            st.mixed.color = st.mixed.color || cs.color != st.color;
+        }
+    }
+}
+
+}  // namespace
+
+double CursorStyle::lineSpacingValue() const {
+    const bool percent = lineSpacingType.empty() || lineSpacingType == "PERCENT";
+    return percent ? static_cast<double>(lineSpacing) : huToPt(lineSpacing, 1);
+}
+
+const char* CursorStyle::lineSpacingUnit() const {
+    return lineSpacingType.empty() || lineSpacingType == "PERCENT" ? "%" : "pt";
+}
+
+double CursorStyle::fontSizePt() const { return huToPt(fontSize, 1); }
+
+double CursorStyle::fontSizeIn(const std::string& unit) const {
+    return huToLength(fontSize, lengthUnitOf(unit), 2);
+}
+
 CursorStyle cursorStyle(const model::Document& doc, const std::vector<Node>& pages) {
     const PointerHold& hold = pointerHold();
     const PointerCursor cur = pointerCursor();
@@ -4207,7 +4506,9 @@ CursorStyle cursorStyle(const model::Document& doc, const std::vector<Node>& pag
             selCaret.styleId = startPara->styleId;
             selCaret.paraShapeId = startPara->paraShapeId;
             selCaret.charShapeId = charShapeAtParagraphChar(*startPara, startChar, true);
-            return cursorStyleForCaret(doc, selCaret);
+            CursorStyle st = cursorStyleForCaret(doc, selCaret);
+            markMixed(doc, pages, cur, st);
+            return st;
         }
     }
     if (hold.caret.hit) {
@@ -4271,6 +4572,7 @@ struct CaretLineWalk {
 CaretStatus caretStatus(const model::Document& doc, const std::vector<Node>& pages) {
     CaretStatus st;
     st.sectionCount = static_cast<int>(doc.sections.size());
+    st.overwrite = overwrite();
     // 블록이면 끄는 쪽 끝(focus)을 센다. 커서가 없으면 마지막으로 놓은 캐럿을 쓴다.
     const PointerCursor cur = pointerCursor();
     const PointerHold& hold = pointerHold();
@@ -4319,16 +4621,156 @@ void forgetLayoutNodeCaches() {
     // 글자 측정은 내용으로 다시 확인하므로 남긴다.
     std::unique_lock lock(gSpanMu);
     lineBlockCache().clear();
-    tabMeasures().clear();
     gPageStoryLinesCache.clear();
     gPageBlockSelectionCache.clear();
 }
 
-void evictLineGlyph(const Node& line, const Node& span) {
+namespace {
+
+// 문서가 그리는 글자를 접기 전에 뽑아 두는 일. 쉬는 프레임마다 조금씩 한다.
+struct FontFoldPrep {
+    const model::Document* doc = nullptr;
+    std::vector<layout::DrawnGlyph> glyphs;
+    std::size_t next = 0;
+    bool listed = false;
+    bool ready = false;
+};
+
+FontFoldPrep& fontFoldPrep() {
+    static FontFoldPrep prep;
+    return prep;
+}
+
+std::mutex gFontFoldMu;
+
+// 접힌 파일의 TTF 를 그리기 쪽에서도 놓는다. gFaceMu·gFtMutex 를 잡고 부른다.
+void releaseFontBytesLocked(const void* data) {
+    for (Face& face : gOpenFaces) {
+        if (face.bytes.get() != data) continue;
+        face.bytes.reset();
+        face.info = stbtt_fontinfo{};
+        face.folded = true;
+    }
+    for (auto it = gFtFaces.begin(); it != gFtFaces.end();) {
+        if (it->second.bytes.get() == data) {
+            if (it->second.face) FT_Done_Face(it->second.face);
+            it = gFtFaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// 오래 안 쓴 파일부터 need 바이트만큼 접는다. minIdleMs 안에 쓴 파일과 pinned 파일은 남긴다.
+std::size_t foldFontFiles(std::size_t need, std::int64_t minIdleMs, const std::vector<const void*>& pinned) {
+    if (!fontFoldPrep().ready) return 0;
+    std::vector<layout::OpenFontFile> files = layout::openFontFiles();
+    // 오래 안 쓴 것부터 접는다. 같은 초 안에 쓴 것끼리는 큰 파일부터 접어 적게 접고도 예산에 든다.
+    std::sort(files.begin(), files.end(), [](const layout::OpenFontFile& a, const layout::OpenFontFile& b) {
+        const std::int64_t aSecond = a.lastUseMs / 1000;
+        const std::int64_t bSecond = b.lastUseMs / 1000;
+        if (aSecond != bSecond) return aSecond < bSecond;
+        return a.bytes > b.bytes;
+    });
+    const std::int64_t now = layout::fontClockMs();
+    std::size_t released = 0;
+    for (const layout::OpenFontFile& file : files) {
+        if (released >= need) break;
+        if (now - file.lastUseMs < minIdleMs) continue;
+        if (std::find(pinned.begin(), pinned.end(), file.key) != pinned.end()) continue;
+        std::unique_lock faceLock(gFaceMu);
+        std::lock_guard ftLock(gFtMutex);
+        const void* data = layout::foldFontFile(file.key);
+        if (!data) continue;
+        releaseFontBytesLocked(data);
+        released += file.bytes;
+        std::printf("{\"글꼴접기\":\"%s\",\"MB\":%.1f,\"쉰초\":%.0f}\n", file.faces.empty() ? "" : file.faces.front().c_str(),
+                    static_cast<double>(file.bytes) / 1048576.0, static_cast<double>(now - file.lastUseMs) / 1000.0);
+    }
+    if (released > 0) std::fflush(stdout);
+    return released;
+}
+
+class FontFilePool final : public CachePool {
+public:
+    const char* name() const override { return "fonts"; }
+    std::size_t bytes() const override {
+        std::size_t open = 0;
+        for (const layout::OpenFontFile& file : layout::openFontFiles()) open += file.bytes;
+        return open + layout::packedFontBytes();
+    }
+    // 메모리 신호로 비울 때: Spare 는 오래 안 쓴 글꼴, Recent 는 잠깐이라도 안 쓴 글꼴, Near 는 커서 글꼴 말고 모두.
+    std::size_t release(CacheTier tier, std::size_t need) override {
+        std::lock_guard lock(gFontFoldMu);
+        const std::int64_t idle = tier == CacheTier::Spare ? kFontRecentMs : (tier == CacheTier::Recent ? 2000 : 0);
+        return foldFontFiles(need, idle, pinnedFiles_);
+    }
+    std::vector<const void*> pinnedFiles_;
+};
+
+FontFilePool& fontFilePool() {
+    static FontFilePool pool;
+    static const bool registered = (registerCachePool(pool, kFontFileBudget), true);
+    (void)registered;
+    return pool;
+}
+
+}  // namespace
+
+void resetFontFold() {
+    std::lock_guard lock(gFontFoldMu);
+    fontFoldPrep() = FontFoldPrep{};
+}
+
+void foldIdleFonts(const model::Document& doc, const std::function<std::uint32_t()>& cursorCharShape, double budgetMs) {
+    FontFilePool& pool = fontFilePool();
+    std::unique_lock lock(gFontFoldMu);
+    FontFoldPrep& prep = fontFoldPrep();
+    if (prep.doc != &doc) {
+        prep = FontFoldPrep{};
+        prep.doc = &doc;
+    }
+    if (!prep.ready) {
+        // 예산 안이면 뽑을 일도 없다. 넘을 때만 문서 글자를 다 뽑아 두고 접는다.
+        if (pool.bytes() <= cacheBudget(pool)) return;
+        const auto started = std::chrono::steady_clock::now();
+        const auto spent = [&] {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        };
+        if (!prep.listed) {
+            prep.glyphs = layout::documentDrawnGlyphs(doc);
+            prep.listed = true;
+        }
+        lock.unlock();
+        while (prep.next < prep.glyphs.size() && spent() < budgetMs) {
+            const layout::DrawnGlyph& glyph = prep.glyphs[prep.next++];
+            const GlyphMem* mem = glyphMemory(glyph.face, glyph.cp);
+            if (!mem || !mem->face) continue;
+            const std::string& face = glyphFaceName(mem);
+            baseGlyphCommands(mem, false, false);
+            if (glyph.bold) baseGlyphCommands(mem, true, designedBoldFace(face, true));
+        }
+        lock.lock();
+        if (prep.next < prep.glyphs.size()) return;
+        std::printf("{\"글꼴접기준비\":%zu}\n", prep.glyphs.size());
+        std::fflush(stdout);
+        prep.ready = true;
+        prep.glyphs.clear();
+        prep.glyphs.shrink_to_fit();
+    }
+    const std::size_t total = pool.bytes();
+    const std::size_t budget = cacheBudget(pool);
+    if (total <= budget) return;
+    pool.pinnedFiles_.clear();
+    for (const std::string& face : layout::charShapeFaces(doc, cursorCharShape ? cursorCharShape() : 0)) {
+        if (const void* key = layout::fontFileKey(face)) pool.pinnedFiles_.push_back(key);
+    }
+    foldFontFiles(total - budget, kFontRecentMs, pool.pinnedFiles_);
+}
+
+void evictLineGlyph(const Node& line) {
     std::unique_lock lock(gSpanMu);
     lineBlockCache().erase(&line);
-    spanMeasures().erase(&span);
-    tabMeasures().erase(&span);
 }
 
 void invalidateLinePlaces(const std::vector<FrameInvalidation>& invalidations, bool fullInvalidation) {
@@ -4339,8 +4781,6 @@ void invalidateLinePlaces(const std::vector<FrameInvalidation>& invalidations, b
         linePlaces().clear();
         linePlacesByHash().clear();
         linePlacePages().clear();
-        spanMeasures().clear();
-        tabMeasures().clear();
         idleLineNote() = {};
         return;
     }
@@ -4382,19 +4822,17 @@ void invalidateLinePlaces(const std::vector<FrameInvalidation>& invalidations, b
     }
 }
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
+// ---------------------------------------------------------------------------
+// 화면 글자·쪽 텍스처 판단. GPU 없이 돌아서 네이티브 시험이 같은 판단을 탄다.
+// GPU 호출(텍스처 올리기·그리기)은 아래 #if 안에 있고, GPU 화면이 없는 빌드는 빈 함수다.
+
 namespace {
 
-struct ScreenTexture {
-    int stamp = -1;
-    bool mipmapped = false;
-    sk_sp<SkImage> image;
-};
-
-std::unordered_map<int, ScreenTexture>& screenTextures() {
-    static std::unordered_map<int, ScreenTexture> textures;
-    return textures;
-}
+void dropScreenTexture(int id);
+void clearAtlasTextures();
+void dropPageImage(int page);
+void clearPageImages();
+bool pageTexturesOn();
 
 // 글자 크기마다 알파 마스크 한 장. Skia 스트라이크처럼 글꼴·글자·픽셀 크기·장평·굵기·기울임이 키다.
 constexpr int kAtlasDim = 2048;
@@ -4427,7 +4865,8 @@ struct AtlasPage {
     std::uint64_t seq = 0;
     std::uint64_t uploadedSeq = 0;
     bool needUpload = false;
-    sk_sp<SkImage> gpu;
+    // 화면 텍스처로 올린 적이 있다. 텍스처 자체는 GPU 쪽이 같은 번호로 들고 있다.
+    bool uploaded = false;
 };
 
 struct MaskFamily {
@@ -4490,6 +4929,61 @@ std::unordered_map<MaskFamily, std::vector<int>, MaskFamilyHash>& glyphFamilies(
 std::vector<AtlasPage>& glyphPages() {
     static std::vector<AtlasPage> pages;
     return pages;
+}
+
+void collectRenderMemory(std::vector<std::pair<std::string, std::size_t>>& out) {
+    std::size_t glyphCount = 0;
+    std::size_t glyphBytes = 0;
+    std::size_t quadBytes = 0;
+    {
+        std::lock_guard lock(frameGlyphMutex());
+        for (const auto& [id, frame] : frameGlyphs()) {
+            glyphCount += frame.glyphs.size();
+            glyphBytes += frame.glyphs.capacity() * sizeof(FrameGlyph) + frame.hosts.capacity() * sizeof(TextHost);
+        }
+        for (const auto& [id, cached] : cachedSpriteQuads()) quadBytes += cached.quads.capacity() * sizeof(LocalGlyphQuad);
+    }
+    std::size_t outlineBytes = 0;
+    {
+        std::shared_lock lock(gOutlineMu);
+        for (const auto& [key, commands] : gCommands) outlineBytes += commands.capacity() * sizeof(GlyphCommand);
+        for (const auto& [key, commands] : gCurves) outlineBytes += commands.capacity() * sizeof(GlyphCommand);
+    }
+    std::size_t maskBytes = 0;
+    std::size_t atlasBytes = 0;
+    {
+        std::lock_guard lock(glyphAtlasMutex());
+        for (const auto& [key, loc] : glyphMasks()) maskBytes += loc.alpha.capacity();
+        for (const AtlasPage& page : glyphPages()) atlasBytes += page.alpha.capacity();
+    }
+    std::size_t placeBytes = 0;
+    std::size_t placeHashBytes = 0;
+    std::size_t placeCount = 0;
+    {
+        std::shared_lock lock(gPlaceMu);
+        // 두 표가 같은 자리를 가리키면 한 번만 센다. 해시 표 몫은 그 표에만 있는 자리다.
+        std::unordered_set<const LinePlaces*> counted;
+        for (const auto& [key, places] : linePlaces()) {
+            placeBytes += key.capacity() + 48;
+            if (!places || !counted.insert(places.get()).second) continue;
+            placeBytes += places->spots.capacity() * sizeof(GlyphSpot) + sizeof(LinePlaces);
+            placeCount += places->spots.size();
+        }
+        for (const auto& [hash, places] : linePlacesByHash()) {
+            placeHashBytes += 32;
+            if (!places || !counted.insert(places.get()).second) continue;
+            placeHashBytes += places->spots.capacity() * sizeof(GlyphSpot) + sizeof(LinePlaces);
+        }
+    }
+    out.emplace_back("linePlaces", placeBytes);
+    out.emplace_back("linePlacesByHash", placeHashBytes);
+    out.emplace_back("linePlaceGlyphCount", placeCount);
+    out.emplace_back("frameGlyphs", glyphBytes);
+    out.emplace_back("frameGlyphCount", glyphCount);
+    out.emplace_back("glyphQuads", quadBytes);
+    out.emplace_back("outlines", outlineBytes);
+    out.emplace_back("maskCopies", maskBytes);
+    out.emplace_back("atlasCpu", atlasBytes);
 }
 
 // 글자 마스크 아틀라스. 지금은 크기만 알리고 버리지는 않는다.
@@ -4555,19 +5049,20 @@ int maskUnclampedPpemFor(const FrameGlyph& glyph, int framePercent, int layoutZo
 }
 
 int maskPpemFor(const FrameGlyph& glyph, int framePercent, int layoutZoom, int maskZoom) {
-    return std::clamp(maskUnclampedPpemFor(glyph, framePercent, layoutZoom, maskZoom), 1, 256);
+    return glyphMaskPpem(maskUnclampedPpemFor(glyph, framePercent, layoutZoom, maskZoom));
 }
 
+// 글자 하나를 알파 마스크로 찍는다. 자리 잡기·크기 고르기는 이 함수 밖에서 정한다.
 bool rasterGlyphAlpha(const FrameGlyph& glyph, int ppem, MaskLoc& loc) {
     if (!glyph.mem || !glyph.mem->face || ppem <= 0) return false;
-    const auto& curves = hangulCurves(glyph.mem, glyph.bold, glyph.italic, ppem);
     const int fitX = glyph.mem->fitX > 0 ? glyph.mem->fitX : 1000;
     const int fitY = glyph.mem->fitY > 0 ? glyph.mem->fitY : 1000;
+    constexpr int pad = 2;
+    const auto& curves = hangulCurves(glyph.mem, glyph.bold, glyph.italic, ppem);
     SkPath path = glyphPath(curves, static_cast<float>(ppem), glyph.ratio, 0.f, 0.f, fitX, fitY);
     if (path.isEmpty()) return false;
     const SkRect bounds = path.computeTightBounds();
     if (bounds.isEmpty()) return false;
-    constexpr int pad = 2;
     const int x0 = static_cast<int>(std::floor(bounds.fLeft)) - pad;
     const int y0 = static_cast<int>(std::floor(bounds.fTop)) - pad;
     const int x1 = static_cast<int>(std::ceil(bounds.fRight)) + pad;
@@ -4735,7 +5230,7 @@ void releaseUnusedZoomMasks(const std::vector<ScreenSprite>& sprites, int layout
         const auto found = frameGlyphs().find(sprite.id);
         if (found == frameGlyphs().end()) continue;
         const int effLayout = layoutZoom > 0 ? layoutZoom : (sprite.percent > 0 ? sprite.percent : 100);
-        for (const FrameGlyph& glyph : found->second) {
+        for (const FrameGlyph& glyph : found->second.glyphs) {
             if (screenPpemFor(glyph, sprite.percent, effLayout) <= kDotMaxPpem) continue;
             const int want = maskPpemFor(glyph, sprite.percent, layoutZoom, maskZoom);
             used.insert(maskId(glyph, want));
@@ -4874,7 +5369,7 @@ void ensureGlyphMasks(const std::vector<ScreenSprite>& sprites, int layoutZoom, 
             const float frameX = sprite.sw > 0 ? static_cast<float>(sprite.w) / static_cast<float>(sprite.sw) : 1.f;
             const float frameY = sprite.sh > 0 ? static_cast<float>(sprite.h) / static_cast<float>(sprite.sh) : 1.f;
             bool spriteAllReady = true;
-            for (const FrameGlyph& glyph : found->second) {
+            for (const FrameGlyph& glyph : found->second.glyphs) {
                 if (!glyph.mem) continue;
                 if (screenPpemFor(glyph, sprite.percent, effLayout) <= kDotMaxPpem) continue;
                 const int want = maskPpemFor(glyph, sprite.percent, layoutZoom, maskZoom);
@@ -4949,15 +5444,20 @@ void ensureGlyphMasks(const std::vector<ScreenSprite>& sprites, int layoutZoom, 
     glyphMaskPending() = more;
 }
 
+// 화면에 찍을 글자 마스크 한 장. 펜 자리 (x, y) 에 마스크를 scale 배로 놓는다.
 struct GlyphQuad {
-    SkRSXform xform;
-    SkRect tex;
-    SkColor color;
+    float scale = 1.f;
+    float x = 0.f;
+    float y = 0.f;
+    GlyphRect tex;
+    std::uint32_t color = 0;
+    bool turn = false;  // 펜(penX, penY)을 축으로 시계 방향 90° 돌린다
+    float penX = 0.f;
+    float penY = 0.f;
 };
 
-SkColor invertColor(SkColor color) {
-    return SkColorSetARGB(SkColorGetA(color), 255 - SkColorGetR(color), 255 - SkColorGetG(color), 255 - SkColorGetB(color));
-}
+// ARGB 에서 알파는 두고 색만 뒤집는다.
+std::uint32_t invertColor(std::uint32_t color) { return (color & 0xFF000000u) | (~color & 0x00FFFFFFu); }
 
 bool hasActiveHold() {
     const PointerHold& hold = pointerHold();
@@ -4992,11 +5492,13 @@ bool offsetInHold(int story, int paragraph, int offset) {
     return afterStart && beforeEnd;
 }
 
-bool glyphInSelection(const FrameGlyph& glyph) {
+bool glyphInSelection(const FrameGlyphs& frame, const FrameGlyph& glyph) {
     if (offsetInHold(glyph.story, glyph.paragraph, glyph.offset)) return true;
     // 수식은 칸 픽셀이라 블록에 걸리면 뒤집힌다. 개체 안 글자는 다른 이야기라 그 개체의 칸으로 본다.
-    for (int i = 0; i < glyph.hostCount && i < kObjectHostDepth; ++i) {
-        const TextHost& host = glyph.hosts[i];
+    for (int i = 0; i < glyph.hostCount; ++i) {
+        const std::size_t at = static_cast<std::size_t>(glyph.hostFirst + i);
+        if (at >= frame.hosts.size()) break;
+        const TextHost& host = frame.hosts[at];
         if (offsetInHold(host.story, host.paragraph, host.offset)) return true;
     }
     return false;
@@ -5004,7 +5506,7 @@ bool glyphInSelection(const FrameGlyph& glyph) {
 
 void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, int viewW, int viewH,
                       bool activeHold, std::vector<std::vector<GlyphQuad>>& sharp,
-                      std::vector<std::vector<GlyphQuad>>& scaled, SkRect& batchBounds, bool& hasPendingGlyphs,
+                      std::vector<std::vector<GlyphQuad>>& scaled, GlyphRect& batchBounds, bool& hasPendingGlyphs,
                       bool* outAllExact = nullptr) {
     const auto found = frameGlyphs().find(sprite.id);
     if (found == frameGlyphs().end() || sprite.sw <= 0 || sprite.sh <= 0) {
@@ -5017,7 +5519,8 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
             return;
         }
     }
-    const std::vector<FrameGlyph>& glyphs = found->second;
+    const FrameGlyphs& frameGlyphSet = found->second;
+    const std::vector<FrameGlyph>& glyphs = frameGlyphSet.glyphs;
     const int effLayout = layoutZoom > 0 ? layoutZoom : (sprite.percent > 0 ? sprite.percent : 100);
     const int effMask = maskZoom > 0 ? maskZoom : effLayout;
     const std::uint32_t gen = maskCacheGen();
@@ -5053,6 +5556,8 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
             const float localPenY = std::round(lq.rawPenY * frameY);
             lq.relX = localPenX + lq.bearingX * scale;
             lq.relY = localPenY + lq.bearingY * scale;
+            lq.penRelX = localPenX;
+            lq.penRelY = localPenY;
             lq.scale = scale;
             lq.stretched = std::abs(scale - 1.f) > 0.005f;
         }
@@ -5077,7 +5582,7 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
         int lastDotX = -100000;
         int lastDotY = -100000;
         int lastDotPara = -2;
-        SkColor lastDotColor = 0;
+        std::uint32_t lastDotColor = 0;
 
         for (std::size_t gi = 0; gi < glyphs.size(); ++gi) {
             const FrameGlyph& glyph = glyphs[gi];
@@ -5113,8 +5618,8 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
                 lq.rawPenX = glyph.penX;
                 lq.rawPenY = glyph.penY;
                 lq.basePpem = bPpem;
-                lq.tex = SkRect::MakeXYWH(static_cast<float>(dot.x), static_cast<float>(dot.y),
-                                          static_cast<float>(dot.w), static_cast<float>(dot.h));
+                lq.tex = GlyphRect::xywh(static_cast<float>(dot.x), static_cast<float>(dot.y),
+                                         static_cast<float>(dot.w), static_cast<float>(dot.h));
                 lq.color = glyph.color;
                 lq.atlasPage = dot.page;
                 lq.seq = dot.seq;
@@ -5124,7 +5629,7 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
                 continue;
             }
             const int unclampedWant = maskUnclampedPpemFor(glyph, sprite.percent, layoutZoom, maskZoom);
-            const int want = std::clamp(unclampedWant, 1, 256);
+            const int want = glyphMaskPpem(unclampedWant);
             int drawnPpem = want;
             bool isMissing = false;
             const MaskLoc* mask = maskFor(glyph, want, &drawnPpem, &isMissing);
@@ -5154,14 +5659,17 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
             lq.unclampedWant = unclampedWant;
             lq.relX = localPenX + lq.bearingX * scale;
             lq.relY = localPenY + lq.bearingY * scale;
+            lq.penRelX = localPenX;
+            lq.penRelY = localPenY;
             lq.scale = scale;
-            lq.tex = SkRect::MakeXYWH(static_cast<float>(mask->x), static_cast<float>(mask->y),
-                                      static_cast<float>(mask->w), static_cast<float>(mask->h));
+            lq.tex = GlyphRect::xywh(static_cast<float>(mask->x), static_cast<float>(mask->y),
+                                     static_cast<float>(mask->w), static_cast<float>(mask->h));
             lq.color = glyph.color;
             lq.atlasPage = mask->page;
             lq.seq = mask->seq;
             lq.glyphIndex = static_cast<std::uint32_t>(gi);
             lq.stretched = std::abs(scale - 1.f) > 0.005f;
+            lq.turn = glyph.turn != 0;
             cached.quads.push_back(lq);
         }
     }
@@ -5187,24 +5695,29 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
             }
         }
         AtlasPage& atlasPage = glyphPages()[static_cast<std::size_t>(lq.atlasPage)];
-        if (!atlasPage.gpu || lq.seq > atlasPage.uploadedSeq) {
+        if (!atlasPage.uploaded || lq.seq > atlasPage.uploadedSeq) {
             atlasPage.needUpload = true;
         }
-        const SkColor drawColor =
-            (activeHold && lq.glyphIndex < glyphs.size() && glyphInSelection(glyphs[lq.glyphIndex]))
+        const std::uint32_t drawColor =
+            (activeHold && lq.glyphIndex < glyphs.size() && glyphInSelection(frameGlyphSet, glyphs[lq.glyphIndex]))
                 ? invertColor(lq.color)
                 : lq.color;
         GlyphQuad quad;
-        quad.xform = SkRSXform::Make(lq.scale, 0.f, x, y);
+        quad.scale = lq.scale;
+        quad.x = x;
+        quad.y = y;
         quad.tex = lq.tex;
         quad.color = drawColor;
+        quad.turn = lq.turn;
+        quad.penX = sx + lq.penRelX;
+        quad.penY = sy + lq.penRelY;
         std::vector<std::vector<GlyphQuad>>& bucket = lq.stretched ? scaled : sharp;
         if (static_cast<int>(bucket.size()) <= lq.atlasPage) bucket.resize(static_cast<std::size_t>(numPages));
         bucket[static_cast<std::size_t>(lq.atlasPage)].push_back(quad);
         addedAny = true;
     }
     if (addedAny) {
-        const SkRect spriteRect = SkRect::MakeXYWH(sx, sy, static_cast<float>(sprite.w), static_cast<float>(sprite.h));
+        const GlyphRect spriteRect = GlyphRect::xywh(sx, sy, static_cast<float>(sprite.w), static_cast<float>(sprite.h));
         if (!hasPendingGlyphs) {
             batchBounds = spriteRect;
             hasPendingGlyphs = true;
@@ -5213,6 +5726,288 @@ void appendGlyphQuads(const ScreenSprite& sprite, int layoutZoom, int maskZoom, 
         }
     }
 }
+
+// 쪽 텍스처를 쓸지·구울지·버릴지는 pageTextures() 가 정한다. 버리면 GPU 쪽 이미지도 지운다.
+// 쪽 텍스처는 화면 스레드만 만진다. 예산 관리자도 화면 스레드에서 부른다.
+PageTextureCache& pageTextures() {
+    static PageTextureCache cache([](int page) { dropPageImage(page); });
+    return cache;
+}
+
+void clearPageGpuCache() {
+    pageTextures().clear();
+    clearPageImages();
+}
+
+bool pageHasActiveHold(int page) {
+    if (page < 0) return false;
+    const PointerHold& hold = pointerHold();
+    for (const HeldBox& box : hold.boxes) {
+        if (box.page == page && box.invert && box.width > 0 && box.height > 0) return true;
+    }
+    if (caretBlinkPhase() == 0) {
+        for (const HeldBox& box : hold.compUnderlines) {
+            if (box.page == page && box.invert && box.width > 0 && box.height > 0) return true;
+        }
+    }
+    return false;
+}
+
+std::atomic<bool> gRenderInteracting{false};
+
+int rasterQueuedMasks(int budget, int targetMaskZoom) {
+    if (budget < 1) budget = 1;
+    int made = 0;
+    while (made < budget) {
+        if (gRenderInteracting.load(std::memory_order_relaxed)) break;
+        MaskJob job;
+        bool hasJob = false;
+        {
+            std::lock_guard lock(glyphAtlasMutex());
+            std::vector<MaskJob>& jobs = maskJobs();
+            const std::size_t baseCount = std::min(baseMaskJobCount(), jobs.size());
+            if (targetMaskZoom > 0 && targetMaskZoom != 100 && baseCount > 0) {
+                if (maskZoomJobTarget() != targetMaskZoom) {
+                    maskZoomJobTarget() = targetMaskZoom;
+                    maskZoomJobCursor() = 0;
+                }
+                std::size_t& zCursor = maskZoomJobCursor();
+                if (zCursor < baseCount) {
+                    const MaskJob& base = jobs[zCursor++];
+                    const float exact = base.exactPpem > 0.f ? base.exactPpem : static_cast<float>(base.ppem);
+                    const int scaledPpem = glyphMaskPpem(static_cast<int>(
+                        std::lround(static_cast<double>(exact) * static_cast<double>(targetMaskZoom) / 100.0)));
+                    job = MaskJob{base.font, base.cp, base.bold, base.italic, base.ratio,
+                                  scaledPpem, targetMaskZoom, exact};
+                    hasJob = true;
+                }
+            }
+            if (!hasJob) {
+                std::size_t& cursor = maskJobCursor();
+                if (cursor < jobs.size()) {
+                    job = jobs[cursor++];
+                    hasJob = true;
+                }
+            }
+        }
+        if (!hasJob) break;
+        GlyphMem* mem = glyphMemory(job.font, job.cp);
+        if (!mem || !mem->face || job.ppem <= 0) continue;
+        FrameGlyph glyph;
+        glyph.mem = mem;
+        glyph.ppem = job.ppem;
+        glyph.ratio = job.ratio > 0 ? job.ratio : 100;
+        glyph.bold = job.bold;
+        glyph.italic = job.italic;
+        const MaskId key = maskId(glyph, job.ppem);
+        {
+            std::lock_guard lock(glyphAtlasMutex());
+            if (glyphMasks().count(key)) continue;
+        }
+        MaskLoc loc;
+        loc.zoom = job.zoom > 0 ? job.zoom : 100;
+        loc.ppem = job.ppem;
+        const bool drawn = rasterGlyphAlpha(glyph, job.ppem, loc);
+        {
+            std::lock_guard lock(glyphAtlasMutex());
+            if (glyphMasks().count(key)) continue;
+            if (!drawn || !packMask(loc)) {
+                loc.missing = true;
+                loc.alpha.clear();
+                loc.page = -1;
+            }
+            rememberFamily(maskFamily(glyph), job.ppem);
+            glyphMasks().emplace(key, std::move(loc));
+            ++maskBuiltSeq();
+        }
+        ++made;
+    }
+    return made;
+}
+
+}  // namespace
+
+// 선언은 앞쪽 paint_detail 에 있다. 이름 공간이 같아야 같은 함수다.
+void paint_detail::clearScreenGlyphs() {
+    {
+        std::lock_guard lock(glyphAtlasMutex());
+        ++maskCacheGen();
+        ++maskBuiltSeq();
+        dotMaskGen() = 0;
+        glyphMasks().clear();
+        glyphFamilies().clear();
+        glyphPages().clear();
+        glyphMaskPending() = false;
+        maskJobCursor() = 0;
+        maskZoomJobCursor() = 0;
+    }
+    clearAtlasTextures();
+    clearFrameGlyphs();
+    clearPageGpuCache();
+}
+
+void dropScreenSprite(int id) {
+    dropScreenTexture(id);
+    dropFrameGlyphs(id);
+    dropFramePictures(id);
+    dropFrameBorders(id);
+}
+
+void dropPageGpuCache(int page) {
+    if (page < 0) clearPageGpuCache();
+    else pageTextures().drop(page);
+}
+
+bool glyphMasksPending() {
+    std::lock_guard lock(glyphAtlasMutex());
+    return glyphMaskPending();
+}
+
+// 화면이 칸 비트맵 말고 따로 그릴 것(글자, 그림)이 있는지. 있으면 빈 비트맵 칸도 쓴다.
+bool frameHasGlyphs(int id) {
+    {
+        std::lock_guard lock(frameGlyphMutex());
+        const auto found = frameGlyphs().find(id);
+        if (found != frameGlyphs().end() && !found->second.glyphs.empty()) return true;
+    }
+    return frameHasPictures(id) || frameHasBorders(id);
+}
+
+std::vector<FrameGlyphSpot> frameGlyphSpots(int id) {
+    std::vector<FrameGlyphSpot> out;
+    std::lock_guard lock(frameGlyphMutex());
+    const auto found = frameGlyphs().find(id);
+    if (found == frameGlyphs().end()) return out;
+    out.reserve(found->second.glyphs.size());
+    for (const FrameGlyph& glyph : found->second.glyphs) out.push_back(FrameGlyphSpot{glyph.story, glyph.paragraph, glyph.offset});
+    return out;
+}
+
+bool cloneAndAdjustFrameGlyphs(int srcFrameId, int dstFrameId, int newStory, int newParagraph, int deltaOffset,
+                               std::int32_t deltaOriginX, std::int32_t deltaOriginY) {
+    (void)deltaOriginX;
+    (void)deltaOriginY;
+    if (srcFrameId == 0 || dstFrameId == 0) return false;
+    const bool pictures = cloneFramePictures(srcFrameId, dstFrameId);
+    const bool borders = cloneFrameBorders(srcFrameId, dstFrameId);
+    std::lock_guard lock(frameGlyphMutex());
+    const auto found = frameGlyphs().find(srcFrameId);
+    if (found == frameGlyphs().end() || found->second.glyphs.empty()) return pictures || borders;
+    if (srcFrameId != dstFrameId) {
+        FrameGlyphs copy = found->second;
+        for (FrameGlyph& g : copy.glyphs) {
+            if (newStory >= 0) g.story = newStory;
+            if (newParagraph >= 0) g.paragraph = newParagraph;
+            if (deltaOffset != 0 && g.offset >= 0) g.offset += deltaOffset;
+        }
+        frameGlyphs()[dstFrameId] = std::move(copy);
+        if (const auto srIt = spriteMaskReady().find(srcFrameId); srIt != spriteMaskReady().end()) {
+            spriteMaskReady()[dstFrameId] = srIt->second;
+        }
+        cachedSpriteQuads().erase(dstFrameId);
+    } else {
+        for (FrameGlyph& g : found->second.glyphs) {
+            if (newStory >= 0) g.story = newStory;
+            if (newParagraph >= 0) g.paragraph = newParagraph;
+            if (deltaOffset != 0 && g.offset >= 0) g.offset += deltaOffset;
+        }
+    }
+    return true;
+}
+
+bool canUsePageGpuTexture(int page, int pageW, int pageH, int layoutZoom, int maskZoom, int pageStamp, bool dragging) {
+    if (!pageTexturesOn()) return false;
+    PageTextureWant want;
+    want.w = pageW;
+    want.h = pageH;
+    want.layoutZoom = layoutZoom;
+    want.maskZoom = maskZoom;
+    want.stamp = pageStamp;
+    want.interacting = dragging || gRenderInteracting.load(std::memory_order_relaxed);
+    want.maskSeq = maskBuiltSeq();
+    want.pictureSeq = pictureTextureSeq();
+    return pageTextures().usable(page, want);
+}
+
+bool hasScalablePageGpuTexture(int page, int pageStamp) {
+    return pageTexturesOn() && pageTextures().scalable(page, pageStamp);
+}
+
+int pageGpuTextureZoom(int page, int pageStamp) {
+    return pageTexturesOn() ? pageTextures().zoomOf(page, pageStamp) : 0;
+}
+
+bool hasAnyPageGpuTexture(int page) { return pageTexturesOn() && pageTextures().has(page); }
+
+bool canBakePageGpuTexture(int page, int pageW, int pageH, int pageStamp) {
+    return pageTexturesOn() && PageTextureCache::bakeable(page, pageW, pageH, pageStamp);
+}
+
+void setRenderInteracting(bool interacting) {
+    gRenderInteracting.store(interacting, std::memory_order_relaxed);
+}
+
+void setScreenVectors(bool on) { enableScreenVectors(on); }
+
+void setScreenOpSink(ScreenOpSink sink) { screenOpSink() = std::move(sink); }
+
+MaskBake bakeDocumentMasks(const model::Document& doc, int budget, int targetMaskZoom) {
+    noteDocumentGlyphs(doc);
+    // 마스크는 화면이 글자를 직접 그릴 때만 굽는다.
+    if (!screenVectors()) return {};
+    MaskBake out;
+    out.made = rasterQueuedMasks(budget, targetMaskZoom);
+    {
+        std::lock_guard lock(glyphAtlasMutex());
+        const std::size_t baseCount = std::min(baseMaskJobCount(), maskJobs().size());
+        const bool zoomMore =
+            targetMaskZoom > 0 && targetMaskZoom != 100 && baseCount > 0 &&
+            (maskZoomJobTarget() != targetMaskZoom || maskZoomJobCursor() < baseCount);
+        out.more = zoomMore || (maskJobCursor() < maskJobs().size());
+    }
+    if (!out.more && out.made > 0) {
+        std::fprintf(stderr, "[ClassingHWP] %d%% 마스크를 다 찍었다\n", targetMaskZoom > 0 ? targetMaskZoom : 100);
+    }
+    return out;
+}
+#if CHWP_HAS_GPU
+namespace {
+
+struct ScreenTexture {
+    int stamp = -1;
+    bool mipmapped = false;
+    sk_sp<SkImage> image;
+};
+
+std::unordered_map<int, ScreenTexture>& screenTextures() {
+    static std::unordered_map<int, ScreenTexture> textures;
+    return textures;
+}
+
+// 2D 화면에서 셸에 올려 둔 칸 그림.
+ScreenBitmaps& screenBitmaps() {
+    static ScreenBitmaps bitmaps;
+    return bitmaps;
+}
+
+// 이번 프레임에 칸 픽셀로 만든 래스터 그림이 어느 칸의 어느 판인지. 2D 그림 목록이 같은 칸을 같은 번호로 쓴다.
+std::unordered_map<std::uint32_t, std::pair<int, int>>& rasterImageSources() {
+    static std::unordered_map<std::uint32_t, std::pair<int, int>> sources;
+    return sources;
+}
+
+void dropScreenTexture(int id) {
+    screenTextures().erase(id);
+    screenBitmaps().forget(static_cast<std::uint32_t>(id));
+}
+
+// 글자 아틀라스 장마다 올린 텍스처. 장 번호가 같다.
+std::vector<sk_sp<SkImage>>& atlasTextures() {
+    static std::vector<sk_sp<SkImage>> textures;
+    return textures;
+}
+
+void clearAtlasTextures() { atlasTextures().clear(); }
 
 sk_sp<SkRuntimeEffect> sdfGlyphEffect() {
     static sk_sp<SkRuntimeEffect> effect = []() -> sk_sp<SkRuntimeEffect> {
@@ -5252,29 +6047,34 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
         const std::vector<GlyphQuad>& quads = pages[static_cast<std::size_t>(i)];
         if (quads.empty() || i >= static_cast<int>(glyphPages().size())) continue;
         AtlasPage& atlasPage = glyphPages()[static_cast<std::size_t>(i)];
-        if ((atlasPage.needUpload || !atlasPage.gpu) && !atlasPage.alpha.empty()) {
+        std::vector<sk_sp<SkImage>>& textures = atlasTextures();
+        if (textures.size() <= static_cast<std::size_t>(i)) textures.resize(static_cast<std::size_t>(i) + 1);
+        sk_sp<SkImage>& atlasImage = textures[static_cast<std::size_t>(i)];
+        if ((atlasPage.needUpload || !atlasPage.uploaded) && !atlasPage.alpha.empty()) {
             const SkImageInfo info = SkImageInfo::Make(kAtlasDim, kAtlasDim, kAlpha_8_SkColorType, kPremul_SkAlphaType);
             const SkPixmap pixmap(info, atlasPage.alpha.data(), kAtlasDim);
             if (const sk_sp<SkImage> raster = SkImages::RasterFromPixmap(pixmap, nullptr, nullptr)) {
                 if (recorder) {
                     if (sk_sp<SkImage> gpuImg = SkImages::TextureFromImage(recorder, raster.get())) {
-                        atlasPage.gpu = std::move(gpuImg);
+                        atlasImage = std::move(gpuImg);
+                        atlasPage.uploaded = true;
                         atlasPage.uploadedSeq = atlasPage.seq;
                         atlasPage.needUpload = false;
                     } else {
-                        std::fprintf(stderr, "[noting] 글자 아틀라스 업로드 실패\n");
+                        std::fprintf(stderr, "[ClassingHWP] 글자 아틀라스 업로드 실패\n");
                     }
                 } else {
-                    atlasPage.gpu = raster;
+                    atlasImage = raster;
+                    atlasPage.uploaded = true;
                     atlasPage.uploadedSeq = atlasPage.seq;
                     atlasPage.needUpload = false;
                 }
             }
         }
-        if (!atlasPage.gpu) continue;
+        if (!atlasPage.uploaded || !atlasImage) continue;
 
         const sk_sp<SkShader> atlasShader =
-            atlasPage.gpu->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, SkSamplingOptions(filter));
+            atlasImage->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, SkSamplingOptions(filter));
         if (!atlasShader) continue;
         auto drawGroup = [&](const std::vector<GlyphQuad>& group, sk_sp<SkShader> shader) {
             if (group.empty() || !shader) return;
@@ -5294,9 +6094,9 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
                 std::uint16_t* idx = builder.indices();
                 for (std::size_t q = 0; q < count; ++q) {
                     const GlyphQuad& quad = group[start + q];
-                    const float x0 = quad.xform.fTx;
-                    const float y0 = quad.xform.fTy;
-                    const float s = quad.xform.fSCos;
+                    const float x0 = quad.x;
+                    const float y0 = quad.y;
+                    const float s = quad.scale;
                     const float x1 = x0 + quad.tex.width() * s;
                     const float y1 = y0 + quad.tex.height() * s;
                     const std::uint16_t v = static_cast<std::uint16_t>(q * 4);
@@ -5304,10 +6104,17 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
                     pos[v + 1] = {x1, y0};
                     pos[v + 2] = {x1, y1};
                     pos[v + 3] = {x0, y1};
-                    tex[v + 0] = {quad.tex.fLeft, quad.tex.fTop};
-                    tex[v + 1] = {quad.tex.fRight, quad.tex.fTop};
-                    tex[v + 2] = {quad.tex.fRight, quad.tex.fBottom};
-                    tex[v + 3] = {quad.tex.fLeft, quad.tex.fBottom};
+                    if (quad.turn) {
+                        // 세로쓰기에서 눕힌 글자. 펜에서 (dx, dy) 떨어진 점은 (−dy, dx) 로 간다.
+                        for (int k = 0; k < 4; ++k) {
+                            const SkPoint at = pos[v + k];
+                            pos[v + k] = {quad.penX - (at.fY - quad.penY), quad.penY + (at.fX - quad.penX)};
+                        }
+                    }
+                    tex[v + 0] = {quad.tex.l, quad.tex.t};
+                    tex[v + 1] = {quad.tex.r, quad.tex.t};
+                    tex[v + 2] = {quad.tex.r, quad.tex.b};
+                    tex[v + 3] = {quad.tex.l, quad.tex.b};
                     col[v + 0] = quad.color;
                     col[v + 1] = quad.color;
                     col[v + 2] = quad.color;
@@ -5331,7 +6138,7 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
         // 조금 줄인 것은 한 점 쌍선형으로도 획이 남는다. 네 점을 읽으면 오히려 흐려진다.
         constexpr float kShrinkBlend = 0.8f;
         const bool allEven = std::all_of(quads.begin(), quads.end(), [](const GlyphQuad& quad) {
-            return quad.xform.fSCos >= kShrinkBlend && quad.xform.fSCos <= 1.05f;
+            return quad.scale >= kShrinkBlend && quad.scale <= 1.05f;
         });
         if (allEven) {
             drawGroup(quads, atlasShader);
@@ -5343,7 +6150,7 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
         float maxScale = 1.f;
         float minScale = 1.f;
         for (const GlyphQuad& quad : quads) {
-            const float s = quad.xform.fSCos;
+            const float s = quad.scale;
             if (s > 1.05f) {
                 grown.push_back(quad);
                 maxScale = std::max(maxScale, s);
@@ -5392,151 +6199,42 @@ void drawGlyphQuads(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
     }
 }
 
-struct PageGpuCacheEntry {
-    int page = -1;
-    int w = 0;
-    int h = 0;
-    int layoutZoom = 0;
-    int maskZoom = 0;
-    int stamp = 0;
-    bool incomplete = false;
-    std::uint32_t builtSeq = 0;
-    // 그림을 거친 밉맵 단계로 합성했다. 그 뒤 텍스처가 바뀌면 다시 합성한다.
-    bool picturesCoarse = false;
-    std::uint32_t pictureSeq = 0;
-    std::size_t bytes = 0;
-    std::uint64_t lastUsedTick = 0;
-    std::uint64_t lastFrame = 0;
-    sk_sp<SkImage> image;
-};
-
-constexpr std::size_t kMaxPageGpuCacheBytes = 192u * 1024u * 1024u;
-
-std::unordered_map<int, PageGpuCacheEntry>& pageGpuCache() {
-    static std::unordered_map<int, PageGpuCacheEntry> cache;
-    return cache;
-}
-
-std::size_t& pageGpuCacheBytes() {
-    static std::size_t total = 0;
-    return total;
-}
-
-std::uint64_t& pageGpuCacheTick() {
-    static std::uint64_t tick = 0;
-    return tick;
-}
-
-void touchPageGpu(PageGpuCacheEntry& entry) {
-    entry.lastUsedTick = ++pageGpuCacheTick();
-    entry.lastFrame = cacheFrame();
-}
-
+// 쪽 텍스처 이미지. 쓸지·구울지·버릴지는 pageTextures() 가 정하고, 버리면 여기서도 지운다.
 // 쪽 텍스처는 화면 스레드만 만진다. 예산 관리자도 화면 스레드에서 부른다.
-class PageGpuPool final : public CachePool {
-public:
-    const char* name() const override { return "pageGpu"; }
-    std::size_t bytes() const override { return pageGpuCacheBytes(); }
-    std::size_t release(CacheTier tier, std::size_t need) override {
-        auto& cache = pageGpuCache();
-        std::size_t freed = 0;
-        while (freed < need) {
-            auto oldest = cache.end();
-            for (auto it = cache.begin(); it != cache.end(); ++it) {
-                if (tierForFrame(it->second.lastFrame) != tier) continue;
-                if (oldest == cache.end() || it->second.lastUsedTick < oldest->second.lastUsedTick) oldest = it;
-            }
-            if (oldest == cache.end()) break;
-            const std::size_t bytes = oldest->second.bytes;
-            pageGpuCacheBytes() -= std::min(pageGpuCacheBytes(), bytes);
-            freed += bytes;
-            cache.erase(oldest);
-        }
-        return freed;
-    }
-};
-
-PageGpuPool& pageGpuPool() {
-    static PageGpuPool pool;
-    static const bool registered = (registerCachePool(pool, kMaxPageGpuCacheBytes), true);
-    (void)registered;
-    return pool;
+std::unordered_map<int, sk_sp<SkImage>>& pageGpuImages() {
+    static std::unordered_map<int, sk_sp<SkImage>> images;
+    return images;
 }
 
-void clearPageGpuCache() {
-    pageGpuCache().clear();
-    pageGpuCacheBytes() = 0;
+SkImage* pageGpuImage(int page) {
+    const auto found = pageGpuImages().find(page);
+    return found == pageGpuImages().end() ? nullptr : found->second.get();
 }
+
+void dropPageImage(int page) { pageGpuImages().erase(page); }
+
+void clearPageImages() { pageGpuImages().clear(); }
 
 void storePageGpuCache(int page, int w, int h, int layoutZoom, int maskZoom, int stamp, bool incomplete,
                        sk_sp<SkImage> image) {
-    if (!image || page < 0 || w <= 0 || h <= 0) return;
-    const std::size_t entryBytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
-    if (entryBytes > kMaxPageGpuCacheBytes) return;
-    auto& cache = pageGpuCache();
-    if (auto existing = cache.find(page); existing != cache.end()) {
-        if (pageGpuCacheBytes() >= existing->second.bytes) {
-            pageGpuCacheBytes() -= existing->second.bytes;
-        } else {
-            pageGpuCacheBytes() = 0;
-        }
-        cache.erase(existing);
-    }
-    PageGpuCacheEntry entry;
-    entry.page = page;
-    entry.w = w;
-    entry.h = h;
-    entry.layoutZoom = layoutZoom;
-    entry.maskZoom = maskZoom;
-    entry.stamp = stamp;
-    entry.incomplete = incomplete;
-    entry.builtSeq = maskBuiltSeq();
-    entry.picturesCoarse = false;
-    entry.pictureSeq = pictureTextureSeq();
-    entry.bytes = entryBytes;
-    touchPageGpu(entry);
-    entry.image = std::move(image);
-    pageGpuCacheBytes() += entryBytes;
-    cache[page] = std::move(entry);
-    // 새 쪽은 이번 프레임에 쓴 것이라 남고, 넘치면 오래 안 본 쪽부터 비운다.
-    enforceCacheBudget(pageGpuPool());
+    if (!image) return;
+    PageTextureMeta meta;
+    meta.page = page;
+    meta.w = w;
+    meta.h = h;
+    meta.layoutZoom = layoutZoom;
+    meta.maskZoom = maskZoom;
+    meta.stamp = stamp;
+    meta.incomplete = incomplete;
+    meta.builtSeq = maskBuiltSeq();
+    meta.pictureSeq = pictureTextureSeq();
+    if (pageTextures().store(meta)) pageGpuImages()[page] = std::move(image);
 }
 
-bool pageHasActiveHold(int page) {
-    if (page < 0) return false;
-    const PointerHold& hold = pointerHold();
-    for (const HeldBox& box : hold.boxes) {
-        if (box.page == page && box.invert && box.width > 0 && box.height > 0) return true;
-    }
-    if (caretBlinkPhase() == 0) {
-        for (const HeldBox& box : hold.compUnderlines) {
-            if (box.page == page && box.invert && box.width > 0 && box.height > 0) return true;
-        }
-    }
-    return false;
+bool pageTexturesOn() {
+    const GpuSlot& slot = gpuSlot();
+    return slot.ready && !slot.raster && slot.recorder;
 }
-
-}  // namespace
-
-// 선언은 앞쪽 paint_detail 에 있다. 이름 공간이 같아야 같은 함수다.
-void paint_detail::clearScreenGlyphs() {
-    {
-        std::lock_guard lock(glyphAtlasMutex());
-        ++maskCacheGen();
-        ++maskBuiltSeq();
-        dotMaskGen() = 0;
-        glyphMasks().clear();
-        glyphFamilies().clear();
-        glyphPages().clear();
-        glyphMaskPending() = false;
-        maskJobCursor() = 0;
-        maskZoomJobCursor() = 0;
-    }
-    clearFrameGlyphs();
-    clearPageGpuCache();
-}
-
-namespace {
 
 sk_sp<SkImage> screenTexture(skgpu::graphite::Recorder* recorder, const ScreenSprite& sprite, bool needMipmap,
                              bool dragging, bool& outMipmapped, int& mipmapUpgrades) {
@@ -5546,7 +6244,9 @@ sk_sp<SkImage> screenTexture(skgpu::graphite::Recorder* recorder, const ScreenSp
     if (!recorder) {
         const SkImageInfo info = SkImageInfo::Make(sprite.sw, sprite.sh, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
         const SkPixmap pixmap(info, sprite.rgba, static_cast<std::size_t>(sprite.sw) * 4u);
-        return SkImages::RasterFromPixmap(pixmap, nullptr, nullptr);
+        sk_sp<SkImage> image = SkImages::RasterFromPixmap(pixmap, nullptr, nullptr);
+        if (image) rasterImageSources()[image->uniqueID()] = {sprite.id, sprite.stamp};
+        return image;
     }
     ScreenTexture& slot = screenTextures()[sprite.id];
     if (slot.image && slot.stamp == sprite.stamp) {
@@ -5776,12 +6476,86 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
             paint.setAntiAlias(true);
             paint.setColor(SkColorSetARGB(255, 26, 115, 232));
             paint.setStrokeWidth(2.f * unit);
-            canvas->drawLine(x, top, x, bottom, paint);
             const float radius = 8.f * unit;
+            if (pin.turned) {
+                // 세로쓰기는 막대가 누워 있다. 동그라미는 막대 왼쪽 끝 밖에 단다.
+                const float right = static_cast<float>(page->x - scrollX) +
+                                    static_cast<float>(pin.x + std::max<std::int32_t>(pin.height, 1)) * sx;
+                canvas->drawLine(x, top, right, top, paint);
+                canvas->drawCircle(x - radius, top, radius, paint);
+                return;
+            }
+            canvas->drawLine(x, top, x, bottom, paint);
             canvas->drawCircle(x, bottom + radius, radius, paint);
         };
         drawPin(hold.pinStart);
         drawPin(hold.pinEnd);
+    }
+    // 표 칸 경계선을 끄는 동안 새 선 자리를 점선으로 보인다.
+    if (hold.borderDrag != 0 && hold.borderPage >= 0) {
+        if (const ViewPage* page = sheetOf(pages, hold.borderPage);
+            page && page->w > 0 && page->h > 0 && page->widthHu > 0 && page->heightHu > 0) {
+            const float sx = static_cast<float>(page->w) / static_cast<float>(page->widthHu);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(page->heightHu);
+            const float ox = static_cast<float>(page->x - scrollX);
+            const float oy = static_cast<float>(page->y - scrollY);
+            SkPaint pen;
+            pen.setAntiAlias(true);
+            pen.setStyle(SkPaint::kStroke_Style);
+            pen.setStrokeWidth(1.f);
+            pen.setColor(SK_ColorBLACK);
+            const SkScalar intervals[2] = {4.f, 3.f};
+            pen.setPathEffect(SkDashPathEffect::Make(intervals, 0));
+            const std::int32_t at = hold.borderAt + hold.borderDelta;
+            if (hold.borderDrag == 1) {
+                const float lx = ox + static_cast<float>(at) * sx;
+                canvas->drawLine(lx, oy + static_cast<float>(hold.borderY0) * sy, lx,
+                                 oy + static_cast<float>(hold.borderY1) * sy, pen);
+            } else {
+                const float ly = oy + static_cast<float>(at) * sy;
+                canvas->drawLine(ox + static_cast<float>(hold.borderX0) * sx, ly,
+                                 ox + static_cast<float>(hold.borderX1) * sx, ly, pen);
+            }
+        }
+    }
+    // 개체를 옮기거나(그림이 아닌 개체는) 크기를 바꾸는 동안: 원래 자리는 반투명하게 덮어 흐리게 두고, 새 자리에
+    // 누를 때 떼어 둔 그 개체 모습을 실제 모양 그대로 늘려 그린다.
+    const bool reshaping = hold.resizeHandle >= 0 && hold.resizeBin.empty();
+    if ((hold.moving || reshaping) && !hold.boxes.empty()) {
+        const HeldBox& box = hold.boxes.front();
+        if (const ViewPage* page = sheetOf(pages, box.page);
+            page && page->w > 0 && page->h > 0 && page->widthHu > 0 && page->heightHu > 0) {
+            const float sx = static_cast<float>(page->w) / static_cast<float>(page->widthHu);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(page->heightHu);
+            const float ox = static_cast<float>(page->x - scrollX);
+            const float oy = static_cast<float>(page->y - scrollY);
+            const auto rectOf = [&](std::int32_t l, std::int32_t t, std::int32_t r, std::int32_t b) {
+                return SkRect::MakeLTRB(ox + static_cast<float>(l) * sx, oy + static_cast<float>(t) * sy,
+                                        ox + static_cast<float>(r) * sx, oy + static_cast<float>(b) * sy);
+            };
+            const SkRect from = hold.moving ? rectOf(box.x, box.y, box.x + box.width, box.y + box.height)
+                                            : rectOf(hold.resizeLeft, hold.resizeTop, hold.resizeRight, hold.resizeBottom);
+            const SkRect to = hold.moving ? rectOf(box.x + hold.moveDX, box.y + hold.moveDY, box.x + box.width + hold.moveDX,
+                                                   box.y + box.height + hold.moveDY)
+                                          : rectOf(box.x, box.y, box.x + box.width, box.y + box.height);
+            SkPaint veil;
+            veil.setAntiAlias(false);
+            veil.setColor(SkColorSetARGB(170, 255, 255, 255));
+            canvas->drawRect(from, veil);
+            if (hold.dragSnapshot && hold.dragSnapshot->width > 0) {
+                SkRect src = SkRect::MakeWH(static_cast<float>(hold.dragSnapshot->width),
+                                            static_cast<float>(hold.dragSnapshot->height));
+                const PictureTextureView texture =
+                    pictureTexture(recorder, hold.dragSnapshotId, hold.dragSnapshot, to.width(), to.height(), src);
+                if (texture.image) {
+                    src = SkRect::MakeLTRB(src.fLeft * texture.scaleX, src.fTop * texture.scaleY,
+                                           src.fRight * texture.scaleX, src.fBottom * texture.scaleY);
+                    canvas->drawImageRect(texture.image.get(), src, to,
+                                          SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear), nullptr,
+                                          SkCanvas::kFast_SrcRectConstraint);
+                }
+            }
+        }
     }
     if (hold.objectHandles && !hold.boxes.empty() && hold.caretPageW > 0) {
         const HeldBox& box = hold.boxes.front();
@@ -5800,7 +6574,8 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
                 };
                 SkPaint cover;
                 cover.setAntiAlias(false);
-                cover.setColor(SK_ColorWHITE);
+                // 원래 자리는 반투명하게 덮어 흐리게 남긴다.
+                cover.setColor(SkColorSetARGB(170, 255, 255, 255));
                 canvas->drawRect(SkRect::MakeLTRB(screenX(hold.resizeLeft), screenY(hold.resizeTop),
                                                   screenX(hold.resizeRight), screenY(hold.resizeBottom)),
                                  cover);
@@ -5863,6 +6638,39 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
             }
         }
     }
+    // 도형을 끄는 동안 새로 생길 모양 그대로 보인다. 넣을 때와 같이 검은 실선 33 HU 에 흰 채움이고, 선은 채움이 없다
+    // (insertShapeNow).
+    if (hold.drawing && hold.drawPage >= 0) {
+        if (const ViewPage* page = sheetOf(pages, hold.drawPage);
+            page && page->w > 0 && page->h > 0 && page->widthHu > 0 && page->heightHu > 0) {
+            const float sx = static_cast<float>(page->w) / static_cast<float>(page->widthHu);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(page->heightHu);
+            const float left = static_cast<float>(page->x - scrollX);
+            const float top = static_cast<float>(page->y - scrollY);
+            const float x0 = left + static_cast<float>(hold.drawX0) * sx;
+            const float y0 = top + static_cast<float>(hold.drawY0) * sy;
+            const float x1 = left + static_cast<float>(hold.drawX1) * sx;
+            const float y1 = top + static_cast<float>(hold.drawY1) * sy;
+            SkPaint pen;
+            pen.setAntiAlias(true);
+            pen.setStyle(SkPaint::kStroke_Style);
+            pen.setStrokeWidth(std::max(1.f, 33.f * sx));
+            pen.setColor(SK_ColorBLACK);
+            SkPaint face;
+            face.setAntiAlias(true);
+            face.setColor(SK_ColorWHITE);
+            const SkRect box = SkRect::MakeLTRB(std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::max(y0, y1));
+            if (hold.drawTool == 3) {
+                canvas->drawLine(x0, y0, x1, y1, pen);
+            } else if (hold.drawTool == 2) {
+                canvas->drawOval(box, face);
+                canvas->drawOval(box, pen);
+            } else {
+                canvas->drawRect(box, face);
+                canvas->drawRect(box, pen);
+            }
+        }
+    }
     // 커서가 든 글상자·표에서 선이 없는 테두리. 한글처럼 빨간 점선이고, 커서처럼 깜빡이지 않는다.
     if (hold.caret.hit && !hold.frameLines.empty() && hold.framePage == hold.caretPage && hold.caretPageW > 0 &&
         hold.caretPageH > 0) {
@@ -5901,85 +6709,17 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
     const float sy = static_cast<float>(page->h) / static_cast<float>(hold.caretPageH);
     const float x = static_cast<float>(page->x - scrollX) + static_cast<float>(hold.caret.x) * sx;
     const float y = static_cast<float>(page->y - scrollY) + static_cast<float>(hold.caret.y) * sy;
-    const float h = std::max(1.f, static_cast<float>(hold.caret.height) * sy);
     SkPaint paint;
     paint.setAntiAlias(false);
     paint.setColor(onSelection ? SK_ColorWHITE : SK_ColorBLACK);
-    canvas->drawRect(SkRect::MakeXYWH(x, y, std::max(1.f, sx), h), paint);
-}
-
-std::atomic<bool> gRenderInteracting{false};
-
-int rasterQueuedMasks(int budget, int targetMaskZoom) {
-    if (budget < 1) budget = 1;
-    int made = 0;
-    while (made < budget) {
-        if (gRenderInteracting.load(std::memory_order_relaxed)) break;
-        MaskJob job;
-        bool hasJob = false;
-        {
-            std::lock_guard lock(glyphAtlasMutex());
-            std::vector<MaskJob>& jobs = maskJobs();
-            const std::size_t baseCount = std::min(baseMaskJobCount(), jobs.size());
-            if (targetMaskZoom > 0 && targetMaskZoom != 100 && baseCount > 0) {
-                if (maskZoomJobTarget() != targetMaskZoom) {
-                    maskZoomJobTarget() = targetMaskZoom;
-                    maskZoomJobCursor() = 0;
-                }
-                std::size_t& zCursor = maskZoomJobCursor();
-                if (zCursor < baseCount) {
-                    const MaskJob& base = jobs[zCursor++];
-                    const float exact = base.exactPpem > 0.f ? base.exactPpem : static_cast<float>(base.ppem);
-                    const int scaledPpem = std::clamp(
-                        std::max(1, static_cast<int>(std::lround(static_cast<double>(exact) *
-                                                                 static_cast<double>(targetMaskZoom) / 100.0))),
-                        1, 256);
-                    job = MaskJob{base.font, base.cp, base.bold, base.italic, base.ratio,
-                                  scaledPpem, targetMaskZoom, exact};
-                    hasJob = true;
-                }
-            }
-            if (!hasJob) {
-                std::size_t& cursor = maskJobCursor();
-                if (cursor < jobs.size()) {
-                    job = jobs[cursor++];
-                    hasJob = true;
-                }
-            }
-        }
-        if (!hasJob) break;
-        GlyphMem* mem = glyphMemory(job.font, job.cp);
-        if (!mem || !mem->face || job.ppem <= 0) continue;
-        FrameGlyph glyph;
-        glyph.mem = mem;
-        glyph.ppem = job.ppem;
-        glyph.ratio = job.ratio > 0 ? job.ratio : 100;
-        glyph.bold = job.bold;
-        glyph.italic = job.italic;
-        const MaskId key = maskId(glyph, job.ppem);
-        {
-            std::lock_guard lock(glyphAtlasMutex());
-            if (glyphMasks().count(key)) continue;
-        }
-        MaskLoc loc;
-        loc.zoom = job.zoom > 0 ? job.zoom : 100;
-        loc.ppem = job.ppem;
-        const bool drawn = rasterGlyphAlpha(glyph, job.ppem, loc);
-        {
-            std::lock_guard lock(glyphAtlasMutex());
-            if (glyphMasks().count(key)) continue;
-            if (!drawn || !packMask(loc)) {
-                loc.missing = true;
-                loc.alpha.clear();
-                loc.page = -1;
-            }
-            rememberFamily(maskFamily(glyph), job.ppem);
-            glyphMasks().emplace(key, std::move(loc));
-            ++maskBuiltSeq();
-        }
-        ++made;
+    if (hold.caret.turned) {
+        // 세로쓰기 커서는 줄을 가로지르는 누운 막대다.
+        const float w = std::max(1.f, static_cast<float>(hold.caret.height) * sx);
+        canvas->drawRect(SkRect::MakeXYWH(x, y, w, std::max(1.f, sy)), paint);
+        return;
     }
-    return made;
+    const float h = std::max(1.f, static_cast<float>(hold.caret.height) * sy);
+    canvas->drawRect(SkRect::MakeXYWH(x, y, std::max(1.f, sx), h), paint);
 }
 
 }  // namespace
@@ -5996,137 +6736,22 @@ bool resetScreenSurface() {
     return beginDawnSurface();
 }
 
-void dropScreenSprite(int id) {
-    screenTextures().erase(id);
-    dropFrameGlyphs(id);
-    dropFramePictures(id);
-    dropFrameBorders(id);
-}
-
-void dropPageGpuCache(int page) {
-    if (page < 0) {
-        clearPageGpuCache();
-        return;
-    }
-    auto& cache = pageGpuCache();
-    const auto found = cache.find(page);
-    if (found == cache.end()) return;
-    if (pageGpuCacheBytes() >= found->second.bytes) pageGpuCacheBytes() -= found->second.bytes;
-    else pageGpuCacheBytes() = 0;
-    cache.erase(found);
-}
-
-bool glyphMasksPending() {
-    std::lock_guard lock(glyphAtlasMutex());
-    return glyphMaskPending();
-}
-
-// 화면이 칸 비트맵 말고 따로 그릴 것(글자, 그림)이 있는지. 있으면 빈 비트맵 칸도 쓴다.
-bool frameHasGlyphs(int id) {
-    {
-        std::lock_guard lock(frameGlyphMutex());
-        const auto found = frameGlyphs().find(id);
-        if (found != frameGlyphs().end() && !found->second.empty()) return true;
-    }
-    return frameHasPictures(id) || frameHasBorders(id);
-}
-
-bool cloneAndAdjustFrameGlyphs(int srcFrameId, int dstFrameId, int newStory, int newParagraph, int deltaOffset,
-                               std::int32_t deltaOriginX, std::int32_t deltaOriginY) {
-    (void)deltaOriginX;
-    (void)deltaOriginY;
-    if (srcFrameId == 0 || dstFrameId == 0) return false;
-    const bool pictures = cloneFramePictures(srcFrameId, dstFrameId);
-    const bool borders = cloneFrameBorders(srcFrameId, dstFrameId);
-    std::lock_guard lock(frameGlyphMutex());
-    const auto found = frameGlyphs().find(srcFrameId);
-    if (found == frameGlyphs().end() || found->second.empty()) return pictures || borders;
-    if (srcFrameId != dstFrameId) {
-        std::vector<FrameGlyph> copy = found->second;
-        for (FrameGlyph& g : copy) {
-            if (newStory >= 0) g.story = newStory;
-            if (newParagraph >= 0) g.paragraph = newParagraph;
-            if (deltaOffset != 0 && g.offset >= 0) g.offset += deltaOffset;
-        }
-        frameGlyphs()[dstFrameId] = std::move(copy);
-        if (const auto srIt = spriteMaskReady().find(srcFrameId); srIt != spriteMaskReady().end()) {
-            spriteMaskReady()[dstFrameId] = srIt->second;
-        }
-        cachedSpriteQuads().erase(dstFrameId);
-    } else {
-        for (FrameGlyph& g : found->second) {
-            if (newStory >= 0) g.story = newStory;
-            if (newParagraph >= 0) g.paragraph = newParagraph;
-            if (deltaOffset != 0 && g.offset >= 0) g.offset += deltaOffset;
-        }
-    }
+// 캔버스 없이 2D 로만 합성한다. 글자는 칸 비트맵에 굽는다(GPU 화면이 없을 때와 같다).
+bool attachRemoteScreen() {
+    screenTextures().clear();
+    screenBitmaps().clear();
+    clearScreenGlyphs();
+    clearPageGpuCache();
+    releaseGpuImages();
+    clearDawnSlot();
+    GpuSlot& slot = gpuSlot();
+    slot.tried = true;
+    slot.failed = true;
+    slot.raster = true;
+    slot.ready = true;
+    slot.vectors = false;
+    noteScreenFailed(true);
     return true;
-}
-
-bool canUsePageGpuTexture(int page, int pageW, int pageH, int layoutZoom, int maskZoom, int pageStamp, bool dragging) {
-    if (layoutZoom > 100) return false;
-    const GpuSlot& slot = gpuSlot();
-    if (!slot.ready || slot.raster || !slot.recorder) return false;
-    if (page < 0 || pageStamp == 0 || pageW <= 0 || pageH <= 0 || pageW > kMaxPageGpuCacheW ||
-        pageH > kMaxPageGpuCacheH) {
-        return false;
-    }
-    const auto it = pageGpuCache().find(page);
-    if (it == pageGpuCache().end()) return false;
-    const PageGpuCacheEntry& entry = it->second;
-    if (!entry.image || entry.w <= 0 || entry.h <= 0 || entry.stamp != pageStamp) {
-        return false;
-    }
-    if (dragging || gRenderInteracting.load(std::memory_order_relaxed)) return true;
-    if (entry.incomplete && entry.builtSeq != maskBuiltSeq()) return false;
-    if (entry.picturesCoarse && entry.pictureSeq != pictureTextureSeq()) return false;
-    if (entry.w == pageW && entry.h == pageH && entry.layoutZoom == layoutZoom && entry.maskZoom == maskZoom) {
-        return true;
-    }
-    // 더 큰 배율로 구운 쪽은 밉맵으로 줄여 쓴다. 같은 배율이면 마스크 배율까지 같아야 한다.
-    if (layoutZoom <= 100 && entry.layoutZoom > layoutZoom && entry.layoutZoom <= 100) {
-        return true;
-    }
-    return false;
-}
-
-bool hasScalablePageGpuTexture(int page, int pageStamp) {
-    const GpuSlot& slot = gpuSlot();
-    if (!slot.ready || slot.raster || !slot.recorder) return false;
-    if (page < 0 || pageStamp == 0) return false;
-    const auto it = pageGpuCache().find(page);
-    if (it == pageGpuCache().end()) return false;
-    const PageGpuCacheEntry& entry = it->second;
-    return entry.image && entry.stamp == pageStamp && entry.w > 0 && entry.h > 0;
-}
-
-int pageGpuTextureZoom(int page, int pageStamp) {
-    if (!hasScalablePageGpuTexture(page, pageStamp)) return 0;
-    return pageGpuCache().find(page)->second.layoutZoom;
-}
-
-bool hasAnyPageGpuTexture(int page) {
-    const GpuSlot& slot = gpuSlot();
-    if (!slot.ready || slot.raster || !slot.recorder) return false;
-    if (page < 0) return false;
-    const auto it = pageGpuCache().find(page);
-    if (it == pageGpuCache().end()) return false;
-    const PageGpuCacheEntry& entry = it->second;
-    return entry.image && entry.w > 0 && entry.h > 0;
-}
-
-bool canBakePageGpuTexture(int page, int pageW, int pageH, int pageStamp) {
-    const GpuSlot& slot = gpuSlot();
-    if (!slot.ready || slot.raster || !slot.recorder) return false;
-    if (page < 0 || pageStamp == 0 || pageW <= 0 || pageH <= 0 || pageW > kMaxPageGpuCacheW ||
-        pageH > kMaxPageGpuCacheH) {
-        return false;
-    }
-    return true;
-}
-
-void setRenderInteracting(bool interacting) {
-    gRenderInteracting.store(interacting, std::memory_order_relaxed);
 }
 
 // 개체·그림·칠은 글자 마스크가 아니라 칸 픽셀이다. 블록에 걸린 부분만 색을 뒤집는다.
@@ -6225,40 +6850,50 @@ void drawScrollbar(SkCanvas* canvas, const Scrollbar& bar) {
     canvas->drawRoundRect(thumb, radius, radius, thumbPaint);
 }
 
+// 눈금자 숫자 0~9 의 윤곽. 처음 그릴 때 함초롬돋움에서 한 번 떠 두고 계속 쓴다(몇 KB).
+// 글꼴 예산이 함초롬돋움을 접은 뒤에 새 숫자가 나와도 그리는 도중에 글꼴 파일을 다시 열지 않는다.
+struct RulerDigit {
+    bool ready = false;
+    std::vector<GlyphCommand> commands;
+    float advance1000 = 500.f;
+    int fitX = 1000;
+    int fitY = 1000;
+};
+
+// 아직 못 뜬 숫자(글꼴을 받기 전)는 다음에 다시 뜬다. 한 번 뜬 숫자는 글꼴을 다시 찾지 않는다.
+const RulerDigit& rulerDigit(int d) {
+    static std::array<RulerDigit, 10> digits;
+    static std::mutex mu;
+    std::lock_guard lock(mu);
+    RulerDigit& digit = digits[static_cast<std::size_t>(d)];
+    if (digit.ready) return digit;
+    static const std::string face = "함초롬돋움";
+    const GlyphMem* mem = glyphMemory(face, static_cast<char32_t>('0' + d));
+    if (!mem || !mem->face) return digit;
+    digit.commands = hangulCurves(mem, false, false, 0);
+    digit.advance1000 = mem->advance1000;
+    digit.fitX = mem->fitX;
+    digit.fitY = mem->fitY;
+    digit.ready = true;
+    return digit;
+}
+
 // 눈금자 숫자. 함초롬돋움 윤곽을 그대로 칠한다. 가운데 x, 기준선 y 에 맞춘다.
 void drawRulerNumber(SkCanvas* canvas, int value, float centerX, float baseY, float emPx, const SkPaint& ink) {
-    static const std::string face = "함초롬돋움";
     const std::string digits = std::to_string(value);
-    struct Placed {
-        GlyphMem* mem = nullptr;
-        float advance = 0.f;
-    };
-    Placed placed[12];
     float total = 0.f;
-    std::size_t count = 0;
     for (char c : digits) {
-        if (count >= 12) break;
-        GlyphMem* mem = glyphMemory(face, static_cast<char32_t>(c));
-        float advance = emPx * 0.5f;
-        if (mem && mem->face) {
-            int adv = 0;
-            int lsb = 0;
-            stbtt_GetGlyphHMetrics(&mem->face->info, mem->index, &adv, &lsb);
-            advance = static_cast<float>(adv) * stbtt_ScaleForMappingEmToPixels(&mem->face->info, emPx);
-        }
-        placed[count++] = Placed{mem, advance};
-        total += advance;
+        if (c < '0' || c > '9') continue;
+        total += rulerDigit(c - '0').advance1000 * emPx / 1000.f;
     }
     float pen = centerX - total / 2.f;
-    for (std::size_t i = 0; i < count; ++i) {
-        if (placed[i].mem) {
-            const auto& commands = hangulCurves(placed[i].mem, false, false, 0);
-            if (!commands.empty()) {
-                canvas->drawPath(glyphPath(commands, emPx, 100, pen, baseY, placed[i].mem->fitX, placed[i].mem->fitY),
-                                 ink);
-            }
+    for (char c : digits) {
+        if (c < '0' || c > '9') continue;
+        const RulerDigit& digit = rulerDigit(c - '0');
+        if (!digit.commands.empty()) {
+            canvas->drawPath(glyphPath(digit.commands, emPx, 100, pen, baseY, digit.fitX, digit.fitY), ink);
         }
-        pen += placed[i].advance;
+        pen += digit.advance1000 * emPx / 1000.f;
     }
 }
 
@@ -6348,6 +6983,252 @@ void drawRulers(SkCanvas* canvas, int viewW, int viewH, int ruler, const std::ve
     canvas->drawRect(SkRect::MakeLTRB(thick - 1.f, 0.f, thick, static_cast<float>(viewH)), edge);
 }
 
+// Skia Graphite 가 GPU 에 쥔 자원 캐시(중간 텍스처·버퍼 등). 우리 캐시와 따로 GPU 메모리를 쓰니 크기를 같이 보인다.
+// 지금은 재기만 한다. 예산은 Graphite 기본값을 쓴다.
+class SkiaGpuPool final : public CachePool {
+ public:
+    const char* name() const override { return "skiaGpu"; }
+    std::size_t bytes() const override {
+        const GpuSlot& slot = gpuSlot();
+        std::size_t total = 0;
+        if (slot.context) total += slot.context->currentBudgetedBytes();
+        if (slot.recorder) total += slot.recorder->currentBudgetedBytes();
+        return total;
+    }
+    std::size_t release(CacheTier, std::size_t) override { return 0; }
+};
+
+void registerSkiaGpuPool() {
+    static SkiaGpuPool pool;
+    static const bool registered = (registerCachePool(pool, kNoCacheBudget), true);
+    (void)registered;
+}
+
+// 2D 그림 목록의 그림 번호. 칸 그림은 칸 번호와 판으로 셸에 한 번만 올린다. 칸이 아닌 그림은 그림 번호로 올린다.
+int screenImageKey(const SkImage* image) {
+    if (!image) return 0;
+    SkPixmap pixmap;
+    std::vector<std::uint8_t> copied;
+    if (!image->peekPixels(&pixmap) || pixmap.colorType() != kRGBA_8888_SkColorType) {
+        const SkImageInfo info =
+            SkImageInfo::Make(image->width(), image->height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+        copied.resize(info.computeMinByteSize());
+        if (copied.empty() || !image->readPixels(nullptr, info, copied.data(), info.minRowBytes(), 0, 0)) return 0;
+        pixmap = SkPixmap(info, copied.data(), info.minRowBytes());
+    }
+    std::uint64_t source = (std::uint64_t{1} << 40) | image->uniqueID();
+    int stamp = 0;
+    if (const auto found = rasterImageSources().find(image->uniqueID()); found != rasterImageSources().end()) {
+        source = static_cast<std::uint32_t>(found->second.first);
+        stamp = found->second.second;
+    }
+    return screenBitmaps().use(source, stamp, pixmap.width(), pixmap.height(),
+                               static_cast<const std::uint8_t*>(pixmap.addr()), pixmap.rowBytes());
+}
+
+// 한 쪽의 칸 조각(바탕 비트맵·그림·테두리·글자 쿼드)을 GPU 캔버스 pageCanvas 에 차례대로 굽는다.
+// 화면의 쪽 텍스처와 쪽 그림(renderPageGpu)이 같이 쓴다. origin 은 조각 좌표에서 뺄 쪽 왼쪽 위다.
+void bakePageSprites(SkCanvas* pageCanvas, GpuSlot& slot, const std::vector<const ScreenSprite*>& pageSprites,
+                     int originX, int originY, int bakeW, int bakeH, int cacheZoom, int maskZoom, int cacheW,
+                     int cacheH, bool dragging, int& mipmapUpgrades, bool& pageIncomplete, bool& pagePicturesCoarse) {
+    pageCanvas->clear(SK_ColorWHITE);
+    std::vector<std::vector<GlyphQuad>> pSharp;
+    std::vector<std::vector<GlyphQuad>> pScaled;
+    GlyphRect pBatchBounds;
+    bool pHasPending = false;
+    auto flushPageGlyphs = [&]() {
+        if (!pHasPending) return;
+        drawGlyphQuads(pageCanvas, slot.recorder.get(), pSharp, SkFilterMode::kNearest);
+        drawGlyphQuads(pageCanvas, slot.recorder.get(), pScaled, SkFilterMode::kLinear);
+        for (auto& pq : pSharp) pq.clear();
+        for (auto& pq : pScaled) pq.clear();
+        pBatchBounds = GlyphRect{};
+        pHasPending = false;
+    };
+    const std::vector<SkRect> emptyBacks;
+    sk_sp<SkColorFilter> emptyInverted;
+    for (const ScreenSprite* spritePtr : pageSprites) {
+        const ScreenSprite& sprite = *spritePtr;
+        ScreenSprite localSprite = sprite;
+        localSprite.x = sprite.x - originX;
+        localSprite.y = sprite.y - originY;
+        if (const auto pictures = framePictures(sprite.id); pictures && localSprite.sw > 0 &&
+                                                             localSprite.sh > 0) {
+            const SkRect dst = SkRect::MakeXYWH(
+                static_cast<float>(localSprite.x), static_cast<float>(localSprite.y),
+                static_cast<float>(localSprite.w), static_cast<float>(localSprite.h));
+            if (pHasPending && pBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) flushPageGlyphs();
+            if (!drawFramePictures(pageCanvas, slot.recorder.get(), *pictures, dst,
+                                   static_cast<float>(localSprite.w) / static_cast<float>(localSprite.sw),
+                                   static_cast<float>(localSprite.h) / static_cast<float>(localSprite.sh),
+                                   dragging, emptyBacks, emptyInverted)) {
+                pagePicturesCoarse = true;
+            }
+        }
+        if (frameHasBorders(sprite.id) && localSprite.sw > 0 && localSprite.sh > 0) {
+            const SkRect dst = SkRect::MakeXYWH(
+                static_cast<float>(localSprite.x), static_cast<float>(localSprite.y),
+                static_cast<float>(localSprite.w), static_cast<float>(localSprite.h));
+            if (pHasPending && pBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) flushPageGlyphs();
+            drawSpriteBorders(pageCanvas, sprite.id, dst, localSprite.sw, localSprite.sh, emptyBacks,
+                              emptyInverted);
+        }
+        if (localSprite.rgba && localSprite.sw > 1 && localSprite.sh > 1) {
+            const bool exactSize = localSprite.w == localSprite.sw && localSprite.h == localSprite.sh;
+            const bool heavyShrink =
+                !localSprite.nearest &&
+                (localSprite.w * 2 < localSprite.sw || localSprite.h * 2 < localSprite.sh);
+            bool mipmapped = false;
+            const sk_sp<SkImage> image = screenTexture(slot.recorder.get(), localSprite, heavyShrink,
+                                                       dragging, mipmapped, mipmapUpgrades);
+            if (image) {
+                const SkRect dst = SkRect::MakeXYWH(static_cast<float>(localSprite.x),
+                                                    static_cast<float>(localSprite.y),
+                                                    static_cast<float>(localSprite.w),
+                                                    static_cast<float>(localSprite.h));
+                if (pHasPending && pBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) {
+                    flushPageGlyphs();
+                }
+                const SkSamplingOptions sampling =
+                    (localSprite.nearest || exactSize)
+                        ? SkSamplingOptions(SkFilterMode::kNearest)
+                        : (heavyShrink || cacheZoom <= 75
+                               ? (mipmapped
+                                      ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
+                                      : SkSamplingOptions(SkFilterMode::kLinear))
+                               : SkSamplingOptions(SkCubicResampler::CatmullRom()));
+                drawSpriteImage(pageCanvas, slot.recorder.get(), image.get(), dst, sampling, emptyBacks,
+                                emptyInverted, static_cast<float>(bakeW), static_cast<float>(bakeH));
+            }
+        }
+        if (!slot.vectors) continue;
+        bool spriteExact = true;
+        appendGlyphQuads(localSprite, cacheZoom, maskZoom, cacheW, cacheH, false, pSharp, pScaled,
+                         pBatchBounds, pHasPending, &spriteExact);
+        if (!spriteExact) pageIncomplete = true;
+    }
+    flushPageGlyphs();
+}
+
+namespace {
+
+struct PageReadBox {
+    std::unique_ptr<const SkImage::AsyncReadResult> result;
+};
+
+void onPageRead(void* context, std::unique_ptr<const SkImage::AsyncReadResult> result) {
+    static_cast<PageReadBox*>(context)->result = std::move(result);
+}
+
+bool submitPage(GpuSlot& slot) {
+    std::unique_ptr<skgpu::graphite::Recording> recording = slot.recorder->snap();
+    if (!recording) return false;
+    skgpu::graphite::InsertRecordingInfo info;
+    info.fRecording = recording.get();
+    if (slot.context->insertRecording(info) != skgpu::graphite::InsertStatus::kSuccess) return false;
+    return slot.context->submit(skgpu::graphite::SyncToCpu::kYes);
+}
+
+}  // namespace
+
+PageBitmap renderPageGpu(const model::Document& doc, std::vector<Node>& pages, int pageIndex, int pixelHeight,
+                         FrameCache& frames) {
+    PageBitmap out;
+    if (!pageImageGpu() || pageIndex < 0 || pageIndex >= static_cast<int>(pages.size()) || pixelHeight < 32) {
+        return out;
+    }
+    GpuSlot& slot = gpuSlot();
+    if (!slot.tried) beginDawnSurface();
+    if (!slot.ready || slot.raster || !slot.context || !slot.recorder) return out;
+    const Node& scene = pages[static_cast<std::size_t>(pageIndex)];
+    if (scene.height <= 0 || scene.width <= 0) return out;
+    const int pixelW = pagePixelWidth(scene.width, scene.height, pixelHeight);
+    const int fullH = pagePixelHeight(scene.height, 100);
+    const int percent = std::max(1, static_cast<int>(std::lround(100.0 * pixelHeight / std::max(1, fullH))));
+    // 화면과 같이 칸을 굽는다. 100% 보다 작으면 100% 칸을 줄여 놓는다.
+    // 칸을 고르는 범위는 구운 배율의 쪽 크기다. 100% 보다 작게 그려도 100% 칸 전부가 들어오게 넓힌다.
+    ViewPlan plan;
+    plan.viewW = std::max(pixelW, pagePixelWidth(scene.width, scene.height, fullH));
+    plan.viewH = std::max(pixelHeight, fullH);
+    plan.percent = percent;
+    ViewPage view;
+    view.index = pageIndex;
+    view.w = pixelW;
+    view.h = pixelHeight;
+    view.widthHu = scene.width;
+    view.heightHu = scene.height;
+    plan.pages.push_back(view);
+    frames.bakeVisibleNow(doc, pages, plan);
+    const int bakePercent = percent < 100 ? 100 : percent;
+    std::vector<PageSprite> placed = readyPageSprites(frames, pageIndex, bakePercent);
+    placePageSprites(placed, percent, pixelHeight, scene.height);
+    std::vector<ScreenSprite> sprites;
+    sprites.reserve(placed.size());
+    for (const PageSprite& item : placed) {
+        ScreenSprite sprite;
+        sprite.id = item.id;
+        sprite.stamp = item.stamp;
+        sprite.x = item.localX;
+        sprite.y = item.localY;
+        sprite.w = item.w;
+        sprite.h = item.h;
+        sprite.sw = item.sw;
+        sprite.sh = item.sh;
+        sprite.percent = item.percent;
+        sprite.page = pageIndex;
+        sprite.layer = item.layer;
+        sprite.nearest = item.nearest;
+        sprite.rgba = item.rgba;
+        sprites.push_back(sprite);
+    }
+    std::vector<const ScreenSprite*> pageSprites;
+    pageSprites.reserve(sprites.size());
+    for (const ScreenSprite& sprite : sprites) pageSprites.push_back(&sprite);
+    registerAtlasPool();
+    registerSkiaGpuPool();
+    const int maskZoom = restingMaskZoom(percent);
+    const SkImageInfo info = SkImageInfo::Make(pixelW, pixelHeight, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+    sk_sp<SkSurface> surface;
+    // 그림은 GPU 로 올리는 데 몇 차례가 걸린다. 덜 올라간 그림이 있으면 다 올린 뒤 다시 굽는다.
+    for (int round = 0; round < 64; ++round) {
+        std::unique_lock<std::mutex> glyphLock(frameGlyphMutex());
+        std::unique_lock<std::mutex> atlasLock(glyphAtlasMutex());
+        if (slot.vectors) ensureGlyphMasks(sprites, percent, maskZoom, pixelW, pixelHeight, false);
+        surface = SkSurfaces::RenderTarget(slot.recorder.get(), info, skgpu::Mipmapped::kNo);
+        if (!surface) return out;
+        int mipmapUpgrades = 0;
+        bool incomplete = false;
+        bool coarse = false;
+        bakePageSprites(surface->getCanvas(), slot, pageSprites, 0, 0, pixelW, pixelHeight, percent, maskZoom, pixelW,
+                        pixelHeight, false, mipmapUpgrades, incomplete, coarse);
+        atlasLock.unlock();
+        glyphLock.unlock();
+        if (!coarse || !pictureUploadsWaiting()) break;
+        while (pictureUploadsWaiting()) {
+            advancePictureUploads(slot.recorder.get());
+            if (!submitPage(slot)) return out;
+        }
+    }
+    if (!submitPage(slot)) return out;
+    PageReadBox box;
+    slot.context->asyncRescaleAndReadPixels(surface.get(), info, SkIRect::MakeWH(pixelW, pixelHeight),
+                                            SkImage::RescaleGamma::kSrc, SkImage::RescaleMode::kNearest, onPageRead,
+                                            &box);
+    slot.context->submit(skgpu::graphite::SyncToCpu::kYes);
+    for (int spin = 0; !box.result && spin < 1000; ++spin) slot.context->checkAsyncWorkCompletion();
+    if (!box.result) return out;
+    const auto* src = static_cast<const std::uint8_t*>(box.result->data(0));
+    const std::size_t rowBytes = box.result->rowBytes(0);
+    out.width = pixelW;
+    out.height = pixelHeight;
+    out.rgba.resize(static_cast<std::size_t>(pixelW) * static_cast<std::size_t>(pixelHeight) * 4u);
+    for (int y = 0; y < pixelHeight; ++y) {
+        std::memcpy(out.rgba.data() + static_cast<std::size_t>(y) * pixelW * 4u,
+                    src + static_cast<std::size_t>(y) * rowBytes, static_cast<std::size_t>(pixelW) * 4u);
+    }
+    return out;
+}
+
 bool presentFailed(const char* why) {
     static const char* last = nullptr;
     static int quiet = 0;
@@ -6359,7 +7240,7 @@ bool presentFailed(const char* why) {
     }
     last = why;
     quiet = 30;
-    std::fprintf(stderr, "[noting 오류] 화면: %s\n", why ? why : "알 수 없음");
+    std::fprintf(stderr, "[ClassingHWP 오류] 화면: %s\n", why ? why : "알 수 없음");
     return false;
 }
 
@@ -6368,7 +7249,8 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
                    const Scrollbar& barX, const Scrollbar& barY, bool dragging, int ruler, double dpr) {
     beginCacheFrame();
     registerAtlasPool();
-    pageGpuPool();
+    registerSkiaGpuPool();
+    pageTextures().ensureRegistered();
     keepPictureBudget();
     if (viewW <= 0 || viewH <= 0) return presentFailed("화면 크기가 없습니다");
     // 화면에 걸친 쪽의 텍스처를 그리기 전에 모두 이번 프레임 것으로 표시한다.
@@ -6378,26 +7260,26 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
     for (const ScreenSprite& quad : papers) {
         if (quad.page < 0 || quad.w <= 0 || quad.h <= 0) continue;
         if (quad.x >= viewW || quad.y >= viewH || quad.x + quad.w <= 0 || quad.y + quad.h <= 0) continue;
-        if (const auto it = pageGpuCache().find(quad.page); it != pageGpuCache().end()) {
-            it->second.lastFrame = cacheFrame();
-        }
+        pageTextures().markFrame(quad.page);
     }
     GpuSlot& slot = gpuSlot();
     if (!slot.ready) return presentFailed("GPU가 준비되지 않았습니다");
-    if (!slot.raster) advancePictureUploads(slot.recorder.get());
+    if (!slot.raster) {
+        const FramePhaseTimer timer(FramePhase::Pictures);
+        advancePictureUploads(slot.recorder.get());
+    }
     sk_sp<SkSurface> surface;
-    if (slot.raster) {
-        const std::size_t needBytes = static_cast<std::size_t>(viewW) * static_cast<std::size_t>(viewH) * 4u;
-        if (slot.rasterW != viewW || slot.rasterH != viewH || slot.rasterPixels.size() != needBytes) {
-            slot.rasterW = viewW;
-            slot.rasterH = viewH;
-            slot.rasterPixels.assign(needBytes, 0);
-        }
-        const SkImageInfo rasterInfo = SkImageInfo::Make(viewW, viewH, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
-        surface = SkSurfaces::WrapPixels(rasterInfo, slot.rasterPixels.data(), static_cast<std::size_t>(viewW) * 4u);
-        if (!surface) return presentFailed("래스터 화면을 만들지 못했습니다");
+    ScreenFrame2D frame2d;
+    std::unique_ptr<SkCanvas> opCanvas;
+    rasterImageSources().clear();
+    if (slot.raster && screenOpSink()) {
+        // 2D 화면: 픽셀을 합성하지 않고 그림 목록을 낸다. 셸이 플랫폼 2D 그리기로 옮긴다.
+        opCanvas = makeScreenOpCanvas(viewW, viewH, frame2d, &screenImageKey);
+    } else if (slot.raster) {
+        return presentFailed("2D 화면 그림 목록을 받을 곳이 없습니다");
     } else {
         if (!slot.context || !slot.recorder) return presentFailed("GPU 기록기가 없습니다");
+        const FramePhaseTimer timer(FramePhase::Acquire);
         if (!configureDawnSurface(slot, viewW, viewH)) return presentFailed("화면 표면을 맞추지 못했습니다");
     }
     // 스프라이트가 없는 순수 페이지 GPU 텍스처 합성 프레임은 글자·아틀라스 뮤텍스를 잠그지 않는다.
@@ -6406,23 +7288,14 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
     if (!sprites.empty() || slot.raster) {
         glyphLock.lock();
         atlasLock.lock();
-        // 핀치 중에는 10% 단위로 화면 안 글리프만 찍고, 멈추면 나머지 마스크까지 찍는다.
-        int effectiveLayoutZoom = layoutZoom > 0 ? std::max(layoutZoom, 25) : layoutZoom;
-        bool hasPageBake = false;
-        for (const ScreenSprite& quad : papers) {
-            if (quad.nearest && quad.page >= 0 && quad.stamp != 0) {
-                hasPageBake = true;
-                const int cz = quad.percent > 0 ? quad.percent : effectiveLayoutZoom;
-                if (cz > effectiveLayoutZoom) effectiveLayoutZoom = cz;
-            }
-        }
-        const int maskViewW = (hasPageBake || (layoutZoom > 0 && layoutZoom < 25)) ? 0 : viewW;
-        const int maskViewH = (hasPageBake || (layoutZoom > 0 && layoutZoom < 25)) ? 0 : viewH;
+        const MaskPass pass = maskPassFor(papers, layoutZoom, viewW, viewH);
         if (slot.vectors && maskZoom > 0) {
-            ensureGlyphMasks(sprites, effectiveLayoutZoom, maskZoom, maskViewW, maskViewH, dragging);
+            const FramePhaseTimer timer(FramePhase::Masks);
+            ensureGlyphMasks(sprites, pass.layoutZoom, maskZoom, pass.viewW, pass.viewH, dragging);
         }
     }
     if (!slot.raster) {
+        const FramePhaseTimer timer(FramePhase::Acquire);
         wgpu::SurfaceTexture surfaceTexture;
         slot.surface.GetCurrentTexture(&surfaceTexture);
         if (!surfaceTexture.texture) return presentFailed("GPU 텍스처를 받지 못했습니다");
@@ -6431,61 +7304,58 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         surface = SkSurfaces::WrapBackendTexture(slot.recorder.get(), backend, nullptr, nullptr);
         if (!surface) return presentFailed("GPU 화면을 감싸지 못했습니다");
     }
-    SkCanvas* canvas = surface->getCanvas();
+    SkCanvas* canvas = opCanvas ? opCanvas.get() : surface->getCanvas();
     canvas->clear(SkColorSetARGB(255, 213, 219, 227));
     // 걸친 칸과 글자 쿼드는 통째로 두고, 캔버스 밖으로 나간 픽셀만 자른다.
     canvas->clipRect(SkRect::MakeWH(static_cast<float>(viewW), static_cast<float>(viewH)));
     SkPaint paper;
     paper.setColor(SK_ColorWHITE);
     std::unordered_set<int> handledPages;
-    int pageGpuBakesThisFrame = 0;
-    int pageGpuBakePixelsThisFrame = 0;
-    const int maxPageGpuBakes = dragging ? 24 : 64;
-    const int maxPageGpuBakePixels = dragging ? 1800000 : 5400000;
     int mipmapUpgrades = 0;
-    const bool allowPageGpuBake = true;
-
-    std::unordered_map<int, std::vector<const ScreenSprite*>> bakeSpritesByPage;
-    if (!slot.raster && slot.recorder && !sprites.empty()) {
-        bool anyBakeCandidate = false;
-        for (const ScreenSprite& quad : papers) {
-            if (quad.nearest && quad.page >= 0 && quad.stamp != 0) {
-                anyBakeCandidate = true;
-                break;
-            }
-        }
-        if (anyBakeCandidate) {
-            for (const ScreenSprite& s : sprites) {
-                if (s.page >= 0) {
-                    bakeSpritesByPage[s.page].push_back(&s);
-                }
-            }
-        }
-    }
+    // 쪽마다 무엇을 그릴지는 planPaper 가 정한다. 여기서는 그 차례대로 해 보고, GPU 가 못 하면 다음으로 간다.
+    PageBakeBudget bakeBudget(dragging);
+    PaperFrame paperFrame;
+    paperFrame.viewW = viewW;
+    paperFrame.viewH = viewH;
+    paperFrame.layoutZoom = layoutZoom;
+    paperFrame.maskZoom = maskZoom;
+    paperFrame.dragging = dragging;
+    paperFrame.texturesOn = pageTexturesOn();
+    paperFrame.interacting = gRenderInteracting.load(std::memory_order_relaxed);
+    paperFrame.maskSeq = maskBuiltSeq();
+    paperFrame.pictureSeq = pictureTextureSeq();
+    const std::unordered_map<int, std::vector<const ScreenSprite*>> bakeSpritesByPage =
+        paperFrame.texturesOn ? spritesByPage(papers, sprites)
+                              : std::unordered_map<int, std::vector<const ScreenSprite*>>{};
 
     sk_sp<SkColorFilter> inverted;
+    FramePhaseTimer papersTimer(FramePhase::Papers);
     for (const ScreenSprite& quad : papers) {
         if (quad.w <= 0 || quad.h <= 0) continue;
-        const bool onScreen = quad.x < viewW && quad.y < viewH && quad.x + quad.w > 0 && quad.y + quad.h > 0;
-        const int cacheW = quad.sw > 0 ? quad.sw : quad.w;
-        const int cacheH = quad.sh > 0 ? quad.sh : quad.h;
-        const int cacheZoom = quad.percent > 0 ? quad.percent : (layoutZoom > 0 ? std::max(layoutZoom, 25) : 100);
-        if (canUsePageGpuTexture(quad.page, cacheW, cacheH, cacheZoom, maskZoom, quad.stamp, dragging)) {
-            PageGpuCacheEntry& entry = pageGpuCache()[quad.page];
-            touchPageGpu(entry);
+        const auto pageSpritesIt = bakeSpritesByPage.find(quad.page);
+        const bool pageHasSprites = pageSpritesIt != bakeSpritesByPage.end() && !pageSpritesIt->second.empty();
+        const PaperPlan plan = planPaper(pageTextures(), quad, paperFrame, pageHasSprites, bakeBudget);
+        const bool onScreen = plan.onScreen;
+        const int cacheW = plan.cacheW;
+        const int cacheH = plan.cacheH;
+        const int cacheZoom = plan.cacheZoom;
+        SkImage* const cachedImage = pageGpuImage(quad.page);
+        if (cachedImage && plan.useTexture) {
+            pageTextures().touch(quad.page);
             if (onScreen) {
                 const SkSamplingOptions pageSampling =
-                    entry.image->hasMipmaps()
+                    cachedImage->hasMipmaps()
                         ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
                         : SkSamplingOptions(SkFilterMode::kLinear);
-                if (entry.w == quad.w && entry.h == quad.h) {
-                    canvas->drawImage(entry.image.get(), static_cast<float>(quad.x), static_cast<float>(quad.y));
+                const PageTextureMeta* entry = pageTextures().find(quad.page);
+                if (entry && entry->w == quad.w && entry->h == quad.h) {
+                    canvas->drawImage(cachedImage, static_cast<float>(quad.x), static_cast<float>(quad.y));
                 } else {
                     const SkRect dst = SkRect::MakeXYWH(static_cast<float>(quad.x), static_cast<float>(quad.y),
                                                         static_cast<float>(quad.w), static_cast<float>(quad.h));
-                    canvas->drawImageRect(entry.image.get(), dst, pageSampling, nullptr);
+                    canvas->drawImageRect(cachedImage, dst, pageSampling, nullptr);
                 }
-                drawPageHoldInversion(canvas, entry.image.get(), quad, pageSampling, viewW, viewH, inverted);
+                drawPageHoldInversion(canvas, cachedImage, quad, pageSampling, viewW, viewH, inverted);
             }
             handledPages.insert(quad.page);
             continue;
@@ -6493,143 +7363,59 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         const int bakeW = cacheW;
         const int bakeH = cacheH;
         const int quadPixels = bakeW * bakeH;
-        const bool withinBakeBudget =
-            pageGpuBakesThisFrame == 0 ||
-            (pageGpuBakesThisFrame < maxPageGpuBakes &&
-             pageGpuBakePixelsThisFrame + quadPixels <= maxPageGpuBakePixels);
-        if (!slot.raster && slot.recorder && quad.nearest && quad.page >= 0 && quad.stamp != 0 &&
-            bakeW <= kMaxPageGpuCacheW && bakeH <= kMaxPageGpuCacheH &&
-            allowPageGpuBake && withinBakeBudget) {
-            const auto pageSpritesIt = bakeSpritesByPage.find(quad.page);
-            if (pageSpritesIt != bakeSpritesByPage.end() && !pageSpritesIt->second.empty()) {
-                const std::vector<const ScreenSprite*>& pageSprites = pageSpritesIt->second;
-                const SkImageInfo pageInfo =
-                    SkImageInfo::Make(bakeW, bakeH, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
-                sk_sp<SkSurface> pageSurface =
-                    SkSurfaces::RenderTarget(slot.recorder.get(), pageInfo, skgpu::Mipmapped::kYes);
-                if (!pageSurface) {
-                    pageSurface = SkSurfaces::RenderTarget(slot.recorder.get(), pageInfo, skgpu::Mipmapped::kNo);
-                }
-                if (pageSurface) {
-                    SkCanvas* pageCanvas = pageSurface->getCanvas();
-                    pageCanvas->clear(SK_ColorWHITE);
-                    std::vector<std::vector<GlyphQuad>> pSharp;
-                    std::vector<std::vector<GlyphQuad>> pScaled;
-                    SkRect pBatchBounds = SkRect::MakeEmpty();
-                    bool pHasPending = false;
-                    bool pageIncomplete = false;
-                    bool pagePicturesCoarse = false;
-                    auto flushPageGlyphs = [&]() {
-                        if (!pHasPending) return;
-                        drawGlyphQuads(pageCanvas, slot.recorder.get(), pSharp, SkFilterMode::kNearest);
-                        drawGlyphQuads(pageCanvas, slot.recorder.get(), pScaled, SkFilterMode::kLinear);
-                        for (auto& pq : pSharp) pq.clear();
-                        for (auto& pq : pScaled) pq.clear();
-                        pBatchBounds = SkRect::MakeEmpty();
-                        pHasPending = false;
-                    };
-                    const std::vector<SkRect> emptyBacks;
-                    sk_sp<SkColorFilter> emptyInverted;
-                    for (const ScreenSprite* spritePtr : pageSprites) {
-                        const ScreenSprite& sprite = *spritePtr;
-                        ScreenSprite localSprite = sprite;
-                        localSprite.x = sprite.x - quad.x;
-                        localSprite.y = sprite.y - quad.y;
-                        if (const auto pictures = framePictures(sprite.id); pictures && localSprite.sw > 0 &&
-                                                                             localSprite.sh > 0) {
-                            const SkRect dst = SkRect::MakeXYWH(
-                                static_cast<float>(localSprite.x), static_cast<float>(localSprite.y),
-                                static_cast<float>(localSprite.w), static_cast<float>(localSprite.h));
-                            if (pHasPending && SkRect::Intersects(pBatchBounds, dst)) flushPageGlyphs();
-                            if (!drawFramePictures(pageCanvas, slot.recorder.get(), *pictures, dst,
-                                                   static_cast<float>(localSprite.w) / static_cast<float>(localSprite.sw),
-                                                   static_cast<float>(localSprite.h) / static_cast<float>(localSprite.sh),
-                                                   dragging, emptyBacks, emptyInverted)) {
-                                pagePicturesCoarse = true;
-                            }
+        if (plan.bake) {
+            const FramePhaseTimer bakeTimer(FramePhase::PageBake);
+            const std::vector<const ScreenSprite*>& pageSprites = pageSpritesIt->second;
+            const SkImageInfo pageInfo =
+                SkImageInfo::Make(bakeW, bakeH, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+            sk_sp<SkSurface> pageSurface =
+                SkSurfaces::RenderTarget(slot.recorder.get(), pageInfo, skgpu::Mipmapped::kYes);
+            if (!pageSurface) {
+                pageSurface = SkSurfaces::RenderTarget(slot.recorder.get(), pageInfo, skgpu::Mipmapped::kNo);
+            }
+            if (pageSurface) {
+                SkCanvas* pageCanvas = pageSurface->getCanvas();
+                bool pageIncomplete = false;
+                bool pagePicturesCoarse = false;
+                bakePageSprites(pageCanvas, slot, pageSprites, quad.x, quad.y, bakeW, bakeH, cacheZoom, maskZoom,
+                                cacheW, cacheH, dragging, mipmapUpgrades, pageIncomplete, pagePicturesCoarse);
+                if (sk_sp<SkImage> pageImg = SkSurfaces::AsImage(pageSurface)) {
+                    if (onScreen) {
+                        const SkSamplingOptions pageSampling =
+                            pageImg->hasMipmaps()
+                                ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
+                                : SkSamplingOptions(SkFilterMode::kLinear);
+                        if (bakeW == quad.w && bakeH == quad.h) {
+                            canvas->drawImage(pageImg.get(), static_cast<float>(quad.x), static_cast<float>(quad.y));
+                        } else {
+                            const SkRect dst =
+                                SkRect::MakeXYWH(static_cast<float>(quad.x), static_cast<float>(quad.y),
+                                                 static_cast<float>(quad.w), static_cast<float>(quad.h));
+                            canvas->drawImageRect(pageImg.get(), dst, pageSampling, nullptr);
                         }
-                        if (frameHasBorders(sprite.id) && localSprite.sw > 0 && localSprite.sh > 0) {
-                            const SkRect dst = SkRect::MakeXYWH(
-                                static_cast<float>(localSprite.x), static_cast<float>(localSprite.y),
-                                static_cast<float>(localSprite.w), static_cast<float>(localSprite.h));
-                            if (pHasPending && SkRect::Intersects(pBatchBounds, dst)) flushPageGlyphs();
-                            drawSpriteBorders(pageCanvas, sprite.id, dst, localSprite.sw, localSprite.sh, emptyBacks,
-                                              emptyInverted);
-                        }
-                        if (localSprite.rgba && localSprite.sw > 1 && localSprite.sh > 1) {
-                            const bool exactSize = localSprite.w == localSprite.sw && localSprite.h == localSprite.sh;
-                            const bool heavyShrink =
-                                !localSprite.nearest &&
-                                (localSprite.w * 2 < localSprite.sw || localSprite.h * 2 < localSprite.sh);
-                            bool mipmapped = false;
-                            const sk_sp<SkImage> image = screenTexture(slot.recorder.get(), localSprite, heavyShrink,
-                                                                       dragging, mipmapped, mipmapUpgrades);
-                            if (image) {
-                                const SkRect dst = SkRect::MakeXYWH(static_cast<float>(localSprite.x),
-                                                                    static_cast<float>(localSprite.y),
-                                                                    static_cast<float>(localSprite.w),
-                                                                    static_cast<float>(localSprite.h));
-                                if (pHasPending && SkRect::Intersects(pBatchBounds, dst)) {
-                                    flushPageGlyphs();
-                                }
-                                const SkSamplingOptions sampling =
-                                    (localSprite.nearest || exactSize)
-                                        ? SkSamplingOptions(SkFilterMode::kNearest)
-                                        : (heavyShrink || cacheZoom <= 75
-                                               ? (mipmapped
-                                                      ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
-                                                      : SkSamplingOptions(SkFilterMode::kLinear))
-                                               : SkSamplingOptions(SkCubicResampler::CatmullRom()));
-                                drawSpriteImage(pageCanvas, slot.recorder.get(), image.get(), dst, sampling, emptyBacks,
-                                                emptyInverted, static_cast<float>(bakeW), static_cast<float>(bakeH));
-                            }
-                        }
-                        if (!slot.vectors) continue;
-                        bool spriteExact = true;
-                        appendGlyphQuads(localSprite, cacheZoom, maskZoom, cacheW, cacheH, false, pSharp, pScaled,
-                                         pBatchBounds, pHasPending, &spriteExact);
-                        if (!spriteExact) pageIncomplete = true;
+                        drawPageHoldInversion(canvas, pageImg.get(), quad, pageSampling, viewW, viewH, inverted);
                     }
-                    flushPageGlyphs();
-                    if (sk_sp<SkImage> pageImg = SkSurfaces::AsImage(pageSurface)) {
-                        if (onScreen) {
-                            const SkSamplingOptions pageSampling =
-                                pageImg->hasMipmaps()
-                                    ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
-                                    : SkSamplingOptions(SkFilterMode::kLinear);
-                            if (bakeW == quad.w && bakeH == quad.h) {
-                                canvas->drawImage(pageImg.get(), static_cast<float>(quad.x), static_cast<float>(quad.y));
-                            } else {
-                                const SkRect dst =
-                                    SkRect::MakeXYWH(static_cast<float>(quad.x), static_cast<float>(quad.y),
-                                                     static_cast<float>(quad.w), static_cast<float>(quad.h));
-                                canvas->drawImageRect(pageImg.get(), dst, pageSampling, nullptr);
-                            }
-                            drawPageHoldInversion(canvas, pageImg.get(), quad, pageSampling, viewW, viewH, inverted);
-                        }
-                        storePageGpuCache(quad.page, bakeW, bakeH, cacheZoom, maskZoom, quad.stamp, pageIncomplete,
-                                          std::move(pageImg));
-                        pageGpuCache()[quad.page].picturesCoarse = pagePicturesCoarse;
-                        handledPages.insert(quad.page);
-                        ++pageGpuBakesThisFrame;
-                        pageGpuBakePixelsThisFrame += quadPixels;
-                        continue;
-                    }
+                    storePageGpuCache(quad.page, bakeW, bakeH, cacheZoom, maskZoom, quad.stamp, pageIncomplete,
+                                      std::move(pageImg));
+                    pageTextures().setPicturesCoarse(quad.page, pagePicturesCoarse);
+                    handledPages.insert(quad.page);
+                    bakeBudget.spend(quadPixels);
+                    continue;
                 }
             }
         }
-        if (cacheZoom <= 100 && hasScalablePageGpuTexture(quad.page, quad.stamp)) {
-            PageGpuCacheEntry& entry = pageGpuCache()[quad.page];
-            touchPageGpu(entry);
+        SkImage* const scaledImage = pageGpuImage(quad.page);
+        if (scaledImage && plan.scaleTexture) {
+            pageTextures().touch(quad.page);
             if (onScreen) {
                 const SkRect dst = SkRect::MakeXYWH(static_cast<float>(quad.x), static_cast<float>(quad.y),
                                                     static_cast<float>(quad.w), static_cast<float>(quad.h));
                 const SkSamplingOptions pageSampling =
-                    entry.image->hasMipmaps()
+                    scaledImage->hasMipmaps()
                         ? SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear)
                         : SkSamplingOptions(SkFilterMode::kLinear);
-                canvas->drawImageRect(entry.image.get(), dst, pageSampling, nullptr);
-                drawPageHoldInversion(canvas, entry.image.get(), quad, pageSampling, viewW, viewH, inverted);
+                canvas->drawImageRect(scaledImage, dst, pageSampling, nullptr);
+                drawPageHoldInversion(canvas, scaledImage, quad, pageSampling, viewW, viewH, inverted);
             }
             handledPages.insert(quad.page);
             continue;
@@ -6642,22 +7428,27 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
             handledPages.insert(quad.page);
         }
     }
+    papersTimer.stop();
+    FramePhaseTimer backsTimer(FramePhase::Overlay);
     const std::vector<SkRect> invertBacks =
         placeInvertBacks(canvas, pages, scrollX, scrollY, viewW, viewH, handledPages);
+    backsTimer.stop();
     std::vector<std::vector<GlyphQuad>> sharp;
     std::vector<std::vector<GlyphQuad>> scaled;
-    SkRect glyphBatchBounds = SkRect::MakeEmpty();
+    GlyphRect glyphBatchBounds;
     bool hasPendingGlyphs = false;
     auto flushGlyphBatches = [&]() {
         if (!hasPendingGlyphs) return;
+        const FramePhaseTimer timer(FramePhase::Glyphs);
         drawGlyphQuads(canvas, slot.recorder.get(), sharp, SkFilterMode::kNearest);
         drawGlyphQuads(canvas, slot.recorder.get(), scaled, SkFilterMode::kLinear);
         for (auto& pageQuads : sharp) pageQuads.clear();
         for (auto& pageQuads : scaled) pageQuads.clear();
-        glyphBatchBounds = SkRect::MakeEmpty();
+        glyphBatchBounds = GlyphRect{};
         hasPendingGlyphs = false;
     };
     const bool activeHold = hasActiveHold();
+    FramePhaseTimer spritesTimer(FramePhase::Sprites);
     for (const ScreenSprite& sprite : sprites) {
         if (sprite.page >= 0 && handledPages.count(sprite.page)) continue;
         if (sprite.x >= viewW || sprite.y >= viewH || sprite.x + sprite.w <= 0 || sprite.y + sprite.h <= 0) continue;
@@ -6665,7 +7456,7 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         if (const auto pictures = framePictures(sprite.id); pictures && sprite.sw > 0 && sprite.sh > 0) {
             const SkRect dst = SkRect::MakeXYWH(static_cast<float>(sprite.x), static_cast<float>(sprite.y),
                                                 static_cast<float>(sprite.w), static_cast<float>(sprite.h));
-            if (hasPendingGlyphs && SkRect::Intersects(glyphBatchBounds, dst)) flushGlyphBatches();
+            if (hasPendingGlyphs && glyphBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) flushGlyphBatches();
             drawFramePictures(canvas, slot.recorder.get(), *pictures, dst,
                               static_cast<float>(sprite.w) / static_cast<float>(sprite.sw),
                               static_cast<float>(sprite.h) / static_cast<float>(sprite.sh), dragging, invertBacks,
@@ -6674,7 +7465,7 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         if (frameHasBorders(sprite.id) && sprite.sw > 0 && sprite.sh > 0) {
             const SkRect dst = SkRect::MakeXYWH(static_cast<float>(sprite.x), static_cast<float>(sprite.y),
                                                 static_cast<float>(sprite.w), static_cast<float>(sprite.h));
-            if (hasPendingGlyphs && SkRect::Intersects(glyphBatchBounds, dst)) flushGlyphBatches();
+            if (hasPendingGlyphs && glyphBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) flushGlyphBatches();
             drawSpriteBorders(canvas, sprite.id, dst, sprite.sw, sprite.sh, invertBacks, inverted);
         }
         const bool exactSize = sprite.w == sprite.sw && sprite.h == sprite.sh;
@@ -6685,7 +7476,7 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         if (image) {
             const SkRect dst = SkRect::MakeXYWH(static_cast<float>(sprite.x), static_cast<float>(sprite.y),
                                                 static_cast<float>(sprite.w), static_cast<float>(sprite.h));
-            if (hasPendingGlyphs && SkRect::Intersects(glyphBatchBounds, dst)) {
+            if (hasPendingGlyphs && glyphBatchBounds.intersects(dst.fLeft, dst.fTop, dst.fRight, dst.fBottom)) {
                 flushGlyphBatches();
             }
             // 드래그 중 확대 칸은 Linear로 붙인다. Catmull-Rom은 손이 멈춘 뒤에 쓴다.
@@ -6703,51 +7494,28 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
                             static_cast<float>(viewW), static_cast<float>(viewH));
         }
         if (!slot.vectors) continue;
+        const FramePhaseTimer glyphTimer(FramePhase::Glyphs);
         appendGlyphQuads(sprite, layoutZoom, maskZoom, viewW, viewH, activeHold, sharp, scaled, glyphBatchBounds,
                          hasPendingGlyphs);
     }
     flushGlyphBatches();
-    drawCaret(canvas, slot.recorder.get(), pages, scrollX, scrollY, !invertBacks.empty(), dpr);
-    drawRulers(canvas, viewW, viewH, ruler, pages, scrollX, scrollY);
-    drawScrollbar(canvas, barX);
-    drawScrollbar(canvas, barY);
-    if (slot.raster) {
-        const int ok = EM_ASM_INT(
-            {
-                const canvas = Module["canvas"];
-                if (!canvas || typeof canvas.getContext !== "function") return 0;
-                const w = $1 | 0;
-                const h = $2 | 0;
-                if (w <= 0 || h <= 0) return 0;
-                if (canvas.width !== w || canvas.height !== h) {
-                    canvas.width = w;
-                    canvas.height = h;
-                }
-                let ctx = canvas._noting2dCtx;
-                if (!ctx) {
-                    try {
-                        ctx = canvas.getContext("2d");
-                    } catch (e) {
-                        ctx = null;
-                    }
-                    if (!ctx) return 0;
-                    canvas._noting2dCtx = ctx;
-                }
-                const byteLen = (w * h * 4) >>> 0;
-                let img = canvas._notingImgData;
-                if (!img || img.width !== w || img.height !== h) {
-                    img = ctx.createImageData(w, h);
-                    canvas._notingImgData = img;
-                }
-                const ptr = $0 >>> 0;
-                img.data.set(HEAPU8.subarray(ptr, ptr + byteLen));
-                ctx.putImageData(img, 0, 0);
-                return 1;
-            },
-            slot.rasterPixels.data(), viewW, viewH);
-        if (ok != 0) return true;
-        return presentFailed("2D 화면에 픽셀을 올리지 못했습니다");
+    spritesTimer.stop();
+    {
+        const FramePhaseTimer timer(FramePhase::Overlay);
+        drawCaret(canvas, slot.recorder.get(), pages, scrollX, scrollY, !invertBacks.empty(), dpr);
+        drawRulers(canvas, viewW, viewH, ruler, pages, scrollX, scrollY);
+        drawScrollbar(canvas, barX);
+        drawScrollbar(canvas, barY);
     }
+    if (opCanvas) {
+        frame2d.width = viewW;
+        frame2d.height = viewH;
+        const FramePhaseTimer timer(FramePhase::Submit);
+        screenBitmaps().finish(frame2d);
+        if (screenOpSink()(frame2d)) return true;
+        return presentFailed("2D 화면 그림 목록을 넘기지 못했습니다");
+    }
+    const FramePhaseTimer submitTimer(FramePhase::Submit);
     std::unique_ptr<skgpu::graphite::Recording> recording = slot.recorder->snap();
     if (!recording) return presentFailed("GPU 녹화를 끝내지 못했습니다");
     skgpu::graphite::InsertRecordingInfo info;
@@ -6760,60 +7528,29 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
     return true;
 }
 
-MaskBake bakeDocumentMasks(const model::Document& doc, int budget, int targetMaskZoom) {
-    if (!screenVectors()) return {};
-    noteDocumentGlyphs(doc);
-    MaskBake out;
-    out.made = rasterQueuedMasks(budget, targetMaskZoom);
-    {
-        std::lock_guard lock(glyphAtlasMutex());
-        const std::size_t baseCount = std::min(baseMaskJobCount(), maskJobs().size());
-        const bool zoomMore =
-            targetMaskZoom > 0 && targetMaskZoom != 100 && baseCount > 0 &&
-            (maskZoomJobTarget() != targetMaskZoom || maskZoomJobCursor() < baseCount);
-        out.more = zoomMore || (maskJobCursor() < maskJobs().size());
-    }
-    if (!out.more && out.made > 0) {
-        std::fprintf(stderr, "[noting] %d%% 마스크를 다 찍었다\n", targetMaskZoom > 0 ? targetMaskZoom : 100);
-    }
-    return out;
-}
 #else
-bool screenReady() { return false; }
+namespace {
+void dropScreenTexture(int) {}
+void clearAtlasTextures() {}
+void dropPageImage(int) {}
+void clearPageImages() {}
+bool pageTexturesOn() { return false; }
+}  // namespace
 
-MaskBake bakeDocumentMasks(const model::Document& doc, int, int) {
-    noteDocumentGlyphs(doc);
-    return {};
-}
+bool screenReady() { return false; }
 
 bool resetScreenSurface() { return false; }
 
-void dropScreenSprite(int) {}
-
-bool frameHasGlyphs(int) { return false; }
-
-bool cloneAndAdjustFrameGlyphs(int, int, int, int, int, std::int32_t, std::int32_t) { return false; }
-
-bool canUsePageGpuTexture(int, int, int, int, int, int, bool) { return false; }
-
-bool hasScalablePageGpuTexture(int, int) { return false; }
-
-int pageGpuTextureZoom(int, int) { return 0; }
-
-bool hasAnyPageGpuTexture(int) { return false; }
-
-void dropPageGpuCache(int) {}
-
-bool canBakePageGpuTexture(int, int, int, int) { return false; }
-
-void setRenderInteracting(bool) {}
-
-bool glyphMasksPending() { return false; }
+bool attachRemoteScreen() { return false; }
 
 bool presentScreen(int, int, const std::vector<ScreenSprite>&, const std::vector<ScreenSprite>&, int, int,
                    const std::vector<ViewPage>&, int, int, const Scrollbar&, const Scrollbar&, bool, int, double) {
     return false;
 }
+
+PageBitmap renderPageGpu(const model::Document&, std::vector<Node>&, int, int, FrameCache&) { return {}; }
 #endif
 
-}  // namespace noting::render
+void renderMemory(std::vector<std::pair<std::string, std::size_t>>& out) { collectRenderMemory(out); }
+
+}  // namespace chwp::render

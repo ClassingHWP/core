@@ -3,18 +3,21 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-#include "noting/export/font.hpp"
+#include "chwp/export/font.hpp"
 
-namespace noting::model {
+namespace chwp::model {
 struct Document;
 }
 
-namespace noting::layout {
+namespace chwp::layout {
 
 // TTF/OTF 바이트를 글꼴 이름에 묶는다. 같은 프로세스에서 레이아웃이 이 폭을 쓴다.
 void registerFontFace(std::string face, std::vector<std::uint8_t> bytes);
+// 들고 있는 글꼴 파일 바이트(같은 파일은 한 번)와 글자 표 바이트. 메모리 보고용.
+void fontMemory(std::size_t& fileBytes, std::size_t& tableBytes, int& faces);
 
 // em(HWPUNIT)으로 늘린 진행 폭. 글꼴이나 글리프가 없으면 -1.
 std::int32_t fontGlyphAdvance(const std::string& face, char32_t codePoint, std::int32_t em);
@@ -123,15 +126,54 @@ void setFontLoadPage(int page);
 // 코어는 이 키로 주소를 만들지 않는다. 같은 파일의 바이트를 이름끼리 나눌 때만 쓴다.
 void setFontCatalog(const std::string& json);
 
+// 열린 글꼴 파일 하나. 접기는 core 가 정하고(render::foldFontFiles), 여기서는 목록과 접기만 한다.
+struct OpenFontFile {
+    const void* key = nullptr;  // 파일 기록. foldFontFile 에 넘긴다
+    std::size_t bytes = 0;       // 푼 TTF 크기
+    std::int64_t lastUseMs = 0;  // 마지막으로 파일을 읽은 때(fontClockMs 기준)
+    std::vector<std::string> faces;
+};
+// 압축본을 들고 있어 접을 수 있는 열린 글꼴 파일.
+std::vector<OpenFontFile> openFontFiles();
+// 그 파일의 TTF 를 놓는다. 놓은 TTF 의 주소를 돌려준다(그리기 쪽이 같은 바이트를 놓는 데 쓴다). 없으면 nullptr.
+const void* foldFontFile(const void* key);
+// 들고 있는 압축본 크기 합.
+std::size_t packedFontBytes();
+std::int64_t fontClockMs();
+// 그 글꼴 이름(별칭 포함)이 쓰는 파일 기록. 없으면 nullptr.
+const void* fontFileKey(const std::string& face);
+
+// 문서가 그리는 글자. face 는 그릴 때 찾는 글꼴 이름이다. 문서 글꼴 이름과, 빠진 글자는 문서 대체까지 고른
+// 이름을 둘 다 넣는다(그리기가 두 이름으로 다 찾는다).
+struct DrawnGlyph {
+    std::string face;
+    char32_t cp = 0;
+    bool bold = false;
+};
+std::vector<DrawnGlyph> documentDrawnGlyphs(const model::Document& doc);
+// 글자 모양이 한글·영문 칸에 쓰는 글꼴 이름. 굵으면 굵은 짝 이름도 넣는다.
+std::vector<std::string> charShapeFaces(const model::Document& doc, std::uint32_t charShapeId);
+
 // 라이선스 때문에 파일을 올리지 못한 글꼴. 셸 목록에 폭만 있는 이름(metrics/)과 대역 파일을 붙인 이름(standin/)이다.
 // 목록에 아예 없는 이름(사용자 컴퓨터에 깔린 글꼴 등)은 여기 들지 않는다.
 bool fontLicenseBlocked(const std::string& face);
 
+// 그 이름의 글꼴(폭만 있는 글꼴 포함)이 올라와 있거나 이 기기 글꼴 폴더에 있는지. 대체 글꼴은 치지 않는다.
+bool fontFaceAvailable(const std::string& face);
+
 // 막힌 글꼴을 편집할 때 바꿀 글꼴 표. {"막힌 이름": "바꿀 이름"} JSON 객체다.
 void setFontLicenseSwaps(const std::string& json);
+// 셸 replace.json: {원래 글꼴: 대신 받을 글꼴}. 받은 뒤 문서의 글꼴 이름도 바꾼다.
+void setFontReplacements(const std::string& json);
+// 대신 받을 글꼴. 없으면 비어 있다.
+std::string fontReplacement(const std::string& face);
+// 셸 글꼴 목록의 경로(metrics/…, full/…, standin/…). 목록에 없으면 비어 있다.
+std::string fontCatalogPath(const std::string& face);
 
 // 막힌 글꼴이면 바꿀 글꼴 이름, 아니면 빈 문자열. 표에 없거나 표의 글꼴이 목록에 없으면 함초롬으로 간다.
 std::string fontLicenseSwapTarget(const std::string& face);
+// {"이름": "글", ...} 꼴 JSON 을 읽어 out 에 넣는다.
+void collectFaceFiles(const std::string& json, std::unordered_map<std::string, std::string>& out);
 
 // 글꼴 고르기 목록에 드는 이름인지. 파일을 올린 이름이다.
 bool fontPickable(const std::string& face);
@@ -147,4 +189,4 @@ struct FontSwap {
 // 문서 글꼴 표에서 막힌 글꼴과 바꿀 글꼴. 비어 있으면 그대로 편집해도 된다.
 std::vector<FontSwap> licenseFontSwaps(const model::Document& doc);
 
-}  // namespace noting::layout
+}  // namespace chwp::layout

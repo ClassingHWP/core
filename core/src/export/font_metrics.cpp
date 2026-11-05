@@ -1,6 +1,7 @@
 #include "export/font_metrics.hpp"
 
-#include "noting/model/document.hpp"
+#include "chwp/model/document.hpp"
+#include "export/layout.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -27,7 +28,8 @@
 #include <windows.h>
 #endif
 
-namespace noting::layout {
+namespace chwp::layout {
+std::vector<std::uint8_t> sfntFromDelivered(std::vector<std::uint8_t> bytes);
 namespace {
 
 // 같은 전진폭은 한 번만 둔다. 구간이 한 폭이면 값 하나, 몇 칸만 다르면 그 칸만 예외로 둔다.
@@ -61,8 +63,18 @@ struct GlyphTable {
     bool overflow = false;
 };
 
+// 받은 글꼴 파일 하나. 압축본(WOFF2)은 늘 들고, 푼 TTF 는 열려 있을 때만 든다.
+// 접으면 TTF 를 놓고, 다시 필요하면 압축본을 풀어 연다(openData).
+struct PackedFont {
+    std::shared_ptr<const std::vector<std::uint8_t>> packed;
+    std::shared_ptr<const std::vector<std::uint8_t>> open;
+    std::int64_t lastUseMs = 0;
+};
+
 struct Metrics {
-    std::shared_ptr<const std::vector<std::uint8_t>> data;
+    // 열린 TTF. 접힌 글꼴은 비어 있고 openData 가 다시 채운다. 잠금(gMutex) 안에서만 바꾼다.
+    mutable std::shared_ptr<const std::vector<std::uint8_t>> data;
+    PackedFont* file = nullptr;
     std::uint16_t unitsPerEm = 0;
     std::int16_t xAvgCharWidth = 0;
     std::uint16_t winAscent = 0;
@@ -87,12 +99,48 @@ std::unordered_set<std::string> gFailed;
 std::unordered_set<std::string> gFetchMiss;
 // 서버 글꼴 목록의 글꼴 이름 → 파일 이름. 같은 파일은 한 번만 읽는다.
 std::unordered_map<std::string, std::string> gFaceFile;
-// 라이선스 때문에 파일을 올리지 못한 글꼴 → 그 폴백을 만든 OFL 원본 글꼴(글꼴 서버의 license-swap.json).
+// 라이선스 때문에 파일을 올리지 못한 글꼴 → 그 폴백(font/standin)을 만든 OFL 원본 글꼴(review/pack-web-fonts.mjs).
 std::unordered_map<std::string, std::string> gLicenseSwap;
+std::unordered_map<std::string, std::string> gFontReplace;
 bool gAvailableReady = false;
 FontFaceRequestHandler gFontFaceHandler = nullptr;
 void* gFontFaceUser = nullptr;
 std::unordered_map<std::string, std::shared_ptr<const std::vector<std::uint8_t>>> gFileBytes;
+// 압축본으로 받은 글꼴 파일. 키는 압축본 주소다. 셸 목록의 파일 이름으로도 찾는다.
+std::unordered_map<const void*, std::unique_ptr<PackedFont>> gPacked;
+std::unordered_map<std::string, PackedFont*> gFilePacked;
+
+std::int64_t fontNowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void appendFontWhy(std::string& out);
+void writeFontLog(const std::string& line);
+
+// 글꼴 파일을 쓸 수 있게 연다. 접혀 있으면 압축본을 풀고, 같은 파일을 가리키는 이름들이 함께 쓴다.
+bool openData(const Metrics& font) {
+    if (font.file) font.file->lastUseMs = fontNowMs();
+    if (font.data) return true;
+    PackedFont* file = font.file;
+    if (!file || !file->packed) return false;
+    if (!file->open) {
+        std::vector<std::uint8_t> sfnt = sfntFromDelivered(*file->packed);
+        if (sfnt.size() < 12) return false;
+        file->open = std::make_shared<const std::vector<std::uint8_t>>(std::move(sfnt));
+        // 접은 글꼴을 다시 연 이유. 잦으면 접는 기준이 맞지 않는다는 뜻이다.
+        std::string note = "{\"글꼴다시열기\":" + std::to_string(file->open->size());
+        appendFontWhy(note);
+        note += "}\n";
+        writeFontLog(note);
+        for (auto& [name, bytes] : gFileBytes) {
+            const auto packed = gFilePacked.find(name);
+            if (packed != gFilePacked.end() && packed->second == file) bytes = file->open;
+        }
+    }
+    font.data = file->open;
+    return true;
+}
 std::unordered_map<std::string, std::filesystem::path> gFiles;
 bool gFilesReady = false;
 
@@ -526,7 +574,7 @@ bool stepMapped(std::uint32_t& cp, std::uint32_t last, bool overflow) {
 }
 
 bool walkMappings(const Metrics& font, Scratch& scratch) {
-    if (!font.data) return false;
+    if (!openData(font)) return false;
     const auto& bytes = *font.data;
     const auto* data = bytes.data();
     if (font.cmapFormat == 12) {
@@ -664,7 +712,7 @@ MapFind locateMapped(const Metrics& font, char32_t cp, int& glyph, int& advance)
 }
 
 int lookupGlyphCmap(const Metrics& font, char32_t cp) {
-    if (!font.data || cp < 0 || cp > 0x10FFFF) return -1;
+    if (cp < 0 || cp > 0x10FFFF || !openData(font)) return -1;
     const auto& bytes = *font.data;
     const auto* data = bytes.data();
     if (font.cmapFormat == 12) {
@@ -756,7 +804,7 @@ void visitDesignAdvances(const Metrics& font, void (*sink)(void*, char32_t, std:
         const int advance = designAdvanceOf(font, static_cast<char32_t>(cp));
         if (advance >= 0) sink(ctx, static_cast<char32_t>(cp), advance);
     };
-    if (!font.data) return;
+    if (!openData(font)) return;
     const auto& bytes = *font.data;
     const auto* data = bytes.data();
     if (font.cmapFormat == 12) {
@@ -1049,7 +1097,93 @@ std::vector<std::uint8_t> sfntFromDelivered(std::vector<std::uint8_t> bytes) {
     return sfnt;
 }
 
+void fontMemory(std::size_t& fileBytes, std::size_t& tableBytes, int& faces) {
+    std::lock_guard lock(gMutex);
+    fileBytes = 0;
+    tableBytes = 0;
+    faces = static_cast<int>(gFaces.size());
+    std::unordered_set<const std::vector<std::uint8_t>*> seen;
+    const auto blockBytes = [](const CodeBlock& b) {
+        return b.glyphs.capacity() * 2 + b.excepts.capacity() * sizeof(WidthExcept) + b.widthOf.capacity() +
+               b.palette.capacity() * 2 + b.rawAdvance.capacity() * 2;
+    };
+    for (const auto& [name, metrics] : gFaces) {
+        if (metrics.data && seen.insert(metrics.data.get()).second) fileBytes += metrics.data->capacity();
+        const GlyphTable& t = metrics.glyphs;
+        tableBytes += blockBytes(t.hangul) + blockBytes(t.cjk) + t.otherCp.capacity() * 4 + t.otherGlyph.capacity() * 2 +
+                      t.otherAdvance.capacity() * 2;
+    }
+    for (const auto& [file, bytes] : gFileBytes) {
+        if (bytes && seen.insert(bytes.get()).second) fileBytes += bytes->capacity();
+    }
+}
+
+std::size_t packedFontBytes() {
+    std::lock_guard lock(gMutex);
+    std::size_t total = 0;
+    for (const auto& [key, file] : gPacked) total += file->packed ? file->packed->capacity() : 0;
+    return total;
+}
+
+std::vector<OpenFontFile> openFontFiles() {
+    std::lock_guard lock(gMutex);
+    std::unordered_map<const PackedFont*, OpenFontFile> files;
+    std::unordered_set<const PackedFont*> blocked;
+    for (const auto& [name, metrics] : gFaces) {
+        if (!metrics.file || !metrics.file->open) continue;
+        // 글자 번호·폭 표가 다 차지 않은 글꼴은 cmap 을 다시 읽어야 해서 접지 않는다.
+        if (!metrics.glyphs.ready || metrics.glyphs.overflow) blocked.insert(metrics.file);
+        OpenFontFile& entry = files[metrics.file];
+        entry.key = metrics.file;
+        entry.bytes = metrics.file->open->capacity();
+        entry.lastUseMs = metrics.file->lastUseMs;
+        entry.faces.push_back(name);
+    }
+    std::vector<OpenFontFile> out;
+    for (auto& [file, entry] : files) {
+        if (!blocked.count(file)) out.push_back(std::move(entry));
+    }
+    return out;
+}
+
+const void* foldFontFile(const void* key) {
+    std::lock_guard lock(gMutex);
+    PackedFont* file = nullptr;
+    for (auto& [packed, record] : gPacked) {
+        if (record.get() == key) file = record.get();
+    }
+    if (!file || !file->open) return nullptr;
+    const void* data = file->open.get();
+    for (auto& [name, metrics] : gFaces) {
+        if (metrics.file == file) metrics.data.reset();
+    }
+    for (auto& [name, bytes] : gFileBytes) {
+        if (bytes.get() == data) bytes.reset();
+    }
+    file->open.reset();
+    return data;
+}
+
+std::int64_t fontClockMs() { return fontNowMs(); }
+
+const void* fontFileKey(const std::string& face) {
+    std::lock_guard lock(gMutex);
+    auto found = gFaces.find(face);
+    if (found == gFaces.end()) {
+        const auto alias = gAlias.find(face);
+        if (alias == gAlias.end() || alias->second.empty()) return nullptr;
+        found = gFaces.find(alias->second);
+        if (found == gFaces.end()) return nullptr;
+    }
+    return found->second.file;
+}
+
 void registerFontFace(std::string face, std::vector<std::uint8_t> bytes) {
+    // 압축본으로 왔으면 그대로 남겨 둔다. 접은 뒤 다시 열 때 네트워크 없이 푼다.
+    std::shared_ptr<const std::vector<std::uint8_t>> packed;
+    if (bytes.size() >= 4 && std::memcmp(bytes.data(), "wOF2", 4) == 0) {
+        packed = std::make_shared<const std::vector<std::uint8_t>>(bytes);
+    }
     if (!bytes.empty()) bytes = sfntFromDelivered(std::move(bytes));
     std::lock_guard lock(gMutex);
     if (face.empty() || gFaces.count(face)) return;
@@ -1062,15 +1196,41 @@ void registerFontFace(std::string face, std::vector<std::uint8_t> bytes) {
             held = cached->second;
         }
     }
+    PackedFont* packedFile = nullptr;
+    if (!file.empty()) {
+        if (const auto known = gFilePacked.find(file); known != gFilePacked.end()) packedFile = known->second;
+    }
     if (!held) {
         if (bytes.size() < 12) return;
         held = std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes));
         if (!file.empty()) gFileBytes[file] = held;
+        if (packed) {
+            auto record = std::make_unique<PackedFont>();
+            record->packed = packed;
+            record->open = held;
+            record->lastUseMs = fontNowMs();
+            packedFile = record.get();
+            gPacked.emplace(packed.get(), std::move(record));
+            if (!file.empty()) gFilePacked[file] = packedFile;
+        }
     }
     if (!adoptSharedFaceBytes(face, std::move(held))) return;
+    if (packedFile) {
+        if (const auto adopted = gFaces.find(face); adopted != gFaces.end()) adopted->second.file = packedFile;
+    }
     gFailed.erase(face);
     gFetchMiss.erase(face);
     gAlias.erase(face);
+    // 이 글꼴이 없을 때 굵은 짝 이름("face Bold", "face 볼드")을 대체 글꼴로 적어 두었으면 지운다.
+    // 남겨 두면 글꼴이 들어온 뒤에도 굵은 글자를 대체 글꼴로 잰다(편집으로 고른 글꼴은 편집 뒤에 들어온다).
+    const std::string prefix = face + " ";
+    for (auto it = gAlias.begin(); it != gAlias.end();) {
+        if (it->first.compare(0, prefix.size(), prefix) == 0 && it->second != face) {
+            it = gAlias.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool looksLikeFont(const std::vector<std::uint8_t>& bytes) {
@@ -1187,7 +1347,13 @@ std::shared_ptr<const std::vector<std::uint8_t>> fetchFaceBytes(const std::strin
         return {};
     }
     const std::string& file = named->second.empty() ? face : named->second;
-    if (const auto cached = gFileBytes.find(file); cached != gFileBytes.end()) return cached->second;
+    if (const auto cached = gFileBytes.find(file); cached != gFileBytes.end() && cached->second) return cached->second;
+    // 접힌 파일은 압축본을 풀어 다시 쓴다.
+    if (const auto packed = gFilePacked.find(file); packed != gFilePacked.end()) {
+        Metrics probe;
+        probe.file = packed->second;
+        if (openData(probe)) return probe.data;
+    }
     gFetchMiss.insert(face);
     return {};
 }
@@ -1211,6 +1377,11 @@ bool loadResolvedFace(const std::string& face) {
         if (downloaded && looksLikeFont(*downloaded) && adoptSharedFaceBytes(face, std::move(downloaded))) {
             ok = true;
             result = "받기";
+            if (const auto named = gFaceFile.find(face); named != gFaceFile.end()) {
+                const auto packed = gFilePacked.find(named->second.empty() ? face : named->second);
+                const auto adopted = gFaces.find(face);
+                if (packed != gFilePacked.end() && adopted != gFaces.end()) adopted->second.file = packed->second;
+            }
         } else {
             gFailed.insert(face);
         }
@@ -1280,7 +1451,7 @@ void setFontFaceRequestHandler(FontFaceRequestHandler handler, void* user) {
     gFontFaceUser = user;
 }
 
-void requestDocumentFontFaces(const model::Document& doc) {
+void requestFontFaces(const std::vector<std::string>& faces) {
     FontFaceRequestHandler handler = nullptr;
     void* user = nullptr;
     {
@@ -1288,26 +1459,14 @@ void requestDocumentFontFaces(const model::Document& doc) {
         handler = gFontFaceHandler;
         user = gFontFaceUser;
     }
-    if (!handler) return;
-    std::vector<std::string> faces;
-    auto add = [&](const std::string& name) {
-        if (name.empty()) return;
-        if (std::find(faces.begin(), faces.end(), name) != faces.end()) return;
-        faces.push_back(name);
-    };
-    for (const auto& group : doc.header.fonts) {
-        for (const auto& font : group) {
-            add(font.face);
-            add(font.subst);
-        }
-    }
-    // 글리프가 없을 때 core 가 넘어가는 글꼴. 사용자 영역 기호는 Wingdings 까지 간다.
-    for (const char* fallback : {"함초롬바탕", "함초롬돋움", "Wingdings"}) add(fallback);
+    if (!handler || faces.empty()) return;
     std::vector<const char*> ptrs;
     ptrs.reserve(faces.size());
     for (const std::string& face : faces) ptrs.push_back(face.c_str());
-    handler(user, ptrs.empty() ? nullptr : ptrs.data(), static_cast<int>(ptrs.size()));
+    handler(user, ptrs.data(), static_cast<int>(ptrs.size()));
 }
+
+void requestDocumentFontFaces(const model::Document& doc) { requestFontFaces(documentFontFaces(doc)); }
 
 void setFontCatalog(const std::string& json) {
     std::lock_guard lock(gMutex);
@@ -1337,9 +1496,32 @@ void setFontLicenseSwaps(const std::string& json) {
     collectFaceFiles(json, gLicenseSwap);
 }
 
+void setFontReplacements(const std::string& json) {
+    std::lock_guard lock(gMutex);
+    gFontReplace.clear();
+    collectFaceFiles(json, gFontReplace);
+}
+
+std::string fontReplacement(const std::string& face) {
+    std::lock_guard lock(gMutex);
+    const auto found = gFontReplace.find(face);
+    return found == gFontReplace.end() ? std::string() : found->second;
+}
+
+std::string fontCatalogPath(const std::string& face) {
+    std::lock_guard lock(gMutex);
+    const auto found = gFaceFile.find(face);
+    return found == gFaceFile.end() ? std::string() : found->second;
+}
+
 bool fontLicenseBlocked(const std::string& face) {
     std::lock_guard lock(gMutex);
     return catalogBlocked(face);
+}
+
+bool fontFaceAvailable(const std::string& face) {
+    std::lock_guard lock(gMutex);
+    return loadResolvedFace(face);
 }
 
 std::string fontLicenseSwapTarget(const std::string& face) {
@@ -1456,7 +1638,7 @@ bool fontFaceBytes(const std::string& face, std::shared_ptr<const std::vector<st
     const FontWhyFallback why("그리기", 0, &face);
     std::lock_guard lock(gMutex);
     const Metrics* metrics = metricsFor(face);
-    if (!metrics || !metrics->data || metrics->data->empty()) return false;
+    if (!metrics || !openData(*metrics) || metrics->data->empty()) return false;
     out = metrics->data;
     fontOffset = static_cast<int>(metrics->fontOffset);
     return true;
@@ -1469,7 +1651,7 @@ bool fontOutlineBytes(const std::string& face, bool bold, std::shared_ptr<const 
     const FontWhyFallback why("윤곽", 0, &face);
     std::lock_guard lock(gMutex);
     const Metrics* regular = metricsFor(face);
-    if (!regular || !regular->data || regular->data->empty()) return false;
+    if (!regular) return false;
     const Metrics* chosen = regular;
     if (bold) {
         if (regular->weight >= 600) {
@@ -1479,6 +1661,7 @@ bool fontOutlineBytes(const std::string& face, bool bold, std::shared_ptr<const 
             designedBold = true;
         }
     }
+    if (!openData(*chosen) || chosen->data->empty()) return false;
     out = chosen->data;
     fontOffset = static_cast<int>(chosen->fontOffset);
     return true;
@@ -1488,8 +1671,9 @@ bool fontDesignedBold(const std::string& face) {
     if (face.empty()) return false;
     const FontWhyFallback why("굵기", 0, &face);
     std::lock_guard lock(gMutex);
+    // 접힌 글꼴도 올라온 글꼴이다. 굵기는 표에서 읽은 값이라 파일을 열지 않는다.
     const Metrics* regular = metricsFor(face);
-    if (!regular || !regular->data || regular->data->empty()) return false;
+    if (!regular) return false;
     if (regular->weight >= 600) return true;
     return boldCompanion(face) != nullptr;
 }
@@ -1725,4 +1909,304 @@ std::uint16_t fontTableEm(const std::string& face) {
     return 1024;
 }
 
-}  // namespace noting::layout
+namespace {
+
+// 문서 글자가 쓰는 글꼴과 그 글꼴로 그릴 글자.
+struct UsedFace {
+    std::unordered_set<char32_t> chars;
+    bool bold = false;
+    std::vector<std::string> alternates;  // 그 자리의 문서 대체 글꼴(subst, base)
+};
+
+struct UsedFaces {
+    std::unordered_map<std::string, UsedFace> faces;
+    std::vector<std::string> order;  // 처음 만난 차례
+    bool nameless = false;           // 글꼴 이름이 없는 글자. 그리기가 함초롬바탕으로 간다
+};
+
+bool nextUtf8(const std::string& text, std::size_t& i, char32_t& out) {
+    if (i >= text.size()) return false;
+    const auto c = static_cast<unsigned char>(text[i]);
+    int extra = 0;
+    if (c < 0x80) {
+        out = c;
+    } else if ((c & 0xE0) == 0xC0) {
+        out = c & 0x1F;
+        extra = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+        out = c & 0x0F;
+        extra = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+        out = c & 0x07;
+        extra = 3;
+    } else {
+        out = c;
+    }
+    ++i;
+    for (int k = 0; k < extra && i < text.size(); ++k, ++i) out = (out << 6) | (static_cast<unsigned char>(text[i]) & 0x3F);
+    return true;
+}
+
+const model::CharShape* usedCharShape(const model::Document& doc, std::uint32_t id) {
+    if (id < doc.header.charShapes.size() && doc.header.charShapes[id].id == id) return &doc.header.charShapes[id];
+    for (const auto& shape : doc.header.charShapes) {
+        if (shape.id == id) return &shape;
+    }
+    return nullptr;
+}
+
+void useChar(const model::Document& doc, const model::CharShape& shape, model::Lang lang, char32_t cp, UsedFaces& out) {
+    const std::size_t slot = static_cast<std::size_t>(lang);
+    if (slot >= doc.header.fonts.size() || slot >= shape.fontRef.size()) {
+        out.nameless = true;
+        return;
+    }
+    const auto& fonts = doc.header.fonts[slot];
+    const std::uint32_t id = shape.fontRef[slot];
+    if (id >= fonts.size() || fonts[id].face.empty()) {
+        out.nameless = true;
+        return;
+    }
+    const model::Font& font = fonts[id];
+    auto [at, fresh] = out.faces.try_emplace(font.face);
+    if (fresh) out.order.push_back(font.face);
+    UsedFace& used = at->second;
+    used.chars.insert(cp);
+    if (shape.bold) used.bold = true;
+    for (const std::string* alt : {&font.subst, &font.base}) {
+        if (alt->empty() || std::find(used.alternates.begin(), used.alternates.end(), *alt) != used.alternates.end()) continue;
+        used.alternates.push_back(*alt);
+    }
+}
+
+// 본문 글자는 한글 음절이면 한글 칸, 아니면 영문 칸이다(glyphFace). 문단 머리는 hancomCharLang 칸이다.
+void useText(const model::Document& doc, std::uint32_t charShapeId, const std::string& text, bool heading,
+             UsedFaces& out) {
+    const model::CharShape* shape = usedCharShape(doc, charShapeId);
+    if (!shape) {
+        if (!text.empty()) out.nameless = true;
+        return;
+    }
+    std::size_t i = 0;
+    char32_t cp = 0;
+    while (nextUtf8(text, i, cp)) {
+        if (cp < 0x20) continue;
+        const model::Lang lang =
+            heading ? hancomCharLang(cp, true) : (cp >= 0xAC00 && cp <= 0xD7A3 ? model::Lang::Hangul : model::Lang::Latin);
+        useChar(doc, *shape, lang, cp, out);
+    }
+}
+
+void useParagraphs(const model::Document& doc, const std::vector<model::Paragraph>& paras, UsedFaces& out, int depth);
+
+void useControl(const model::Document& doc, const model::Control& control, UsedFaces& out, int depth) {
+    for (const auto& list : control.subLists) useParagraphs(doc, list.paragraphs, out, depth + 1);
+    if (control.table) {
+        for (const auto& cell : control.table->cells) useParagraphs(doc, cell.content.paragraphs, out, depth + 1);
+    }
+    if (control.caption) useParagraphs(doc, control.caption->content.paragraphs, out, depth + 1);
+}
+
+const model::ParaShape* usedParaShape(const model::Document& doc, std::uint32_t id) {
+    if (id < doc.header.paraShapes.size() && doc.header.paraShapes[id].id == id) return &doc.header.paraShapes[id];
+    for (const auto& shape : doc.header.paraShapes) {
+        if (shape.id == id) return &shape;
+    }
+    return nullptr;
+}
+
+// 개요·번호·글머리표 머리. 번호는 숫자·로마자·한글 차례 글자로 쓴다.
+void useHeading(const model::Document& doc, const model::Paragraph& para, UsedFaces& out) {
+    const model::ParaShape* shape = usedParaShape(doc, para.paraShapeId);
+    if (!shape || shape->headingType.empty() || shape->headingType == "NONE") return;
+    const std::uint32_t bodyShape = para.runs.empty() ? 0 : para.runs.front().charShapeId;
+    const auto headShape = [&](const model::ParaHead& head) {
+        return head.charShapeId != 0xFFFFFFFFu ? head.charShapeId : bodyShape;
+    };
+    if (shape->headingType == "BULLET") {
+        for (const auto& bullet : doc.header.bullets) {
+            if (bullet.id != shape->headingIdRef) continue;
+            useText(doc, headShape(bullet.head), bullet.text, true, out);
+            useText(doc, headShape(bullet.head), bullet.checkedText, true, out);
+        }
+        // 정의 없는 0번은 ● 를 쓴다.
+        if (shape->headingIdRef == 0) useText(doc, bodyShape, "\u25CF", true, out);
+        return;
+    }
+    const model::Numbering* numbering = nullptr;
+    for (const auto& item : doc.header.numberings) {
+        if (item.id == shape->headingIdRef) numbering = &item;
+    }
+    static const std::string kNumberChars = "0123456789ivxlcdmIVXLCDM가나다라마바사아자차카타파하①②③㉠㉮";
+    if (!numbering) {
+        useText(doc, bodyShape, kNumberChars, true, out);
+        return;
+    }
+    for (const model::ParaHead& head : numbering->levels) {
+        useText(doc, headShape(head), head.format, true, out);
+        useText(doc, headShape(head), kNumberChars, true, out);
+    }
+}
+
+void useParagraphs(const model::Document& doc, const std::vector<model::Paragraph>& paras, UsedFaces& out, int depth) {
+    if (depth > 32) return;
+    for (const auto& para : paras) {
+        useHeading(doc, para, out);
+        for (const auto& run : para.runs) {
+            for (const auto& item : run.items) {
+                if (item.type == model::InlineItem::Type::Text) {
+                    useText(doc, run.charShapeId, item.text, false, out);
+                    continue;
+                }
+                const model::Control& control = item.control;
+                switch (control.kind) {
+                case model::ControlKind::Footnote:
+                case model::ControlKind::Endnote:
+                case model::ControlKind::AutoNumber:
+                case model::ControlKind::NewNumber:
+                case model::ControlKind::PageNumPos:
+                    // 각주·미주·쪽 번호는 그 런 글자 모양의 숫자와 장식으로 찍는다.
+                    useText(doc, run.charShapeId, "0123456789()-.ivxIVX" + control.prefix + control.suffix, false, out);
+                    break;
+                case model::ControlKind::Dutmal:
+                case model::ControlKind::Compose:
+                    useText(doc, run.charShapeId, control.text, false, out);
+                    useText(doc, run.charShapeId, control.subText, false, out);
+                    break;
+                default:
+                    break;
+                }
+                useControl(doc, control, out, depth);
+            }
+        }
+    }
+}
+
+UsedFaces documentUsedFaces(const model::Document& doc) {
+    UsedFaces out;
+    for (const auto& section : doc.sections) {
+        useParagraphs(doc, section.paragraphs, out, 0);
+        for (const auto& master : section.masterPages) useParagraphs(doc, master.content.paragraphs, out, 0);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::string> documentFontFaces(const model::Document& doc) {
+    const UsedFaces used = documentUsedFaces(doc);
+    std::vector<std::string> out;
+    const auto add = [&](const std::string& name) {
+        if (!name.empty() && std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+    };
+    bool batang = used.nameless;
+    for (const std::string& face : used.order) {
+        const UsedFace& use = used.faces.at(face);
+        add(face);
+        if (use.bold) {
+            add(face + " Bold");
+            add(face + " 볼드");
+        }
+        // 글꼴 파일이 없으면(폭만 잰 글꼴 포함) 폭은 metricsFor 대체, 그리기는 함초롬바탕이다.
+        const std::string replaced = fontReplacement(face);
+        const std::string path = fontCatalogPath(replaced.empty() ? face : replaced);
+        if (path.rfind("full/", 0) != 0 && path.rfind("standin/", 0) != 0) batang = true;
+    }
+    if (batang) add("함초롬바탕");
+    return out;
+}
+
+std::vector<DrawnGlyph> documentDrawnGlyphs(const model::Document& doc) {
+    const UsedFaces used = documentUsedFaces(doc);
+    std::vector<DrawnGlyph> out;
+    for (const std::string& face : used.order) {
+        const UsedFace& use = used.faces.at(face);
+        const std::string subst = use.alternates.size() > 0 ? use.alternates[0] : std::string();
+        const std::string base = use.alternates.size() > 1 ? use.alternates[1] : std::string();
+        for (const char32_t cp : use.chars) {
+            if (cp <= 0x20 || cp == 0xA0 || cp == 0x2007) continue;
+            // 줄은 문서 글꼴 이름 그대로 그리기도 하고(미룬 줄), 빠진 글자는 대체까지 고른 이름으로 그리기도 한다.
+            out.push_back(DrawnGlyph{face, cp, use.bold});
+            std::string resolved = fontWithGlyph(face, cp, subst, base);
+            if (resolved != face) out.push_back(DrawnGlyph{std::move(resolved), cp, use.bold});
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> charShapeFaces(const model::Document& doc, std::uint32_t charShapeId) {
+    std::vector<std::string> out;
+    const model::CharShape* shape = usedCharShape(doc, charShapeId);
+    if (!shape) return out;
+    for (const model::Lang lang : {model::Lang::Hangul, model::Lang::Latin}) {
+        const std::size_t slot = static_cast<std::size_t>(lang);
+        if (slot >= doc.header.fonts.size() || slot >= shape->fontRef.size()) continue;
+        const auto& fonts = doc.header.fonts[slot];
+        const std::uint32_t id = shape->fontRef[slot];
+        if (id >= fonts.size() || fonts[id].face.empty()) continue;
+        out.push_back(fonts[id].face);
+        if (shape->bold) {
+            out.push_back(fonts[id].face + " Bold");
+            out.push_back(fonts[id].face + " 볼드");
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> documentFontGaps(const model::Document& doc) {
+    const UsedFaces used = documentUsedFaces(doc);
+    std::vector<std::string> out;
+    std::lock_guard lock(gMutex);
+    const auto add = [&](const std::string& name) {
+        if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+    };
+    const auto loaded = [&](const std::string& name) -> const Metrics* {
+        const auto found = gFaces.find(name);
+        return found == gFaces.end() ? nullptr : &found->second;
+    };
+    const auto fetchable = [&](const std::string& name) {
+        const auto replaced = gFontReplace.find(name);
+        const std::string& asked = replaced == gFontReplace.end() || replaced->second.empty() ? name : replaced->second;
+        const auto file = gFaceFile.find(asked);
+        return file != gFaceFile.end() && !file->second.empty();
+    };
+    for (const std::string& face : used.order) {
+        // 올라오지 않은 글꼴은 파일이 없는 글꼴이다. 폭·그리기를 대신하는 함초롬바탕은 처음 목록에 있다.
+        const Metrics* metrics = loaded(face);
+        if (!metrics) continue;
+        const UsedFace& use = used.faces.at(face);
+        for (const char32_t cp : use.chars) {
+            if (cp <= 0x20 || cp == 0xA0 || cp == 0x2007) continue;
+            if (lookupGlyph(*metrics, cp) > 0) continue;
+            // fontWithGlyph 와 같은 차례로 본다: 문서 대체, 기본 글꼴, 사용자 영역이면 같은 계열 함초롬과 Wingdings.
+            // 올라온 글꼴에 글자가 있으면 거기서 끝이고, 아직 없는 글꼴은 받을 이름으로 내고 거기서 멈춘다.
+            std::vector<std::string> chain = use.alternates;
+            if (isPrivateUse(cp)) {
+                std::vector<const char*> family;
+                appendFamilyFallbacks(face, family);
+                for (const char* name : family) chain.emplace_back(name);
+                for (const char* name : {"함초롬돋움", "함초롬바탕", "Wingdings"}) chain.emplace_back(name);
+            }
+            bool settled = false;
+            for (const std::string& name : chain) {
+                if (name.empty() || name == face) continue;
+                if (const Metrics* alt = loaded(name)) {
+                    if (lookupGlyph(*alt, cp) > 0) {
+                        settled = true;
+                        break;
+                    }
+                    continue;
+                }
+                if (!fetchable(name)) continue;
+                add(name);
+                settled = true;
+                break;
+            }
+            // 어디에도 없으면 폭과 그리기가 함초롬바탕으로 간다.
+            if (!settled && !loaded("함초롬바탕")) add("함초롬바탕");
+        }
+    }
+    return out;
+}
+
+}  // namespace chwp::layout

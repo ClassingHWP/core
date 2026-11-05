@@ -4,7 +4,7 @@
 
 #include "render/painter.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 
 namespace {
 
@@ -41,10 +41,14 @@ void checkNode(const model::Document& doc, const Node& node, LinePlaceCheck& out
         Painter caret;
         caret.doc = &doc;
         const std::vector<std::int32_t> edges = caret.glyphEdges(node, 0, 0, nullptr);
+        const std::vector<Painter::Mark> marks = caret.caretMarks(node);
         for (const auto& [index, drawnX] : drawnGlyphStarts(doc, node)) {
             if (index >= static_cast<int>(edges.size())) continue;
             ++out.compared;
-            if (edges[static_cast<std::size_t>(index)] == drawnX) continue;
+            // 칸 안에 글자를 미는 폭(세로쓰기 세운 글자, 글자 격자). 캐럿은 칸 경계에 선다.
+            const std::int32_t lead =
+                index < static_cast<int>(marks.size()) ? marks[static_cast<std::size_t>(index)].lead : 0;
+            if (edges[static_cast<std::size_t>(index)] + lead == drawnX) continue;
             ++out.mismatched;
             if (out.firstMiss.empty()) {
                 out.firstMiss = "paragraph " + std::to_string(node.paragraph) + " offset " +
@@ -85,11 +89,11 @@ void checkTops(const model::Document& doc, const Node& node, LinePlaceCheck& out
         ++out.lines;
         Painter caret;
         caret.doc = &doc;
-        const std::vector<Painter::Mark> marks = caret.collectMarks(node);
+        const std::vector<Painter::Mark> marks = caret.caretMarks(node);
         for (const auto& [index, drawnBase] : drawnGlyphBaselines(doc, node)) {
             if (index < 0 || index >= static_cast<int>(marks.size())) continue;
             const Painter::Mark& mark = marks[static_cast<std::size_t>(index)];
-            if (mark.object || mark.noteSpan || mark.superscript || mark.subscript) continue;
+            if (mark.object || !mark.noteText.empty() || mark.superscript || mark.subscript) continue;
             // 이 글자 바로 뒤 캐럿은 이 글자로 높이를 잡는다. 다음 마크가 개체면 그쪽으로 넘어간다.
             if (index + 1 < static_cast<int>(marks.size()) && marks[static_cast<std::size_t>(index) + 1].object) {
                 continue;
@@ -138,4 +142,4 @@ std::vector<std::int32_t> freshCaretEdges(const model::Document& doc, const Node
     return caret.glyphEdges(line, 0, 0, nullptr);
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

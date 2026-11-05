@@ -2,14 +2,14 @@
 
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
-#include "noting/common/unicode.hpp"
-#include "noting/reader.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/render/view.hpp"
 #include "render/equation_raster.hpp"
 
 // Painter: 표 테두리와 칸 꾸밈, 대각선
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 int Painter::edgeThickPx(const BorderEdge& edge) const {
     if (edge.type.empty() || edge.type == "NONE") return 0;
@@ -309,7 +309,7 @@ void Painter::paintColumnRules(const Node& parent, std::int32_t ox, std::int32_t
     for (std::size_t i = 0; i < kids.size(); ++i) {
         const Node& column = kids[i];
         if (column.kind != NodeKind::Column) continue;
-        if (column.borderRight.type.empty() || column.borderRight.type == "NONE") continue;
+        if (column.ext().borderRight.type.empty() || column.ext().borderRight.type == "NONE") continue;
         const Node* next = nullptr;
         for (std::size_t j = i + 1; j < kids.size(); ++j) {
             const Node& other = kids[j];
@@ -324,9 +324,43 @@ void Painter::paintColumnRules(const Node& parent, std::int32_t ox, std::int32_t
         const std::int32_t mid = ox + (left + right) / 2;
         const std::int32_t top = oy + column.y;
         const std::int32_t span = std::max(column.height, next->height);
-        const std::int32_t halfW = std::max<std::int32_t>(column.borderRight.width / 2, 1);
+        const std::int32_t halfW = std::max<std::int32_t>(column.ext().borderRight.width / 2, 1);
         for (const auto& seg : columnRuleSpans(pageNode, parent, ox, oy, mid, halfW, top, top + span)) {
-            paintColumnRuleSpan(column.borderRight, mid, seg.first, seg.second - seg.first);
+            paintColumnRuleSpan(column.ext().borderRight, mid, seg.first, seg.second - seg.first);
+        }
+    }
+}
+
+void Painter::hatchRect(int x0, int y0, int w, int h, const std::string& style, const std::string& color) {
+    if (w <= 0 || h <= 0 || style.empty() || style == "NONE") return;
+    std::uint8_t r = 0, g = 0, b = 0;
+    if (!color.empty()) parseHex(color, r, g, b);
+    const int period = std::max(4, px(600));
+    const int ax = px(originX);
+    const int ay = px(originY);
+    const auto mod = [period](int v) { return ((v % period) + period) % period; };
+    const bool rows = style == "HORIZONTAL" || style == "CROSS";
+    const bool cols = style == "VERTICAL" || style == "CROSS";
+    // SLASH 는 왼쪽 위에서 오른쪽 아래로, BACK_SLASH 는 왼쪽 아래에서 오른쪽 위로 긋는다. 이름과 반대다.
+    const bool down = style == "SLASH" || style == "CROSS_DIAGONAL";
+    const bool up = style == "BACK_SLASH" || style == "CROSS_DIAGONAL";
+    if (rows) {
+        for (int yy = y0; yy < y0 + h; ++yy) {
+            if (mod(yy + ay) == 0) fillRect(bitmap, x0, yy, w, 1, r, g, b);
+        }
+    }
+    if (cols) {
+        for (int xx = x0; xx < x0 + w; ++xx) {
+            if (mod(xx + ax) == 0) fillRect(bitmap, xx, y0, 1, h, r, g, b);
+        }
+    }
+    if (down || up) {
+        for (int yy = y0; yy < y0 + h; ++yy) {
+            const int gy = yy + ay;
+            for (int xx = x0; xx < x0 + w; ++xx) {
+                const int gx = xx + ax;
+                if ((down && mod(gx - gy) == 0) || (up && mod(gx + gy) == 0)) fillRect(bitmap, xx, yy, 1, 1, r, g, b);
+            }
         }
     }
 }
@@ -344,14 +378,14 @@ void Painter::cellChrome(const Node& node, std::int32_t x, std::int32_t y, bool 
     const int tw = std::max(0, x1 - x0);
     const int th = std::max(0, y1 - y0);
     if (!borders) {
-    const bool flat = !node.fillColor.empty() && node.fillColor != "none";
-    const bool grad = flat && !node.gradColor.empty() && node.gradColor != "none";
+    const bool flat = !node.ext().fillColor.empty() && node.ext().fillColor != "none";
+    const bool grad = flat && !node.ext().gradColor.empty() && node.ext().gradColor != "none";
     if (grad && tw > 0 && th > 0) {
         std::uint8_t r0, g0, b0, r1, g1, b1;
-        parseHex(node.fillColor, r0, g0, b0);
-        parseHex(node.gradColor, r1, g1, b1);
+        parseHex(node.ext().fillColor, r0, g0, b0);
+        parseHex(node.ext().gradColor, r1, g1, b1);
         // 0도는 아래에서 위, 시계 방향. 90도는 왼쪽에서 오른쪽이다.
-        const int deg = ((node.gradAngle % 360) + 360) % 360;
+        const int deg = ((node.ext().gradAngle % 360) + 360) % 360;
         const auto mix = [](int a, int b, int t) {
             return static_cast<std::uint8_t>(a + (b - a) * t / 255);
         };
@@ -397,12 +431,13 @@ void Painter::cellChrome(const Node& node, std::int32_t x, std::int32_t y, bool 
         }
     } else if (flat && tw > 0 && th > 0) {
         std::uint8_t r, g, b;
-        parseHex(node.fillColor, r, g, b);
+        parseHex(node.ext().fillColor, r, g, b);
         fillRect(bitmap, x0, y0, tw, th, r, g, b);
     }
-    if (node.imageFillMode >= 0 && !node.binItemId.empty() && tw > 0 && th > 0) {
-        if (const std::shared_ptr<const CachedPicture> image = pictureFor(*doc, node.binItemId)) {
-            const int mode = node.imageFillMode;
+    if (!node.ext().hatchStyle.empty()) hatchRect(x0, y0, tw, th, node.ext().hatchStyle, node.ext().hatchColor);
+    if (node.ext().obj().imageFillMode >= 0 && !node.ext().obj().binItemId.empty() && tw > 0 && th > 0) {
+        if (const std::shared_ptr<const CachedPicture> image = pictureFor(*doc, node.ext().obj().binItemId)) {
+            const int mode = node.ext().obj().imageFillMode;
             const int iw = image->width;
             const int ih = image->height;
             if (iw > 0 && ih > 0 && mode == 5) {
@@ -466,10 +501,10 @@ void Painter::cellChrome(const Node& node, std::int32_t x, std::int32_t y, bool 
     }
     const ClipSuspend open(bitmap);
     // 왼쪽, 오른쪽, 위, 아래. 같은 선이 모서리에서 만나면 미터로 잇는다.
-    strokeTableBorder(node.borderLeft, x, y, x, y + node.height, 1);
-    strokeTableBorder(node.borderRight, x + node.width, y, x + node.width, y + node.height, -1);
-    strokeTableBorder(node.borderTop, x, y, x + node.width, y, 1);
-    strokeTableBorder(node.borderBottom, x, y + node.height, x + node.width, y + node.height, -1);
+    strokeTableBorder(node.ext().borderLeft, x, y, x, y + node.height, 1);
+    strokeTableBorder(node.ext().borderRight, x + node.width, y, x + node.width, y + node.height, -1);
+    strokeTableBorder(node.ext().borderTop, x, y, x + node.width, y, 1);
+    strokeTableBorder(node.ext().borderBottom, x, y + node.height, x + node.width, y + node.height, -1);
     auto joinCorner = [&](const BorderEdge& horizontal, const BorderEdge& vertical, std::int32_t hx,
                           std::int32_t hy, int hInside, int vInside) {
         if (tableLineKind(horizontal.type) == 0 || tableLineKind(horizontal.type) != tableLineKind(vertical.type) ||
@@ -478,10 +513,10 @@ void Painter::cellChrome(const Node& node, std::int32_t x, std::int32_t y, bool 
         }
         mitreTableCorner(hx, hy, hInside, vInside, horizontal);
     };
-    joinCorner(node.borderTop, node.borderLeft, x, y, 1, 1);
-    joinCorner(node.borderTop, node.borderRight, x + node.width, y, 1, -1);
-    joinCorner(node.borderBottom, node.borderLeft, x, y + node.height, -1, 1);
-    joinCorner(node.borderBottom, node.borderRight, x + node.width, y + node.height, -1, -1);
+    joinCorner(node.ext().borderTop, node.ext().borderLeft, x, y, 1, 1);
+    joinCorner(node.ext().borderTop, node.ext().borderRight, x + node.width, y, 1, -1);
+    joinCorner(node.ext().borderBottom, node.ext().borderLeft, x, y + node.height, -1, 1);
+    joinCorner(node.ext().borderBottom, node.ext().borderRight, x + node.width, y + node.height, -1, -1);
     cellDiagonals(node, x, y);
 }
 
@@ -505,7 +540,6 @@ void Painter::drawDiagonalSegment(const BorderEdge& edge, int x0, int y0, int x1
     const int thick = edgeThickPx(edge);
     float intervals[8];
     const int dashes = gdiDash(edge, intervals);
-#if NOTING_HAS_SKIA
     if (SkCanvas* canvas = this->canvas()) {
         SkPaint paint;
         paint.setAntiAlias(true);
@@ -520,7 +554,6 @@ void Painter::drawDiagonalSegment(const BorderEdge& edge, int x0, int y0, int x1
                          static_cast<float>(y1), paint);
         return;
     }
-#endif
     if (dashes < 2) {
         thickLine(x0, y0, x1, y1, thick, r, g, b);
         return;
@@ -549,11 +582,11 @@ void Painter::drawDiagonalSegment(const BorderEdge& edge, int x0, int y0, int x1
 }
 
 void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
-    const BorderEdge& edge = node.borderDiagonal;
+    const BorderEdge& edge = node.ext().borderDiagonal;
     if (edge.type.empty() || edge.type == "NONE") return;
-    const bool hasSlash = !node.slash.type.empty() && node.slash.type != "NONE";
-    const bool hasBackSlash = !node.backSlash.type.empty() && node.backSlash.type != "NONE";
-    const bool hasCenter = !node.centerLine.empty() && node.centerLine != "NONE";
+    const bool hasSlash = !node.ext().slash.type.empty() && node.ext().slash.type != "NONE";
+    const bool hasBackSlash = !node.ext().backSlash.type.empty() && node.ext().backSlash.type != "NONE";
+    const bool hasCenter = !node.ext().centerLine.empty() && node.ext().centerLine != "NONE";
     if (!hasSlash && !hasBackSlash && !hasCenter) return;
 
     const int x0 = px(x);
@@ -600,8 +633,8 @@ void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
         if (below || above) {
             std::vector<int> rSplits;
             std::vector<int> cSplits;
-            for (std::int32_t dy : node.spanRowSplits) rSplits.push_back(px(y + dy));
-            for (std::int32_t dx : node.spanColSplits) cSplits.push_back(px(x + dx));
+            for (std::int32_t dy : node.ext().obj().spanRowSplits) rSplits.push_back(px(y + dy));
+            for (std::int32_t dx : node.ext().obj().spanColSplits) cSplits.push_back(px(x + dx));
             if (rSplits.empty()) rSplits.push_back(ym);
             if (cSplits.empty()) cSplits.push_back(xm);
 
@@ -627,35 +660,43 @@ void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
         }
     };
 
-    paintSpec(node.slash, true);
-    paintSpec(node.backSlash, false);
+    paintSpec(node.ext().slash, true);
+    paintSpec(node.ext().backSlash, false);
 
     if (hasCenter) {
-        if (node.centerLine == "HORIZONTAL" || node.centerLine == "CROSS") {
+        if (node.ext().centerLine == "HORIZONTAL" || node.ext().centerLine == "CROSS") {
             drawDiagonalSegment(edge, x0, ym, x1, ym);
         }
-        if (node.centerLine == "VERTICAL" || node.centerLine == "CROSS") {
+        if (node.ext().centerLine == "VERTICAL" || node.ext().centerLine == "CROSS") {
             drawDiagonalSegment(edge, xm, y0, xm, y1);
         }
     }
 }
 
 void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int32_t oy, std::int32_t stripY0,
-                                std::int32_t stripY1) {
+                                std::int32_t stripY1, std::int32_t stripX0, std::int32_t stripX1) {
     if (!show(frameStroke())) return;
     std::vector<const Node*> cells;
     std::int32_t maxCellY = tableNode.height;
+    std::int32_t maxCellX = tableNode.width;
     for (const Node& child : tableNode.children) {
         if (child.kind == NodeKind::Cell) {
             cells.push_back(&child);
             maxCellY = std::max(maxCellY, child.y + child.height);
+            maxCellX = std::max(maxCellX, child.x + child.width);
         }
     }
     if (cells.empty()) return;
     const bool striped = stripY1 >= 0;
     const bool isLastStrip = !striped || stripY1 >= maxCellY;
+    const bool stripedX = stripX1 >= 0;
+    const bool isLastStripX = !stripedX || stripX1 >= maxCellX;
+    // 세로선은 그 x 가 이 띠 안일 때만 긋는다. 이웃 띠 여백에 걸친 선은 그 띠가 긋는다.
+    const auto ownsX = [&](std::int32_t x) {
+        return !stripedX || (x >= stripX0 && (isLastStripX ? x <= stripX1 : x < stripX1));
+    };
 
-    if (tableNode.cellSpacing > 0) {
+    if (tableNode.ext().cellSpacing > 0) {
         for (const Node* c : cells) {
             if (striped && (c->y < stripY0 || (isLastStrip ? (c->y > stripY1) : (c->y >= stripY1)))) continue;
             cellChrome(*c, ox + c->x, oy + c->y, true);
@@ -708,7 +749,7 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
 
     auto addV = [&](std::int32_t xFixed, std::int32_t yStart, std::int32_t yEnd, const BorderEdge& e,
                     bool isRight) {
-        if (e.type.empty() || e.type == "NONE" || yEnd <= yStart) return;
+        if (e.type.empty() || e.type == "NONE" || yEnd <= yStart || !ownsX(xFixed)) return;
         if (striped) {
             yStart = std::max(yStart, stripY0);
             yEnd = std::min(yEnd, stripY1);
@@ -724,10 +765,10 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
     };
 
     for (const Node* c : cells) {
-        addH(c->y, c->x, c->x + c->width, c->borderTop, false);
-        addH(c->y + c->height, c->x, c->x + c->width, c->borderBottom, true);
-        addV(c->x, c->y, c->y + c->height, c->borderLeft, false);
-        addV(c->x + c->width, c->y, c->y + c->height, c->borderRight, true);
+        addH(c->y, c->x, c->x + c->width, c->ext().borderTop, false);
+        addH(c->y + c->height, c->x, c->x + c->width, c->ext().borderBottom, true);
+        addV(c->x, c->y, c->y + c->height, c->ext().borderLeft, false);
+        addV(c->x + c->width, c->y, c->y + c->height, c->ext().borderRight, true);
     }
 
     auto resolveAndMerge = [&](std::vector<Seg>& segs) {
@@ -793,4 +834,4 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
     }
 }
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

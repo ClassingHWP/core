@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "noting/render/scene.hpp"
+#include "chwp/render/scene.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 
 struct ColumnBox {
     std::int32_t x = 0;
@@ -141,7 +141,7 @@ inline std::vector<ColumnBox> columnBoxes(const ColumnLayout& columns, std::int3
 
 inline void applyColumnRule(Node& column, const ColumnLayout& layout, bool between) {
     if (!between || layout.rule.type.empty() || layout.rule.type == "NONE") return;
-    column.borderRight = layout.rule;
+    column.extMut().borderRight = layout.rule;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

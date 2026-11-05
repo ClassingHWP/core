@@ -2,26 +2,28 @@
 
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
-#include "noting/common/unicode.hpp"
-#include "noting/reader.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/render/view.hpp"
 #include "render/equation_raster.hpp"
 
 // Painter: 캐럿과 선택: 글자 경계, 줄 찾기, 선택 칸, 복사
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 std::vector<std::int32_t> Painter::glyphEdgesWithMarks(const Node& node, const std::vector<Mark>& marks,
                                                        std::int32_t lineX, std::int32_t lineY,
                                                        std::vector<NestedCaret>* nested,
                                                        std::vector<ObjectBand>* bands) {
     // 글자를 그리는 Painter::line 과 같은 자리다. 정렬 식을 여기 다시 쓰지 않는다.
+    // 자동 번호 대신 넣은 글자는 자리만 차지한다. 커서 경계는 원래 문서 글자에만 둔다.
     const LinePlacement place = placeLine(node, marks);
     std::vector<std::int32_t> edges;
     edges.reserve(marks.size() + 1);
-    if (marks.empty()) edges.push_back(lineX + place.end);
     for (std::size_t i = 0; i < marks.size(); ++i) {
         const Mark& mark = marks[i];
+        if (mark.synthetic) continue;
+        const int caretIndex = static_cast<int>(edges.size());
         const std::int32_t at = lineX + place.at[i];
         edges.push_back(at);
         if (mark.object && nested) {
@@ -46,11 +48,11 @@ std::vector<std::int32_t> Painter::glyphEdgesWithMarks(const Node& node, const s
                 }
             }
             if (any && x1 > x0 && y1 > y0) {
-                bands->push_back(ObjectBand{x0, y0, x1 - x0, y1 - y0, static_cast<int>(i)});
+                bands->push_back(ObjectBand{x0, y0, x1 - x0, y1 - y0, caretIndex});
             }
         }
     }
-    if (!marks.empty()) edges.push_back(lineX + place.end);
+    edges.push_back(lineX + place.end);
     return edges;
 }
 
@@ -125,7 +127,6 @@ bool Painter::subtreeHasStory(const Node& node, int story) {
         return false;
     }
     for (const Node& child : node.children) {
-        if (child.kind == NodeKind::Span) continue;
         if (subtreeHasStory(child, story)) return true;
     }
     return false;
@@ -155,7 +156,6 @@ bool Painter::subtreeHasStoryRange(const Node& node, int story, int fromParagrap
         return false;
     }
     for (const Node& child : node.children) {
-        if (child.kind == NodeKind::Span) continue;
         if (subtreeHasStoryRange(child, story, fromParagraph, toParagraph)) return true;
     }
     return false;
@@ -163,9 +163,13 @@ bool Painter::subtreeHasStoryRange(const Node& node, int story, int fromParagrap
 
 void Painter::hitLine(const Node& node, std::int32_t lineX, std::int32_t lineY, std::int32_t px, std::int32_t py,
                       CaretPlace& best, bool requireInside, bool drag, int anchorPara, int anchorOff) {
-    const std::int32_t span = node.height > 0 ? node.height : (node.textHeight > 0 ? node.textHeight : node.fontSize);
-    const std::int32_t top = lineY - std::max<std::int32_t>(0, node.auditRise);
-    const std::int32_t bottom = lineY + std::max<std::int32_t>(span, 1) + std::max<std::int32_t>(0, node.auditBelow);
+    // 세로쓰기 틀의 줄이면 종이 점을 틀 점으로 바꿔 잰다. 안 개체로 다시 들어갈 때는 종이 점을 넘긴다.
+    const std::int32_t paperPx = px;
+    const std::int32_t paperPy = py;
+    paperToTurn(caretTurn, px, py);
+    const std::int32_t span = node.height > 0 ? node.height : (node.lineData().textHeight > 0 ? node.lineData().textHeight : node.fontSize);
+    const std::int32_t top = lineY - std::max<std::int32_t>(0, node.lineData().auditRise);
+    const std::int32_t bottom = lineY + std::max<std::int32_t>(span, 1) + std::max<std::int32_t>(0, node.lineData().auditBelow);
     const std::int32_t left = lineX;
     const std::int32_t right = left + std::max<std::int32_t>(node.width, 1);
     const bool inLineBox = py >= top && py < bottom && px >= left && px <= right;
@@ -207,7 +211,7 @@ void Painter::hitLine(const Node& node, std::int32_t lineX, std::int32_t lineY, 
         best.hasAfter = false;
         best.before = 0;
         best.after = 0;
-        const std::vector<Mark> marks = collectMarks(node);
+        const std::vector<Mark> marks = caretMarks(node);
         applyCaretCharMetrics(node, lineY, marks, chosenIndex, best);
         if (chosenIndex > 0 && chosenIndex - 1 < static_cast<int>(marks.size())) {
             best.hasBefore = true;
@@ -217,19 +221,31 @@ void Painter::hitLine(const Node& node, std::int32_t lineX, std::int32_t lineY, 
             best.hasAfter = true;
             best.after = marks[static_cast<std::size_t>(chosenIndex)].cp;
         }
+        turnCaretToPaper(best, caretTurn);
     }
     if (!requireInside) return;
     // 글자처럼 넣은 개체 안 글이 더 위에 있으면 그 줄로 바꾼다.
     for (const LineBlockNested& item : cache.relNested) {
         if (!item.object) continue;
+        const CaretTurnScope scope(*this);
+        std::int32_t cx = lineX + item.relX;
+        std::int32_t cy = lineY + item.relY;
+        enterUprightObject(*item.object, cx, cy);
         for (const Node& child : item.object->children) {
-            walkCaret(child, lineX + item.relX, lineY + item.relY, px, py, best, drag, anchorPara, anchorOff);
+            walkCaret(child, cx, cy, paperPx, paperPy, best, drag, anchorPara, anchorOff);
         }
     }
 }
 
 void Painter::walkCaret(const Node& node, std::int32_t ox, std::int32_t oy, std::int32_t px, std::int32_t py,
                         CaretPlace& best, bool drag, int anchorPara, int anchorOff) {
+    // 세로쓰기 틀은 돌린 틀에서 찾는다. 점은 종이 그대로 넘기고, 줄에서 틀 점으로 바꾼다(hitLine).
+    const CaretTurnScope scope(*this);
+    bool uprightBox = false;
+    if (enterCaretFrame(node, ox, oy, uprightBox) && uprightBox) {
+        for (const Node& child : node.children) walkCaret(child, ox, oy, px, py, best, drag, anchorPara, anchorOff);
+        return;
+    }
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
     const std::int32_t y = oy + node.y;
     if (node.kind == NodeKind::Line) {
@@ -249,13 +265,13 @@ void Painter::walkCaret(const Node& node, std::int32_t ox, std::int32_t oy, std:
         if (child.kind == NodeKind::Object && !child.treatAsChar) {
             const bool masterBack = child.fromMaster && !child.masterOnTop;
             const bool masterFront = child.fromMaster && !child.masterOnTop;
-            if (masterFront || (!masterBack && child.textWrap != "BEHIND_TEXT")) front.push_back(&child);
+            if (masterFront || (!masterBack && child.ext().obj().textWrap != "BEHIND_TEXT")) front.push_back(&child);
             else behind.push_back(&child);
         } else {
             flow.push_back(&child);
         }
     }
-    const auto byZ = [](const Node* a, const Node* b) { return a->zOrder < b->zOrder; };
+    const auto byZ = [](const Node* a, const Node* b) { return a->ext().obj().zOrder < b->ext().obj().zOrder; };
     std::stable_sort(behind.begin(), behind.end(), byZ);
     std::stable_sort(front.begin(), front.end(), byZ);
     for (const Node* child : behind) walkCaret(*child, x, y, px, py, best, drag, anchorPara, anchorOff);
@@ -266,11 +282,17 @@ void Painter::walkCaret(const Node& node, std::int32_t ox, std::int32_t oy, std:
 
 void Painter::gatherStory(const Node& node, std::int32_t ox, std::int32_t oy, int story, std::vector<StoryLine>& out) {
     if ((node.kind == NodeKind::Object || node.kind == NodeKind::Cell) && !subtreeHasStory(node, story)) return;
+    const CaretTurnScope scope(*this);
+    bool uprightBox = false;
+    if (enterCaretFrame(node, ox, oy, uprightBox) && uprightBox) {
+        for (const Node& child : node.children) gatherStory(child, ox, oy, story, out);
+        return;
+    }
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
     const std::int32_t y = oy + node.y;
     if (node.kind == NodeKind::Line) {
         if (node.story == story) {
-            out.push_back({&node, x, y});
+            out.push_back({&node, x, y, caretTurn});
             return;
         }
         bool anyNestedStory = false;
@@ -299,6 +321,12 @@ void Painter::gatherStoryParagraph(const Node& node, std::int32_t ox, std::int32
         !subtreeHasStoryRange(node, story, paraIdx, paraIdx)) {
         return;
     }
+    const CaretTurnScope scope(*this);
+    bool uprightBox = false;
+    if (enterCaretFrame(node, ox, oy, uprightBox) && uprightBox) {
+        for (const Node& child : node.children) gatherStoryParagraph(child, ox, oy, story, paraIdx, out);
+        return;
+    }
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
     const std::int32_t y = oy + node.y;
     if (node.kind == NodeKind::Column && node.story == story) {
@@ -308,7 +336,7 @@ void Painter::gatherStoryParagraph(const Node& node, std::int32_t ox, std::int32
                 const std::int32_t py = y + child.y;
                 for (const Node& line : child.children) {
                     if (line.kind == NodeKind::Line && line.story == story) {
-                        out.push_back({&line, px + line.x, py + line.y});
+                        out.push_back({&line, px + line.x, py + line.y, caretTurn});
                     }
                 }
             }
@@ -317,7 +345,7 @@ void Painter::gatherStoryParagraph(const Node& node, std::int32_t ox, std::int32
     }
     if (node.kind == NodeKind::Line) {
         if (node.story == story) {
-            if (node.paragraph == paraIdx) out.push_back({&node, x, y});
+            if (node.paragraph == paraIdx) out.push_back({&node, x, y, caretTurn});
             return;
         }
         bool anyNestedStory = false;
@@ -336,7 +364,6 @@ void Painter::gatherStoryParagraph(const Node& node, std::int32_t ox, std::int32
         return;
     }
     for (const Node& child : node.children) {
-        if (child.kind == NodeKind::Span) continue;
         gatherStoryParagraph(child, x, y, story, paraIdx, out);
     }
 }
@@ -344,6 +371,7 @@ void Painter::gatherStoryParagraph(const Node& node, std::int32_t ox, std::int32
 CaretPlace Painter::placeOnLine(const StoryLine& line, std::int32_t px, bool drag, int anchorPara, int anchorOff) {
     CaretPlace place;
     hitLine(*line.node, line.x, line.y, px, line.y, place, false, drag, anchorPara, anchorOff);
+    turnCaretToPaper(place, line.turn);
     return place;
 }
 
@@ -389,17 +417,17 @@ void Painter::applyCaretCharMetrics(const Node& node, std::int32_t lineY, const 
         charSize = shape->height;
     }
     if (charSize <= 0) {
-        if (refMark && refMark->size > 0 && !refMark->noteSpan) charSize = refMark->size;
+        if (refMark && refMark->size > 0 && refMark->noteText.empty()) charSize = refMark->size;
         else if (node.fontSize > 0) charSize = node.fontSize;
-        else if (node.textHeight > 0) charSize = node.textHeight;
+        else if (node.lineData().textHeight > 0) charSize = node.lineData().textHeight;
         else charSize = 1000;
     }
     best.height = std::max<std::int32_t>(charSize, 1);
 
     // 커서 상자는 그 글자를 그린 상자와 같은 자리다. 세로 정렬과 글자 위치(%)는 glyphBaseIn 하나로 정한다.
     // 번호는 3/4로 그려지고 위로 올라간다. 커서는 옆 글자와 같은 칸을 쓴다.
-    const int cOff = (refMark && !refMark->noteSpan) ? refMark->charOffset : 0;
-    std::string charFont = (refMark && !refMark->font.empty()) ? refMark->font : node.font;
+    const int cOff = (refMark && refMark->noteText.empty()) ? refMark->charOffset : 0;
+    std::string charFont = (refMark && !refMark->font.empty()) ? refMark->font : node.font.str();
     if (charFont.empty() && doc && shape) charFont = resolveCharShapeFontName(*doc, *shape);
     const GlyphBase base = glyphBaseIn(node, charSize, charFont, cOff);
     best.y = lineY + node.marginTop + base.baseline - base.ownBase;
@@ -418,7 +446,7 @@ CaretPlace Painter::placeOnLineAtOffset(const StoryLine& line, int offset) {
     best.story = node.story;
     best.paragraph = node.paragraph;
     best.offset = node.start + chosenIndex;
-    const std::vector<Mark> marks = collectMarks(node);
+    const std::vector<Mark> marks = caretMarks(node);
     applyCaretCharMetrics(node, line.y, marks, chosenIndex, best);
     if (chosenIndex > 0 && chosenIndex - 1 < static_cast<int>(marks.size())) {
         best.hasBefore = true;
@@ -428,22 +456,28 @@ CaretPlace Painter::placeOnLineAtOffset(const StoryLine& line, int offset) {
         best.hasAfter = true;
         best.after = marks[static_cast<std::size_t>(chosenIndex)].cp;
     }
+    turnCaretToPaper(best, line.turn);
     return best;
 }
 
-const Painter::StoryLine* Painter::nearestLine(const std::vector<StoryLine>& lines, std::int32_t x, std::int32_t y) const {
+const Painter::StoryLine* Painter::nearestLine(const std::vector<StoryLine>& lines, std::int32_t paperX,
+                                               std::int32_t paperY) const {
     const StoryLine* best = nullptr;
     std::int32_t bestDy = 0;
     std::int32_t bestDx = 0;
     std::int32_t bestCenter = 0;
     for (const StoryLine& line : lines) {
         if (!line.node) continue;
+        // 세로쓰기 줄은 종이 점을 돌린 틀 좌표로 바꿔 잰다.
+        std::int32_t x = paperX;
+        std::int32_t y = paperY;
+        paperToTurn(line.turn, x, y);
         const std::int32_t span =
             line.node->height > 0 ? line.node->height
-                                  : (line.node->textHeight > 0 ? line.node->textHeight : line.node->fontSize);
-        std::int32_t top = line.y - std::max<std::int32_t>(0, line.node->auditRise);
+                                  : (line.node->lineData().textHeight > 0 ? line.node->lineData().textHeight : line.node->fontSize);
+        std::int32_t top = line.y - std::max<std::int32_t>(0, line.node->lineData().auditRise);
         std::int32_t bottom =
-            line.y + std::max<std::int32_t>(span, 1) + std::max<std::int32_t>(0, line.node->auditBelow);
+            line.y + std::max<std::int32_t>(span, 1) + std::max<std::int32_t>(0, line.node->lineData().auditBelow);
         std::int32_t left = line.x;
         std::int32_t right = line.x + std::max<std::int32_t>(line.node->width, 1);
         for (const Node& child : line.node->children) {
@@ -505,6 +539,16 @@ void Painter::pushBlockRgb(std::vector<BlockBox>& out, int page, std::int32_t le
                            std::int32_t height, std::uint8_t r, std::uint8_t g, std::uint8_t b,
                            const ClipBounds& clip) const {
     if (right <= left || height <= 0) return;
+    // 세로쓰기 틀의 칸은 종이 자리로 돌린다. 줄 방향(left..right)은 종이 세로, 줄 높이는 종이 가로다.
+    if (caretTurn.on()) {
+        const std::int32_t paperLeft = caretTurn.x + caretTurn.span - (top + height);
+        const std::int32_t paperTop = caretTurn.y + left;
+        const std::int32_t paperHeight = right - left;
+        left = paperLeft;
+        right = paperLeft + height;
+        top = paperTop;
+        height = paperHeight;
+    }
     const std::int32_t cLeft = std::max(left, clip.x0);
     const std::int32_t cRight = std::min(right, clip.x1);
     const std::int32_t cTop = std::max(top, clip.y0);
@@ -533,7 +577,7 @@ void Painter::pushBlock(std::vector<BlockBox>& out, int page, std::int32_t left,
 
 const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool needBands, bool needNested) {
     const std::int32_t firstW = node.children.empty() ? -1 : node.children.front().width;
-    const std::size_t firstLen = node.children.empty() ? 0 : node.children.front().text.size();
+    const std::size_t firstLen = node.children.empty() ? 0 : node.children.front().text().size();
     std::uint64_t childrenSig = 14695981039346656037ULL;
     for (const Node& child : node.children) {
         childrenSig ^= static_cast<std::uint64_t>(child.kind) + 0x9e3779b97f4a7c15ULL + (childrenSig << 6) +
@@ -544,15 +588,11 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
                        (childrenSig >> 2);
         childrenSig ^= static_cast<std::uint64_t>(child.height) + 0x9e3779b97f4a7c15ULL + (childrenSig << 6) +
                        (childrenSig >> 2);
-        for (unsigned char c : child.text) {
+        for (unsigned char c : child.text()) {
             childrenSig = (childrenSig ^ c) * 1099511628211ULL;
         }
         // 글자 자리(placeLine)를 바꾸는 값은 모두 열쇠에 넣는다. 빠지면 옛 캐럿 자리를 그대로 쓴다.
-        for (const std::int32_t advance : child.advances) {
-            childrenSig = (childrenSig ^ static_cast<std::uint32_t>(advance)) * 1099511628211ULL;
-        }
-        const std::uint64_t childFlags = (child.headingMark ? 1u : 0u) | (child.noteMark ? 2u : 0u) |
-                                         (child.treatAsChar ? 4u : 0u);
+        const std::uint64_t childFlags = (child.headingMark ? 1u : 0u) | (child.treatAsChar ? 4u : 0u);
         childrenSig = (childrenSig ^ childFlags) * 1099511628211ULL;
         childrenSig = (childrenSig ^ static_cast<std::uint32_t>(child.marginLeft)) * 1099511628211ULL;
         childrenSig = (childrenSig ^ static_cast<std::uint32_t>(child.marginRight)) * 1099511628211ULL;
@@ -560,15 +600,27 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
         childrenSig = (childrenSig ^ static_cast<std::uint32_t>(child.marginTop)) * 1099511628211ULL;
         childrenSig = (childrenSig ^ static_cast<std::uint32_t>(child.marginBottom)) * 1099511628211ULL;
     }
-    const std::uint64_t lineFlags = (node.lastLine ? 1u : 0u) | (node.lineBreak ? 2u : 0u) |
-                                    (node.deferTabs ? 4u : 0u);
+    // 본문 글자는 줄 글자 표에 있다. 글자·구간·폭이 바뀌면 열쇠가 바뀐다.
+    for (unsigned char c : node.text()) childrenSig = (childrenSig ^ c) * 1099511628211ULL;
+    const LineGlyphs glyphs = lineGlyphs(node);
+    for (const LineRun& run : glyphs.runs) {
+        const std::uint64_t runKey = static_cast<std::uint64_t>(run.kind) | (run.synthetic ? 8u : 0u) |
+                                     (static_cast<std::uint64_t>(run.textEnd) << 8) |
+                                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(run.width)) << 32);
+        childrenSig = (childrenSig ^ runKey) * 1099511628211ULL;
+    }
+    for (const std::int32_t advance : glyphs.advances) {
+        childrenSig = (childrenSig ^ static_cast<std::uint32_t>(advance)) * 1099511628211ULL;
+    }
+    const std::uint64_t lineFlags = (node.lineData().lastLine ? 1u : 0u) | (node.lineData().lineBreak ? 2u : 0u) |
+                                    (node.lineData().deferTabs ? 4u : 0u);
     childrenSig = (childrenSig ^ lineFlags) * 1099511628211ULL;
     for (unsigned char c : node.align) childrenSig = (childrenSig ^ c) * 1099511628211ULL;
     LineBlockCacheEntry& entry = lineBlockCache()[&node];
     const bool match = (entry.story == node.story && entry.paragraph == node.paragraph &&
                         entry.start == node.start && entry.end == node.end &&
                         entry.width == node.width && entry.height == node.height &&
-                        entry.textHeight == node.textHeight && entry.fontSize == node.fontSize &&
+                        entry.textHeight == node.lineData().textHeight && entry.fontSize == node.fontSize &&
                         entry.indent == node.indent && entry.childCount == node.children.size() &&
                         entry.firstChildW == firstW && entry.firstChildTextLen == firstLen &&
                         entry.childrenSig == childrenSig &&
@@ -576,7 +628,10 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
     if (match && (!needBands || entry.bandsBuilt) && (!needNested || entry.nestedBuilt)) {
         return entry;
     }
-    const std::vector<Mark> marks = collectMarks(node);
+    const std::vector<Mark> drawn = collectMarks(node);
+    std::vector<Mark> marks = drawn;
+    marks.erase(std::remove_if(marks.begin(), marks.end(), [](const Mark& mark) { return mark.synthetic; }),
+                marks.end());
     const int markCount = static_cast<int>(marks.size());
     bool hasObj = false;
     for (const Mark& m : marks) {
@@ -589,7 +644,7 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
     const bool buildNested = needNested && hasObj;
     std::vector<ObjectBand> rawBands;
     std::vector<NestedCaret> rawNested;
-    entry.relEdges = glyphEdgesWithMarks(node, marks, 0, 0,
+    entry.relEdges = glyphEdgesWithMarks(node, drawn, 0, 0,
                                          buildNested ? &rawNested : nullptr,
                                          buildBands ? &rawBands : nullptr);
     entry.story = node.story;
@@ -598,7 +653,7 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
     entry.end = node.end;
     entry.width = node.width;
     entry.height = node.height;
-    entry.textHeight = node.textHeight;
+    entry.textHeight = node.lineData().textHeight;
     entry.fontSize = node.fontSize;
     entry.indent = node.indent;
     entry.childCount = node.children.size();
@@ -607,10 +662,10 @@ const LineBlockCacheEntry& Painter::ensureLineBlockCache(const Node& node, bool 
     entry.childrenSig = childrenSig;
     entry.endExclusive = std::max(node.end, node.start + markCount);
     const std::int32_t span =
-        node.height > 0 ? node.height : (node.textHeight > 0 ? node.textHeight : node.fontSize);
+        node.height > 0 ? node.height : (node.lineData().textHeight > 0 ? node.lineData().textHeight : node.fontSize);
     const std::int32_t textBox =
-        node.textHeight > 0 ? node.textHeight : (node.fontSize > 0 ? node.fontSize : span);
-    const std::int32_t gap = std::max<std::int32_t>(0, node.storedSeg.spacing);
+        node.lineData().textHeight > 0 ? node.lineData().textHeight : (node.fontSize > 0 ? node.fontSize : span);
+    const std::int32_t gap = std::max<std::int32_t>(0, node.lineData().storedSeg.spacing);
     entry.boxHeight = std::max<std::int32_t>(textBox + gap, 1);
 
     entry.markHasOwnBg.assign(static_cast<std::size_t>(markCount), 0);
@@ -710,9 +765,19 @@ void Painter::appendBlock(const Node& node, std::int32_t ox, std::int32_t oy, in
         !subtreeHasStoryRange(node, story, fromParagraph, toParagraph)) {
         return;
     }
+    // 세로쓰기 틀은 돌린 틀에서 칸을 잡고, 칸을 넣을 때 종이 자리로 돌린다(pushBlockRgb).
+    const CaretTurnScope scope(*this);
+    bool uprightBox = false;
+    if (enterCaretFrame(node, ox, oy, uprightBox) && uprightBox) {
+        for (const Node& child : node.children) {
+            appendBlock(child, ox, oy, page, story, fromParagraph, fromOffset, toParagraph, toOffset, out,
+                        inheritedFill, clip);
+        }
+        return;
+    }
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
     const std::int32_t y = oy + node.y;
-    const std::string fill = paintColor(node.fillColor) ? node.fillColor : inheritedFill;
+    const std::string fill = paintColor(node.ext().fillColor) ? node.ext().fillColor.str() : inheritedFill;
     if (node.kind == NodeKind::Line) {
         if (node.story == story) {
             if (node.paragraph < fromParagraph || node.paragraph > toParagraph) return;
@@ -813,7 +878,7 @@ void Painter::appendBlock(const Node& node, std::int32_t ox, std::int32_t oy, in
                             [&](const Node& child, std::int32_t cx, std::int32_t cy, const Node* painted) {
                                 if (!subtreeHasStoryRange(child, story, fromParagraph, toParagraph)) return;
                                 const std::string& next =
-                                    painted && paintColor(painted->fillColor) ? painted->fillColor : fill;
+                                    painted && paintColor(painted->ext().fillColor) ? painted->ext().fillColor.str() : fill;
                                 const ClipBounds nextClip =
                                     painted ? childClipOf(*painted, cx, cy, child, clip) : clip;
                                 appendBlock(child, cx, cy, page, story, fromParagraph, fromOffset, toParagraph,
@@ -845,7 +910,7 @@ std::string Painter::copySelection(const std::vector<Node>& pages, int story, in
     for (const StoryLine& line : lines) {
         const Node& node = *line.node;
         if (node.paragraph < fromParagraph || node.paragraph > toParagraph) continue;
-        const std::vector<Mark> marks = collectMarks(node);
+        const std::vector<Mark> marks = caretMarks(node);
         const int last = static_cast<int>(marks.size());
         const int endExclusive = std::max(node.end, node.start + last);
         const bool hasSpan = endExclusive > node.start;
@@ -863,8 +928,8 @@ std::string Painter::copySelection(const std::vector<Node>& pages, int story, in
         for (int i = begin; i < finish; ++i) {
             const Mark& mark = marks[static_cast<std::size_t>(i)];
             if (mark.object) continue;
-            if (mark.noteSpan) {
-                part += mark.noteSpan->text;
+            if (!mark.noteText.empty()) {
+                part += mark.noteText;
                 continue;
             }
             if (mark.cp == 0) continue;
@@ -879,4 +944,4 @@ std::string Painter::copySelection(const std::vector<Node>& pages, int story, in
     return text;
 }
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

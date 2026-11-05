@@ -1,15 +1,15 @@
 #pragma once
 
 // 표 테두리 셰이더가 CPU 비트맵과 같은지 native Dawn 에서 픽셀로 맞춰 본다.
-// Graphite Dawn 이 든 빌드(NOTING_SKIA_DAWN)에서만 돈다. 아니면 ran 이 거짓이다.
+// Graphite Dawn 이 든 빌드(CHWP_SKIA_DAWN)에서만 돈다. 아니면 ran 이 거짓이다.
 
 #include <string>
 #include <vector>
 
-#include "noting/model/document.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/model/document.hpp"
+#include "chwp/render/scene.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 
 struct BorderMeshCheck {
     bool ran = false;
@@ -27,4 +27,4 @@ struct BorderMeshCheck {
 BorderMeshCheck checkBorderMeshDawn(const model::Document& doc, const std::vector<Node>& pages, int pageLimit,
                                     const std::vector<int>& percents);
 
-}  // namespace noting::render
+}  // namespace chwp::render

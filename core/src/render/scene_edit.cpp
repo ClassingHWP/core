@@ -1,5 +1,5 @@
-#include "noting/render/scene.hpp"
-#include "noting/render/paint.hpp"
+#include "chwp/render/scene.hpp"
+#include "chwp/render/paint.hpp"
 
 #include "render/line_breaker.hpp"
 #include "render/scene_detail.hpp"
@@ -17,7 +17,7 @@
 // 편집 뒤 다시 놓기. 고친 문단만 다시 조판하고, 줄·표 칸·쪽을 되도록 그대로 둔다.
 // 단·쪽을 넘는 변화는 scene.cpp 의 reflowEditedPages 가 맡는다.
 
-namespace noting::render {
+namespace chwp::render {
 
 using namespace detail;
 
@@ -129,37 +129,75 @@ bool bodyFloatingBlocksParagraphShift(const Node& body, const Node& col, int tar
     return false;
 }
 
-bool sameSpanVisual(const Node& a, const Node& b) {
-    if (a.kind != b.kind) return false;
-    if (a.kind == NodeKind::Span) {
-        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height &&
-               a.fontSize == b.fontSize && a.charShapeId == b.charShapeId && a.ratio == b.ratio &&
-               a.spacing == b.spacing && a.relSize == b.relSize && a.charOffset == b.charOffset &&
-               a.superscript == b.superscript && a.subscript == b.subscript &&
-               a.headingMark == b.headingMark && a.font == b.font && a.text == b.text &&
-               a.markpen == b.markpen && a.tabLeader == b.tabLeader && a.advances == b.advances;
+bool sameEdge(const BorderEdge& a, const BorderEdge& b) {
+    return a.type == b.type && a.color == b.color && a.width == b.width && a.end == b.end;
+}
+
+// 개체 안쪽까지 같은지. 표 칸 경계만 옮기면 표 상자는 그대로라, 칸 자리·테두리·글까지 봐야 옛 노드를 쓸 수 있다.
+bool sameNodeShape(const Node& a, const Node& b) {
+    if (a.kind != b.kind || a.x != b.x || a.y != b.y || a.width != b.width || a.height != b.height ||
+        a.text() != b.text() || a.children.size() != b.children.size() || a.ext().fillColor != b.ext().fillColor ||
+        a.ext().gradColor != b.ext().gradColor || a.ext().hatchStyle != b.ext().hatchStyle || a.ext().hatchColor != b.ext().hatchColor) {
+        return false;
     }
+    if (!sameEdge(a.ext().borderLeft, b.ext().borderLeft) || !sameEdge(a.ext().borderRight, b.ext().borderRight) ||
+        !sameEdge(a.ext().borderTop, b.ext().borderTop) || !sameEdge(a.ext().borderBottom, b.ext().borderBottom)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.children.size(); ++i) {
+        if (!sameNodeShape(a.children[i], b.children[i])) return false;
+    }
+    return true;
+}
+
+bool sameLineChildVisual(const Node& a, const Node& b) {
+    if (a.kind != b.kind) return false;
     if (a.kind == NodeKind::Object) {
         return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height &&
                a.role == b.role && a.treatAsChar == b.treatAsChar && a.headingMark == b.headingMark &&
-               a.binItemId == b.binItemId && a.script == b.script;
+               a.ext().obj().binItemId == b.ext().obj().binItemId && a.ext().obj().script == b.ext().obj().script && sameNodeShape(a, b);
     }
     return false;
+}
+
+bool sameHeading(const HeadingRun* a, const HeadingRun* b) {
+    if (!a || !b) return a == b;
+    return a->text == b->text && a->advances == b->advances && a->x == b->x && a->width == b->width &&
+           a->fontSize == b->fontSize && a->charShapeId == b->charShapeId && a->font == b->font &&
+           a->color == b->color && a->ratio == b->ratio && a->relSize == b->relSize && a->bold == b->bold &&
+           a->italic == b->italic && a->superscript == b->superscript && a->subscript == b->subscript;
+}
+
+bool sameGlyphs(const LineGlyphs& a, const LineGlyphs& b) {
+    if (a.runs.size() != b.runs.size() || a.advances != b.advances || a.inks != b.inks) return false;
+    if (!sameHeading(a.heading.get(), b.heading.get())) return false;
+    for (std::size_t i = 0; i < a.runs.size(); ++i) {
+        const LineRun& x = a.runs[i];
+        const LineRun& y = b.runs[i];
+        if (x.kind != y.kind || x.synthetic != y.synthetic || x.slot != y.slot || x.textBegin != y.textBegin ||
+            x.textEnd != y.textEnd || x.advanceAt != y.advanceAt || x.advanceCount != y.advanceCount ||
+            x.inkAt != y.inkAt || x.inkCount != y.inkCount || x.width != y.width || x.charShapeId != y.charShapeId ||
+            x.style != y.style) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool sameLineVisual(const Node& a, const Node& b) {
     if (a.kind != NodeKind::Line || b.kind != NodeKind::Line) return false;
     if (a.paragraph != b.paragraph || a.story != b.story) return false;
-    if (a.auditLine != b.auditLine || a.deferTabs != b.deferTabs || a.spansLater != b.spansLater) return false;
+    if (a.lineData().auditLine != b.lineData().auditLine || a.lineData().deferTabs != b.lineData().deferTabs || a.spansLater != b.spansLater) return false;
     if (a.x != b.x || a.y != b.y || a.width != b.width || a.height != b.height) return false;
     if (a.indent != b.indent || a.marginLeft != b.marginLeft || a.marginTop != b.marginTop) return false;
-    if (a.fontSize != b.fontSize || a.textHeight != b.textHeight || a.lineBaseline != b.lineBaseline) return false;
+    if (a.fontSize != b.fontSize || a.lineData().textHeight != b.lineData().textHeight || a.lineData().lineBaseline != b.lineData().lineBaseline) return false;
     if (a.charShapeId != b.charShapeId || a.font != b.font) return false;
-    if (a.lastLine != b.lastLine || a.lineBreak != b.lineBreak) return false;
-    if (a.align != b.align || a.vertAlign != b.vertAlign || a.text != b.text) return false;
+    if (a.lineData().lastLine != b.lineData().lastLine || a.lineData().lineBreak != b.lineData().lineBreak) return false;
+    if (a.align != b.align || a.vertAlign != b.vertAlign || a.text() != b.text()) return false;
+    if (!sameGlyphs(a.glyphs(), b.glyphs())) return false;
     if (a.children.size() != b.children.size()) return false;
     for (std::size_t i = 0; i < a.children.size(); ++i) {
-        if (!sameSpanVisual(a.children[i], b.children[i])) return false;
+        if (!sameLineChildVisual(a.children[i], b.children[i])) return false;
     }
     return true;
 }
@@ -181,6 +219,13 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
                                                         bool isFirstInColumn = false) {
     SingleParaLayoutResult result;
     if (!canIncrementalRelayoutParagraph(doc, para, allowLineConvergence, isFirstInColumn)) return result;
+    // 세로쓰기 구역 본문은 돌린 틀 좌표 그대로 다시 짠다. 글자 칸과 세운 개체는 조판과 같다(verticalAtom, uprightObject).
+    int direction = 0;
+    if (const model::StorySlot* own = resolveStory(doc, story);
+        own && own->kind == model::StoryKind::Section && sectionIndex >= 0 &&
+        sectionIndex < static_cast<int>(doc.sections.size())) {
+        direction = doc.sections[static_cast<std::size_t>(sectionIndex)].textDirection;
+    }
     if (existingPara && !existingPara->children.empty()) {
         const Node& firstChild = existingPara->children.front();
         if (firstChild.kind == NodeKind::Line && firstChild.start > 0) return result;
@@ -189,14 +234,15 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
     Node paragraph;
     paragraph.kind = NodeKind::Paragraph;
     paragraph.paragraph = pi;
+    paragraph.paragraphId = para.id;
     paragraph.section = sectionIndex;
     paragraph.story = story;
     paragraph.x = 0;
     paragraph.y = paraY;
     if (existingPara) {
-        paragraph.head = existingPara->head;
-        paragraph.headingType = existingPara->headingType;
-        paragraph.headingText = existingPara->headingText;
+        paragraph.extMut().head = existingPara->ext().head;
+        paragraph.extMut().headingType = existingPara->ext().headingType;
+        paragraph.extMut().headingText = existingPara->ext().headingText;
     } else {
         HeadingState dummyHeadings{};
         applyHeading(paragraph, para, doc, dummyHeadings);
@@ -256,7 +302,7 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
     bool canConverge = allowLineConvergence && existingPara && !existingPara->children.empty() && !atoms.empty();
     if (canConverge) {
         for (const Node& oldL : existingPara->children) {
-            if (oldL.kind != NodeKind::Line || oldL.auditLine || oldL.deferTabs || oldL.spansLater) {
+            if (oldL.kind != NodeKind::Line || oldL.lineData().auditLine || oldL.lineData().deferTabs || oldL.spansLater) {
                 canConverge = false;
                 break;
             }
@@ -308,15 +354,15 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
         line.indent = glyphShift();
         line.align = paragraph.align;
         line.vertAlign = paragraph.vertAlign;
-        line.lastLine = true;
+        line.editContent().lastLine = true;
         line.width = std::max<std::int32_t>(0, frameRight - line.x);
         const int emptySize = emptyEm > 0 ? emptyEm : kEm;
         line.charShapeId = !para.runs.empty() ? para.runs.front().charShapeId : 0;
         line.fontSize = emptySize;
-        line.textHeight = line.fontSize;
+        line.editContent().textHeight = line.fontSize;
         line.height = defaultPitch;
         if (useStoredLineHeight) {
-            line.storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.textHeight);
+            line.editContent().storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.editContent().textHeight);
         }
         line.start = 0;
         line.end = 0;
@@ -345,7 +391,7 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
             for (const Node& ch : oldLine.children) {
                 if (ch.kind != NodeKind::Object || !ch.treatAsChar || ch.headingMark) continue;
                 if (ch.width != wantW || ch.height != wantH) continue;
-                if (!bin.empty() && ch.binItemId != bin) continue;
+                if (!bin.empty() && ch.ext().obj().binItemId != bin) continue;
                 found = &ch;
                 ++hits;
             }
@@ -353,16 +399,27 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
         }
         return nullptr;
     };
-    auto lineHost = makeLineHost([&](Atom& atom) { measureLazyAtom(doc, atom); },
-                                 [&](const Atom& atom, std::int32_t pen) {
-                                     if (const Node* reused = reusedObject(atom)) {
-                                         Node child = *reused;
-                                         child.x = pen;
-                                         return child;
-                                     }
-                                     return makeObject(*atom.control, pen, 0, doc, depth, defaultTab,
-                                                       useStoredLineHeight);
-                                 });
+    // 전체 조판(scene.cpp lineHost)처럼 개체에 제 문단 자리를 적는다. 표 경계선 끌기·개체 고르기가 이 값으로 찾는다.
+    auto anchored = [&](Node object, const Atom& atom) {
+        object.extMut().objMut().anchorStory = story;
+        object.extMut().objMut().anchorParagraph = pi;
+        object.extMut().objMut().anchorItem = atom.control ? itemOrdinal(para, atom.control) : -1;
+        return object;
+    };
+    auto lineHost = makeLineHost(
+        [&](Atom& atom) {
+            measureLazyAtom(doc, atom);
+            verticalAtom(doc, atom, direction);
+        },
+        [&](const Atom& atom, std::int32_t pen) {
+            if (const Node* reused = reusedObject(atom)) {
+                Node child = *reused;
+                child.x = pen;
+                return anchored(std::move(child), atom);
+            }
+            Node built = makeObject(*atom.control, pen, 0, doc, depth, defaultTab, useStoredLineHeight);
+            return anchored(direction != 0 ? uprightObject(std::move(built)) : std::move(built), atom);
+        });
     std::size_t guardCursor = cursor;
     int spins = 0;
     while (cursor < atoms.size()) {
@@ -377,19 +434,22 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
                 Node object;
                 if (atom.control) {
                     object = makeObject(*atom.control, 0, 0, doc, depth, defaultTab, useStoredLineHeight);
+                    if (direction != 0) object = uprightObject(std::move(object));
+                    object = anchored(std::move(object), atom);
                 }
                 Node line = singleAtomLine(doc, atom, std::move(object));
                 line.paragraph = pi;
+                line.editContent().vertical = static_cast<std::uint8_t>(direction);
                 line.x = lineLeftOf();
                 line.indent = glyphShift();
                 line.y = localY;
                 line.align = paragraph.align;
                 line.vertAlign = paragraph.vertAlign;
                 line.height = forcedPitch;
-                line.textHeight = line.fontSize;
+                line.editContent().textHeight = line.fontSize;
                 placeInlineObjects(line, kind, spacingValue);
                 if (useStoredLineHeight) {
-                    line.storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.textHeight);
+                    line.editContent().storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.editContent().textHeight);
                 }
                 localY += line.height;
                 if (firstLine) attachHeading(line, paragraph, doc, para, true);
@@ -406,9 +466,11 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
         spec.doc = &doc;
         spec.paraShape = paraShape;
         spec.tabs = &tabs;
+        spec.vertical = direction != 0;
         spec.gaps.push_back({lineLeftOf(), frameRight});
         LineFill fill;
         fill.line.kind = NodeKind::Line;
+        fill.line.editContent().autoSpacing = autoSpacingFlags(paraShape);
         fill.line.paragraph = pi;
         fill.line.y = localY;
         fill.line.vertAlign = paragraph.vertAlign;
@@ -420,20 +482,21 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
         closeLine(fill);
         Node& line = fill.line;
         // 문단 끝 표시와 조판 부호의 글자 모양도 글자 상자에 넣는다. 조판과 같은 범위다.
-        line.textHeight = std::max<std::int32_t>(
-            line.textHeight,
+        line.editContent().textHeight = std::max<std::int32_t>(
+            line.lineData().textHeight,
             unseenSize(unseen, lineStart == 0 ? std::numeric_limits<int>::min() : atoms[lineStart].pos,
                        cursor < atoms.size() ? atoms[cursor].pos : std::numeric_limits<int>::max()));
         line.indent = glyphShift();
         line.align = paragraph.align;
+        line.editContent().vertical = static_cast<std::uint8_t>(direction);
         line.width = std::max<std::int32_t>(0, frameRight - line.x);
         applyFontBaseline(line, paraShape);
         placeInlineObjects(line, kind, spacingValue);
         if (useStoredLineHeight) {
-            line.storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.textHeight);
+            line.editContent().storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.editContent().textHeight);
         }
         // 줄 높이(vertsize)는 조판과 같이 줄 시작부터 단 폭을 넘칠 때까지 잰다.
-        line.measuredSeg.vertSize = scannedVertSize(doc, atoms, tallest, lineStart, cursor, lineTextBox(line),
+        line.editContent().measuredSeg.vertSize = scannedVertSize(doc, atoms, tallest, lineStart, cursor, lineTextBox(line),
                                                     lineStart == 0 ? numberingPush(paragraph, doc, para) : 0,
                                                     columnWidth);
         markInlineOverflow(line);
@@ -480,11 +543,11 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
         line.indent = glyphShift();
         line.align = paragraph.align;
         line.vertAlign = paragraph.vertAlign;
-        line.lastLine = true;
+        line.editContent().lastLine = true;
         line.width = std::max<std::int32_t>(0, frameRight - line.x);
         const int emptySize = atoms.back().fontSize > 0 ? atoms.back().fontSize : (emptyEm > 0 ? emptyEm : kEm);
         line.fontSize = emptySize;
-        line.textHeight = line.fontSize;
+        line.editContent().textHeight = line.fontSize;
         line.height = pitchOf(line.fontSize);
         line.start = atoms.back().pos + 1;
         line.end = atoms.back().pos + 1;
@@ -493,11 +556,11 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
     }
 
     for (auto& child : paragraph.children) {
-        if (child.kind == NodeKind::Line) child.lastLine = false;
+        if (child.kind == NodeKind::Line) child.editContent().lastLine = false;
     }
     for (auto it = paragraph.children.rbegin(); it != paragraph.children.rend(); ++it) {
         if (it->kind != NodeKind::Line) continue;
-        it->lastLine = true;
+        it->editContent().lastLine = true;
         break;
     }
     if (spacingNext > 0) localY += spacingNext;
@@ -545,11 +608,11 @@ bool updateTableAfterCellEdit(Node& tableNode, int editedCellChildIdx, int pageI
                               std::vector<FrameInvalidation>& invalidations,
                               std::int32_t& outTableHeightDelta) {
     outTableHeightDelta = 0;
-    const bool isSplitTable = tableNode.splitTable;
-    std::uint32_t rowCount = tableNode.fileRows;
+    const bool isSplitTable = tableNode.ext().obj().splitTable;
+    std::uint32_t rowCount = tableNode.ext().obj().fileRows;
     for (const Node& child : tableNode.children) {
         if (child.kind != NodeKind::Cell) continue;
-        const std::uint32_t rEnd = child.row + static_cast<std::uint32_t>(std::max(1, child.rowSpan));
+        const std::uint32_t rEnd = child.ext().row + static_cast<std::uint32_t>(std::max(1, child.ext().rowSpan));
         if (rEnd > rowCount) rowCount = rEnd;
     }
     if (rowCount == 0) return false;
@@ -587,46 +650,46 @@ bool updateTableAfterCellEdit(Node& tableNode, int editedCellChildIdx, int pageI
     for (int i = 0; i < static_cast<int>(tableNode.children.size()); ++i) {
         Node& c = tableNode.children[static_cast<std::size_t>(i)];
         if (c.kind != NodeKind::Cell) continue;
-        const int rSpan = std::max(1, static_cast<int>(c.rowSpan));
-        if (rSpan == 1 && c.row >= 0 && static_cast<std::size_t>(c.row) < rowH.size()) {
-            rowH[c.row] = std::max(rowH[c.row], c.fileHeight);
+        const int rSpan = std::max(1, static_cast<int>(c.ext().rowSpan));
+        if (rSpan == 1 && c.ext().row >= 0 && static_cast<std::size_t>(c.ext().row) < rowH.size()) {
+            rowH[c.ext().row] = std::max(rowH[c.ext().row], c.ext().obj().fileHeight);
         }
         const std::int32_t used = c.children.empty() ? 0 : rowContentBottom(c.children[0]);
         CellRef ref{i, &c, used};
         cellRefs.push_back(ref);
         if (rSpan == 1) {
-            cover(rowH, c.row, 1, c.marginTop + c.marginBottom + used);
+            cover(rowH, c.ext().row, 1, c.marginTop + c.marginBottom + used);
         } else {
             spanRefs.push_back(ref);
         }
     }
     std::sort(spanRefs.begin(), spanRefs.end(), [](const CellRef& a, const CellRef& b) {
-        return a.cell->rowSpan < b.cell->rowSpan;
+        return a.cell->ext().rowSpan < b.cell->ext().rowSpan;
     });
     for (const CellRef& ref : spanRefs) {
         const Node& c = *ref.cell;
-        const int rSpan = std::max(1, static_cast<int>(c.rowSpan));
-        const std::int32_t need = std::max(c.fileHeight, c.marginTop + c.marginBottom + ref.used);
-        cover(rowH, c.row, rSpan, need);
+        const int rSpan = std::max(1, static_cast<int>(c.ext().rowSpan));
+        const std::int32_t need = std::max(c.ext().obj().fileHeight, c.marginTop + c.marginBottom + ref.used);
+        cover(rowH, c.ext().row, rSpan, need);
     }
 
-    const std::int32_t spacing = tableNode.cellSpacing;
+    const std::int32_t spacing = tableNode.ext().cellSpacing;
     std::int32_t tableH = 0;
     for (const std::int32_t h : rowH) tableH += h;
     if (!rowH.empty()) tableH += spacing * static_cast<std::int32_t>(rowH.size() + 1);
-    const std::int32_t newTableH = std::max(tableNode.fileHeight, tableH);
+    const std::int32_t newTableH = std::max(tableNode.ext().obj().fileHeight, tableH);
 
     bool anyCellBoxChanged = (newTableH != tableNode.height);
     for (const CellRef& ref : cellRefs) {
         const Node& c = *ref.cell;
-        const int rSpan = std::max(1, static_cast<int>(c.rowSpan));
-        std::int32_t cy = spacing * static_cast<std::int32_t>(c.row + 1);
-        for (int r = 0; r < c.row && static_cast<std::size_t>(r) < rowH.size(); ++r) {
+        const int rSpan = std::max(1, static_cast<int>(c.ext().rowSpan));
+        std::int32_t cy = spacing * static_cast<std::int32_t>(c.ext().row + 1);
+        for (int r = 0; r < c.ext().row && static_cast<std::size_t>(r) < rowH.size(); ++r) {
             cy += rowH[static_cast<std::size_t>(r)];
         }
         std::int32_t ch = 0;
-        for (int i = 0; i < rSpan && c.row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
-            ch += rowH[c.row + static_cast<std::size_t>(i)];
+        for (int i = 0; i < rSpan && c.ext().row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
+            ch += rowH[c.ext().row + static_cast<std::size_t>(i)];
         }
         if (rSpan > 1) ch += spacing * (rSpan - 1);
         if (cy != c.y || ch != c.height) {
@@ -665,26 +728,26 @@ bool updateTableAfterCellEdit(Node& tableNode, int editedCellChildIdx, int pageI
 
     for (const CellRef& ref : cellRefs) {
         Node& c = *ref.cell;
-        const int rSpan = std::max(1, static_cast<int>(c.rowSpan));
-        std::int32_t cy = spacing * static_cast<std::int32_t>(c.row + 1);
-        for (int r = 0; r < c.row && static_cast<std::size_t>(r) < rowH.size(); ++r) {
+        const int rSpan = std::max(1, static_cast<int>(c.ext().rowSpan));
+        std::int32_t cy = spacing * static_cast<std::int32_t>(c.ext().row + 1);
+        for (int r = 0; r < c.ext().row && static_cast<std::size_t>(r) < rowH.size(); ++r) {
             cy += rowH[static_cast<std::size_t>(r)];
         }
         std::int32_t ch = 0;
-        for (int i = 0; i < rSpan && c.row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
-            ch += rowH[c.row + static_cast<std::size_t>(i)];
+        for (int i = 0; i < rSpan && c.ext().row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
+            ch += rowH[c.ext().row + static_cast<std::size_t>(i)];
         }
         if (rSpan > 1) ch += spacing * (rSpan - 1);
         const bool movedY = (cy != c.y);
         const bool changedH = (ch != c.height);
         c.y = cy;
         c.height = ch;
-        c.spanRowSplits.clear();
+        c.extMut().objMut().spanRowSplits.clear();
         if (rSpan > 1 && spacing == 0) {
             std::int32_t acc = 0;
-            for (int i = 0; i + 1 < rSpan && c.row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
-                acc += rowH[c.row + static_cast<std::size_t>(i)];
-                if (acc > 0 && acc < ch) c.spanRowSplits.push_back(acc);
+            for (int i = 0; i + 1 < rSpan && c.ext().row + static_cast<std::size_t>(i) < rowH.size(); ++i) {
+                acc += rowH[c.ext().row + static_cast<std::size_t>(i)];
+                if (acc > 0 && acc < ch) c.extMut().objMut().spanRowSplits.push_back(acc);
             }
         }
         bool innerShifted = false;
@@ -740,7 +803,6 @@ struct StoryColumnLoc {
 
 void findStoryColumns(Node& node, int pageIndex, int targetStory, std::vector<AncestorStep>& stack,
                       std::vector<StoryColumnLoc>& out) {
-    if (node.kind == NodeKind::Span) return;
     if (node.kind == NodeKind::Column) {
         bool matches = (node.story == targetStory);
         if (!matches) {
@@ -855,62 +917,82 @@ bool flowFence(const Document& doc, const Node& paraNode) {
     return model->pageBreak || model->columnBreak || model->layoutBreak || paragraphStartsPage(*model, doc);
 }
 
+// 줄 글자 표를 글자 하나씩 편 것. 편집 빠른 길이 고칠 자리를 찾고 표를 다시 짓는 데 쓴다.
+struct LineUnit {
+    bool object = false;
+    int run = -1;  // 이 글자·개체가 든 구간 번호
+    char32_t cp = 0;
+    std::int32_t adv = 0;
+    std::int32_t ink = 0;
+    std::int32_t glyphBefore = 0;  // 앞 글자 폭 합(개체는 빼고)
+};
+
+// 머리 번호·탭·줄바꿈 없이 글자와 글자처럼 놓인 개체만 있는 줄을 편다. 글자마다 폭이 있어야 한다.
+// 폭을 따로 들지 않는 구간은 글자 하나일 때만 받고, needWidth 면 그 폭이 0보다 커야 한다.
+// pen 은 글자 폭과 개체 폭(여백 포함)의 합이다.
+bool lineUnits(const Node& line, bool needWidth, std::vector<LineUnit>& units, std::int32_t& pen) {
+    if (line.glyphs().heading) return false;
+    for (const Node& child : line.children) {
+        if (child.headingMark) return false;
+    }
+    const LineGlyphs& glyphs = line.glyphs();
+    std::int32_t glyphRun = 0;
+    for (int ri = 0; ri < static_cast<int>(glyphs.runs.size()); ++ri) {
+        const LineRun& run = glyphs.runs[static_cast<std::size_t>(ri)];
+        if (run.kind == RunKind::Object) {
+            if (run.slot >= line.children.size()) return false;
+            const Node& obj = line.children[run.slot];
+            if (!obj.treatAsChar) return false;
+            LineUnit unit;
+            unit.object = true;
+            unit.run = ri;
+            unit.adv = obj.width + obj.marginLeft + obj.marginRight;
+            unit.glyphBefore = glyphRun;
+            units.push_back(unit);
+            pen += unit.adv;
+            continue;
+        }
+        if (run.kind == RunKind::Tab) return false;
+        const std::size_t first = units.size();
+        std::size_t idx = run.textBegin;
+        char32_t cp = 0;
+        while (idx < run.textEnd && nextCodePoint(line.text(), idx, cp)) {
+            if (cp == '\n' || cp == '\t') return false;
+            LineUnit unit;
+            unit.run = ri;
+            unit.cp = cp;
+            units.push_back(unit);
+        }
+        const std::size_t count = units.size() - first;
+        if (count == 0) continue;
+        if (run.advanceCount != 0 && run.advanceCount != count) return false;
+        if (run.advanceCount == 0 && (count != 1 || (needWidth && run.width <= 0))) return false;
+        for (std::size_t g = 0; g < count; ++g) {
+            LineUnit& unit = units[first + g];
+            unit.adv = run.advanceCount == 0 ? run.width : glyphs.advances[run.advanceAt + g];
+            unit.ink = g < run.inkCount ? glyphs.inks[run.inkAt + g] : unit.adv;
+            unit.glyphBefore = glyphRun;
+            glyphRun += unit.adv;
+            pen += unit.adv;
+        }
+    }
+    return true;
+}
+
 // 글자 크기가 그대로이고, 줄에 있는 폭 합에 새 글자 폭을 더해도 줄 너비 안이면 조판하지 않는다.
 // 넘치면 저장된 폭으로만 줄을 나누고, 쪽 나눔·단 나눔 뒤는 다시 나누지 않는다.
 // 1 이면 줄 상자가 그대로다. 2 이면 줄이 늘었다. 0 이면 이 길이 아니다.
 int placeSameSizeGlyph(const Document& doc, const Paragraph& para, const EditRelayoutSpec& spec, Node& targetLine,
-                       const Node* nextLine, Node& paragraphNode, Node& column,
-                       const std::vector<AncestorStep>& ancestors, int lineChildIdx, int paraChildIdx,
-                       bool paragraphContinues) {
-    if (targetLine.auditLine || targetLine.deferTabs || targetLine.spansLater) return 0;
+                       const Node* nextLine) {
+    if (targetLine.lineData().auditLine || targetLine.lineData().deferTabs || targetLine.spansLater) return 0;
     if (targetLine.width <= 0) return 0;
     if (spec.editStartOff < targetLine.start || spec.editOldEndOff > targetLine.end) return 0;
     if (spec.editNewEndOff < spec.editStartOff) return 0;
-    if (nextLine && !targetLine.lineBreak && spec.editNewEndOff < spec.editOldEndOff) return 0;
+    if (nextLine && !targetLine.lineData().lineBreak && spec.editNewEndOff < spec.editOldEndOff) return 0;
 
-    struct Glyph {
-        bool object = false;
-        int child = -1;
-        char32_t cp = 0;
-        std::int32_t adv = 0;
-        std::int32_t ink = 0;
-    };
-    std::vector<Glyph> glyphs;
+    std::vector<LineUnit> glyphs;
     std::int32_t used = 0;
-    for (int ci = 0; ci < static_cast<int>(targetLine.children.size()); ++ci) {
-        const Node& child = targetLine.children[static_cast<std::size_t>(ci)];
-        if (child.headingMark) return 0;
-        if (child.kind == NodeKind::Object) {
-            if (!child.treatAsChar) return 0;
-            Glyph glyph;
-            glyph.object = true;
-            glyph.child = ci;
-            glyph.adv = child.width + child.marginLeft + child.marginRight;
-            glyphs.push_back(glyph);
-            used += glyph.adv;
-            continue;
-        }
-        if (child.kind != NodeKind::Span || child.text == "\t") return 0;
-        std::vector<char32_t> cps;
-        std::size_t idx = 0;
-        char32_t cp = 0;
-        while (nextCodePoint(child.text, idx, cp)) {
-            if (cp == '\n' || cp == '\t') return 0;
-            cps.push_back(cp);
-        }
-        if (cps.empty()) continue;
-        if (!child.advances.empty() && child.advances.size() != cps.size()) return 0;
-        if (child.advances.empty() && (cps.size() != 1 || child.width <= 0)) return 0;
-        for (std::size_t g = 0; g < cps.size(); ++g) {
-            Glyph glyph;
-            glyph.child = ci;
-            glyph.cp = cps[g];
-            glyph.adv = child.advances.empty() ? child.width : child.advances[g];
-            glyph.ink = g < child.inks.size() ? child.inks[g] : glyph.adv;
-            glyphs.push_back(glyph);
-            used += glyph.adv;
-        }
-    }
+    if (!lineUnits(targetLine, true, glyphs, used)) return 0;
     if (static_cast<int>(glyphs.size()) != targetLine.end - targetLine.start) return 0;
     const int localStart = spec.editStartOff - targetLine.start;
     const int localOldEnd = spec.editOldEndOff - targetLine.start;
@@ -919,19 +1001,19 @@ int placeSameSizeGlyph(const Document& doc, const Paragraph& para, const EditRel
         if (glyphs[static_cast<std::size_t>(i)].object) return 0;
     }
 
-    int hostChild = -1;
+    int hostRun = -1;
     if (localStart < static_cast<int>(glyphs.size()) && !glyphs[static_cast<std::size_t>(localStart)].object) {
-        hostChild = glyphs[static_cast<std::size_t>(localStart)].child;
+        hostRun = glyphs[static_cast<std::size_t>(localStart)].run;
     } else {
         for (int i = localStart - 1; i >= 0; --i) {
             if (!glyphs[static_cast<std::size_t>(i)].object) {
-                hostChild = glyphs[static_cast<std::size_t>(i)].child;
+                hostRun = glyphs[static_cast<std::size_t>(i)].run;
                 break;
             }
         }
     }
-    if (hostChild < 0) return 0;
-    const Node& host = targetLine.children[static_cast<std::size_t>(hostChild)];
+    if (hostRun < 0) return 0;
+    const LineRun& host = targetLine.glyphs().runs[static_cast<std::size_t>(hostRun)];
     const int freshCount = spec.editNewEndOff - spec.editStartOff;
     struct Fresh {
         char32_t cp = 0;
@@ -973,12 +1055,13 @@ int placeSameSizeGlyph(const Document& doc, const Paragraph& para, const EditRel
         fallback.ratio.fill(100);
         if (!shape) shape = &fallback;
         const int em = shape->height > 0 ? shape->height : static_cast<int>(kEm);
-        int have = host.fontSize > 0 ? host.fontSize : targetLine.fontSize;
-        if (have <= 0) have = targetLine.textHeight;
+        int have = host.style->fontSize > 0 ? host.style->fontSize : targetLine.fontSize;
+        if (have <= 0) have = targetLine.lineData().textHeight;
         if (have <= 0 || em != have) return 0;
+        const std::string* hostFont = host.style->font;
         for (Fresh& glyph : fresh) {
             const GlyphFace drawn = glyphFace(doc, *shape, glyph.cp, true, true);
-            if (!host.font.empty() && drawn.font != host.font) return 0;
+            if (hostFont && !hostFont->empty() && drawn.font != *hostFont) return 0;
             const std::int32_t width = glyphWidth(doc, glyph.cp, *shape);
             const Lang trailLang = isHangul(glyph.cp) ? Lang::Hangul : Lang::Latin;
             const std::int32_t trail = layout::glyphTrail(glyph.cp, *shape, trailLang, &doc);
@@ -993,147 +1076,97 @@ int placeSameSizeGlyph(const Document& doc, const Paragraph& para, const EditRel
     for (const Fresh& glyph : fresh) added += glyph.adv;
     std::int32_t lastTrail = 0;
     if (localOldEnd < static_cast<int>(glyphs.size())) {
-        const Glyph& tail = glyphs.back();
+        const LineUnit& tail = glyphs.back();
         if (!tail.object) lastTrail = tail.adv - tail.ink;
     } else if (!fresh.empty()) {
         lastTrail = fresh.back().adv - fresh.back().ink;
     } else if (localStart > 0) {
-        const Glyph& tail = glyphs[static_cast<std::size_t>(localStart - 1)];
+        const LineUnit& tail = glyphs[static_cast<std::size_t>(localStart - 1)];
         if (!tail.object) lastTrail = tail.adv - tail.ink;
     }
     const std::int32_t nextPen = used - removed + added;
-    const bool fits = nextPen - lastTrail <= targetLine.width + kSlack;
-    const int deltaOff = spec.editNewEndOff - spec.editOldEndOff;
+    if (nextPen - lastTrail > targetLine.width + kSlack) return 0;
 
-    auto patchSpan = [&](Node& span, int spanBegin) {
-        std::vector<char32_t> cps;
-        std::size_t idx = 0;
-        char32_t cp = 0;
-        while (nextCodePoint(span.text, idx, cp)) cps.push_back(cp);
-        const int g0 = localStart - spanBegin;
-        const int g1 = localOldEnd - spanBegin;
-        if (g0 < 0 || g1 < g0 || g1 > static_cast<int>(cps.size())) return false;
-        std::string text;
+    int spanBegin = -1;
+    int spanCount = 0;
+    for (int i = 0; i < static_cast<int>(glyphs.size()); ++i) {
+        if (glyphs[static_cast<std::size_t>(i)].run != hostRun || glyphs[static_cast<std::size_t>(i)].object) continue;
+        if (spanBegin < 0) spanBegin = i;
+        ++spanCount;
+    }
+    if (spanBegin < 0 || localStart < spanBegin || localOldEnd > spanBegin + spanCount) return 0;
+
+    // 고친 구간만 새 글자로 바꾸고 나머지 구간은 그대로 옮겨 표를 다시 짓는다.
+    const LineGlyphs& old = targetLine.glyphs();
+    LineGlyphs next;
+    next.heading = old.heading;
+    std::string text;
+    text.reserve(targetLine.text().size() + fresh.size() * 3);
+    for (int ri = 0; ri < static_cast<int>(old.runs.size()); ++ri) {
+        LineRun run = old.runs[static_cast<std::size_t>(ri)];
+        const std::size_t at = text.size();
+        if (ri != hostRun) {
+            text.append(targetLine.text(), run.textBegin, run.textEnd - run.textBegin);
+            run.textBegin = static_cast<std::uint16_t>(at);
+            run.textEnd = static_cast<std::uint16_t>(text.size());
+            appendLineRun(next, run, old.advances.data() + run.advanceAt, run.advanceCount,
+                          old.inks.data() + run.inkAt, run.inkCount);
+            continue;
+        }
         std::vector<std::int32_t> advs;
         std::vector<std::int32_t> inks;
-        auto pushOld = [&](int g) {
-            appendUtf8(text, cps[static_cast<std::size_t>(g)]);
-            const std::int32_t adv = span.advances.empty() ? span.width : span.advances[static_cast<std::size_t>(g)];
-            const std::int32_t ink = g < static_cast<int>(span.inks.size()) ? span.inks[static_cast<std::size_t>(g)] : adv;
-            advs.push_back(adv);
-            inks.push_back(ink);
+        auto pushOld = [&](const LineUnit& unit) {
+            appendUtf8(text, unit.cp);
+            advs.push_back(unit.adv);
+            inks.push_back(unit.ink);
         };
-        for (int g = 0; g < g0; ++g) pushOld(g);
+        for (int i = spanBegin; i < localStart; ++i) pushOld(glyphs[static_cast<std::size_t>(i)]);
         for (const Fresh& glyph : fresh) {
             appendUtf8(text, glyph.cp);
             advs.push_back(glyph.adv);
             inks.push_back(glyph.ink);
         }
-        for (int g = g1; g < static_cast<int>(cps.size()); ++g) pushOld(g);
-        span.text = std::move(text);
-        span.advances = std::move(advs);
-        span.inks = std::move(inks);
-        span.width = 0;
-        for (const std::int32_t adv : span.advances) span.width += adv;
-        span.contentHash = 0;
-        span.huBoundsReady = false;
-        return true;
-    };
-
-    if (fits) {
-        int spanBegin = -1;
-        int spanCount = 0;
-        for (int i = 0; i < static_cast<int>(glyphs.size()); ++i) {
-            if (glyphs[static_cast<std::size_t>(i)].child != hostChild || glyphs[static_cast<std::size_t>(i)].object) {
-                continue;
-            }
-            if (spanBegin < 0) spanBegin = i;
-            ++spanCount;
-        }
-        if (spanBegin < 0 || localStart < spanBegin || localOldEnd > spanBegin + spanCount) return 0;
-        Node& span = targetLine.children[static_cast<std::size_t>(hostChild)];
-        if (!patchSpan(span, spanBegin)) return 0;
-        const std::int32_t dx = added - removed;
-        if (dx != 0) {
-            for (int i = localOldEnd; i < static_cast<int>(glyphs.size()); ++i) {
-                const Glyph& glyph = glyphs[static_cast<std::size_t>(i)];
-                if (!glyph.object) continue;
-                targetLine.children[static_cast<std::size_t>(glyph.child)].x += dx;
-            }
-        }
-        std::string lineText;
-        for (const Node& child : targetLine.children) {
-            if (child.kind == NodeKind::Span && !child.headingMark) lineText += child.text;
-        }
-        evictLineGlyph(targetLine, span);
-        targetLine.text = std::move(lineText);
-        targetLine.end += deltaOff;
-        targetLine.contentHash = 0;
-        targetLine.huBoundsReady = false;
-        return 1;
+        for (int i = localOldEnd; i < spanBegin + spanCount; ++i) pushOld(glyphs[static_cast<std::size_t>(i)]);
+        run.textBegin = static_cast<std::uint16_t>(at);
+        run.textEnd = static_cast<std::uint16_t>(text.size());
+        run.width = 0;
+        for (const std::int32_t adv : advs) run.width += adv;
+        appendLineRun(next, run, advs.data(), advs.size(), inks.data(), inks.size());
     }
-
-    return 0;
+    const std::int32_t dx = added - removed;
+    if (dx != 0) {
+        for (int i = localOldEnd; i < static_cast<int>(glyphs.size()); ++i) {
+            const LineUnit& glyph = glyphs[static_cast<std::size_t>(i)];
+            if (!glyph.object) continue;
+            targetLine.children[old.runs[static_cast<std::size_t>(glyph.run)].slot].x += dx;
+        }
+    }
+    evictLineGlyph(targetLine);
+    trimLineGlyphs(next);
+    targetLine.glyphsMut() = std::move(next);
+    targetLine.textMut() = std::move(text);
+    targetLine.end += spec.editNewEndOff - spec.editOldEndOff;
+    targetLine.contentHash = 0;
+    targetLine.huBoundsReady = false;
+    return 1;
 }
 
 // 한 글자는 그 줄의 폭만 바꾼다. 같은 글꼴이면 새 글자만 재고, 그림 개체는 그대로 둔다.
 bool spliceEditedLine(const Document& doc, const Paragraph& para, const EditRelayoutSpec& spec, Node& targetLine,
                       const Node* nextLine) {
-    if (targetLine.auditLine || targetLine.deferTabs || targetLine.spansLater) return false;
+    if (targetLine.lineData().auditLine || targetLine.lineData().deferTabs || targetLine.spansLater) return false;
     if (spec.editStartOff < targetLine.start || spec.editOldEndOff > targetLine.end) return false;
     if (spec.editNewEndOff < spec.editStartOff) return false;
     const bool shrunk = spec.editNewEndOff < spec.editOldEndOff;
-    if (nextLine && !targetLine.lineBreak && shrunk) return false;
+    if (nextLine && !targetLine.lineData().lineBreak && shrunk) return false;
 
-    struct Unit {
-        bool object = false;
-        int child = -1;
-        char32_t cp = 0;
-        std::int32_t adv = 0;
-        std::int32_t ink = 0;
-        std::int32_t glyphBefore = 0;
-    };
-    std::vector<Unit> units;
-    std::int32_t glyphRun = 0;
+    std::vector<LineUnit> units;
     std::int32_t oldPen = 0;
-    for (int ci = 0; ci < static_cast<int>(targetLine.children.size()); ++ci) {
-        const Node& ch = targetLine.children[static_cast<std::size_t>(ci)];
-        if (ch.headingMark) return false;
-        if (ch.kind == NodeKind::Object) {
-            if (!ch.treatAsChar) return false;
-            for (const Node& cap : ch.children) {
-                if (cap.role == "caption" && cap.x < 0) return false;
-            }
-            Unit unit;
-            unit.object = true;
-            unit.child = ci;
-            unit.glyphBefore = glyphRun;
-            units.push_back(unit);
-            oldPen += ch.width + ch.marginLeft + ch.marginRight;
-            continue;
+    if (!lineUnits(targetLine, false, units, oldPen)) return false;
+    for (const Node& obj : targetLine.children) {
+        for (const Node& cap : obj.children) {
+            if (cap.role == "caption" && cap.x < 0) return false;
         }
-        if (ch.kind != NodeKind::Span || ch.text == "\t") return false;
-        std::vector<char32_t> cps;
-        std::size_t idx = 0;
-        char32_t cp = 0;
-        while (nextCodePoint(ch.text, idx, cp)) {
-            if (cp == '\n' || cp == '\t') return false;
-            cps.push_back(cp);
-        }
-        if (cps.empty()) continue;
-        if (!ch.advances.empty() && ch.advances.size() != cps.size()) return false;
-        if (ch.advances.empty() && cps.size() != 1) return false;
-        for (std::size_t g = 0; g < cps.size(); ++g) {
-            Unit unit;
-            unit.child = ci;
-            unit.cp = cps[g];
-            unit.adv = ch.advances.empty() ? ch.width : ch.advances[g];
-            unit.ink = g < ch.inks.size() ? ch.inks[g] : unit.adv;
-            unit.glyphBefore = glyphRun;
-            glyphRun += unit.adv;
-            units.push_back(unit);
-        }
-        oldPen += ch.width;
     }
     if (static_cast<int>(units.size()) != targetLine.end - targetLine.start) return false;
     const int localStart = spec.editStartOff - targetLine.start;
@@ -1149,27 +1182,29 @@ bool spliceEditedLine(const Document& doc, const Paragraph& para, const EditRela
         std::int32_t ink = 0;
     };
     std::vector<Fresh> fresh;
-    int hostChild = -1;
+    int hostRun = -1;
     if (localStart < static_cast<int>(units.size()) && !units[static_cast<std::size_t>(localStart)].object) {
-        hostChild = units[static_cast<std::size_t>(localStart)].child;
+        hostRun = units[static_cast<std::size_t>(localStart)].run;
     } else {
         for (int i = localStart - 1; i >= 0; --i) {
             if (!units[static_cast<std::size_t>(i)].object) {
-                hostChild = units[static_cast<std::size_t>(i)].child;
+                hostRun = units[static_cast<std::size_t>(i)].run;
                 break;
             }
         }
-        if (hostChild < 0) {
+        if (hostRun < 0) {
             for (int i = localStart; i < static_cast<int>(units.size()); ++i) {
                 if (!units[static_cast<std::size_t>(i)].object) {
-                    hostChild = units[static_cast<std::size_t>(i)].child;
+                    hostRun = units[static_cast<std::size_t>(i)].run;
                     break;
                 }
             }
         }
     }
-    const Node* host = hostChild >= 0 ? &targetLine.children[static_cast<std::size_t>(hostChild)] : nullptr;
-    bool pushedStyle = false;
+    const LineGlyphs& old = targetLine.glyphs();
+    const LineRun* host = hostRun >= 0 ? &old.runs[static_cast<std::size_t>(hostRun)] : nullptr;
+    // 줄에 글자가 없으면 새 글자는 제 꼴로 새 구간을 연다.
+    LineRun freshRun;
     const int freshCount = spec.editNewEndOff - spec.editStartOff;
     if (freshCount > 0) {
         std::uint32_t shapeId = host ? host->charShapeId : 0;
@@ -1215,36 +1250,26 @@ bool spliceEditedLine(const Document& doc, const Paragraph& para, const EditRela
         fallback.ratio.fill(100);
         if (!shape) shape = &fallback;
         const int fontSize = shape->height > 0 ? shape->height : kEm;
-        if (host && host->fontSize > 0 && host->fontSize != fontSize) return false;
-        Node freshStyle;
-        bool useFreshStyle = false;
+        if (host && host->style->fontSize > 0 && host->style->fontSize != fontSize) return false;
+        const std::string* hostFont = host ? host->style->font : nullptr;
+        bool styled = false;
         for (Fresh& glyph : fresh) {
             const GlyphFace drawn = glyphFace(doc, *shape, glyph.cp, true, true);
-            if (host && !host->font.empty() && drawn.font != host->font) return false;
+            if (hostFont && !hostFont->empty() && drawn.font != *hostFont) return false;
             const std::int32_t width = glyphWidth(doc, glyph.cp, *shape);
             const Lang trailLang = isHangul(glyph.cp) ? Lang::Hangul : Lang::Latin;
             const std::int32_t trail = layout::glyphTrail(glyph.cp, *shape, trailLang, &doc);
             glyph.adv = width;
             glyph.ink = width - trail;
-            if (!host && !useFreshStyle) {
-                freshStyle.kind = NodeKind::Span;
-                freshStyle.fontSize = fontSize;
-                freshStyle.charShapeId = shapeId;
-                freshStyle.font = drawn.font;
-                freshStyle.ratio = drawn.ratio;
-                freshStyle.relSize = drawn.relSize;
-                freshStyle.spacing = drawn.spacing;
+            if (!host && !styled) {
                 const Lang offsetLang = isHangul(glyph.cp) ? Lang::Hangul : Lang::Latin;
                 const std::size_t offsetSlot = static_cast<std::size_t>(offsetLang);
-                freshStyle.charOffset = offsetSlot < shape->offset.size() ? shape->offset[offsetSlot] : 0;
-                paintCharStyle(freshStyle, doc, shapeId);
-                useFreshStyle = true;
+                const std::int32_t offset = offsetSlot < shape->offset.size() ? shape->offset[offsetSlot] : 0;
+                freshRun.charShapeId = shapeId;
+                freshRun.style = runStyleOf(fontSize, drawn.font, std::string{}, std::string{}, drawn.ratio,
+                                            drawn.relSize, drawn.spacing, offset);
+                styled = true;
             }
-        }
-        if (useFreshStyle) {
-            targetLine.children.push_back(std::move(freshStyle));
-            hostChild = static_cast<int>(targetLine.children.size()) - 1;
-            pushedStyle = true;
         }
     }
 
@@ -1252,66 +1277,70 @@ bool spliceEditedLine(const Document& doc, const Paragraph& para, const EditRela
     for (int i = localStart; i < localOldEnd; ++i) replaced += units[static_cast<std::size_t>(i)].adv;
     std::int32_t added = 0;
     for (const Fresh& glyph : fresh) added += glyph.adv;
-    std::int32_t lastTrail = 0;
-    std::vector<Node> built;
+
+    // 글자를 차례로 놓아 표를 다시 짓는다. 같은 원본 구간에서 온 글자가 이어지면 한 구간으로 묶는다.
+    LineGlyphs built;
     std::string lineText;
+    std::vector<std::pair<std::uint16_t, std::int32_t>> moves;  // 개체 자식 번호와 옮길 폭
+    std::int32_t lastTrail = 0;
     std::int32_t emitted = 0;
     int openKey = -999;
-    Node open;
-    bool openOn = false;
+    LineRun open;
+    std::vector<std::int32_t> openAdvs;
+    std::vector<std::int32_t> openInks;
     auto flush = [&]() {
-        if (!openOn) return;
-        built.push_back(std::move(open));
-        openOn = false;
+        if (openKey == -999) return;
+        open.textEnd = static_cast<std::uint16_t>(lineText.size());
+        appendLineRun(built, open, openAdvs.data(), openAdvs.size(), openInks.data(), openInks.size());
+        openAdvs.clear();
+        openInks.clear();
         openKey = -999;
     };
     auto addGlyph = [&](int key, char32_t cp, std::int32_t adv, std::int32_t ink) {
-        if (!openOn || openKey != key) {
+        if (openKey != key) {
             flush();
             openKey = key;
-            if (key >= 0) open = targetLine.children[static_cast<std::size_t>(key)];
-            else open = Node{};
-            open.kind = NodeKind::Span;
-            open.text.clear();
-            open.advances.clear();
-            open.inks.clear();
+            open = key >= 0 ? old.runs[static_cast<std::size_t>(key)] : freshRun;
+            open.textBegin = static_cast<std::uint16_t>(lineText.size());
             open.width = 0;
-            open.contentHash = 0;
-            open.huBoundsReady = false;
-            openOn = true;
         }
-        appendUtf8(open.text, cp);
         appendUtf8(lineText, cp);
-        open.advances.push_back(adv);
-        open.inks.push_back(ink);
+        openAdvs.push_back(adv);
+        openInks.push_back(ink);
         open.width += adv;
         emitted += adv;
         lastTrail = adv - ink;
     };
-    auto emitUnit = [&](const Unit& unit) {
+    auto emitUnit = [&](const LineUnit& unit) {
         if (unit.object) {
             flush();
-            Node obj = targetLine.children[static_cast<std::size_t>(unit.child)];
-            obj.x += emitted - unit.glyphBefore;
-            obj.huBoundsReady = false;
-            built.push_back(std::move(obj));
+            LineRun run = old.runs[static_cast<std::size_t>(unit.run)];
+            run.textBegin = static_cast<std::uint16_t>(lineText.size());
+            run.textEnd = run.textBegin;
+            appendLineRun(built, run);
+            moves.emplace_back(run.slot, emitted - unit.glyphBefore);
             lastTrail = 0;
             return;
         }
-        addGlyph(unit.child, unit.cp, unit.adv, unit.ink);
+        addGlyph(unit.run, unit.cp, unit.adv, unit.ink);
     };
     for (int i = 0; i < localStart; ++i) emitUnit(units[static_cast<std::size_t>(i)]);
-    for (const Fresh& glyph : fresh) addGlyph(hostChild, glyph.cp, glyph.adv, glyph.ink);
+    for (const Fresh& glyph : fresh) addGlyph(hostRun, glyph.cp, glyph.adv, glyph.ink);
     for (int i = localOldEnd; i < static_cast<int>(units.size()); ++i) emitUnit(units[static_cast<std::size_t>(i)]);
     flush();
-    if (pushedStyle && !targetLine.children.empty()) targetLine.children.pop_back();
-    if (built.empty()) return false;
+    if (built.runs.empty()) return false;
     const std::int32_t newPen = oldPen - replaced + added;
     if (newPen - lastTrail > targetLine.width + kSlack) return false;
 
     evictNodeMeasures(targetLine);
-    targetLine.children = std::move(built);
-    targetLine.text = std::move(lineText);
+    for (const auto& [slot, dx] : moves) {
+        Node& obj = targetLine.children[slot];
+        obj.x += dx;
+        obj.huBoundsReady = false;
+    }
+    trimLineGlyphs(built);
+    targetLine.glyphsMut() = std::move(built);
+    targetLine.textMut() = std::move(lineText);
     targetLine.end += spec.editNewEndOff - spec.editOldEndOff;
     targetLine.contentHash = 0;
     targetLine.huBoundsReady = false;
@@ -1342,7 +1371,7 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
             for (int lIdx = 0; lIdx < static_cast<int>(pNode.children.size()); ++lIdx) {
                 Node& lNode = pNode.children[static_cast<std::size_t>(lIdx)];
                 if (lNode.kind != NodeKind::Line) continue;
-                if (lNode.auditLine || lNode.deferTabs || lNode.spansLater) return false;
+                if (lNode.lineData().auditLine || lNode.lineData().deferTabs || lNode.spansLater) return false;
                 paraLines.push_back(ParaLineLoc{cIdx, pIdx, lIdx, &lNode});
             }
         }
@@ -1364,19 +1393,12 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
 
     const ParaLineLoc& located = paraLines[static_cast<std::size_t>(targetIdx)];
     StoryColumnLoc& locatedCol = storyCols[static_cast<std::size_t>(located.colListIdx)];
-    Node& paragraphNode = locatedCol.column->children[static_cast<std::size_t>(located.paraChildIdx)];
     Node& targetLine = *located.line;
     const Node* nextForSplice = nullptr;
     if (targetIdx + 1 < static_cast<int>(paraLines.size())) {
         nextForSplice = paraLines[static_cast<std::size_t>(targetIdx + 1)].line;
     }
-    bool paragraphContinues = false;
-    for (int i = targetIdx + 1; i < static_cast<int>(paraLines.size()); ++i) {
-        if (paraLines[static_cast<std::size_t>(i)].colListIdx != located.colListIdx) paragraphContinues = true;
-    }
-    const int placed = placeSameSizeGlyph(doc, para, spec, targetLine, nextForSplice, paragraphNode, *locatedCol.column,
-                                          locatedCol.ancestors, located.lineChildIdx, located.paraChildIdx,
-                                          paragraphContinues);
+    const int placed = placeSameSizeGlyph(doc, para, spec, targetLine, nextForSplice);
     if (placed == 1 || placed == 2) {
         const int deltaOff = spec.editNewEndOff - spec.editOldEndOff;
         if (placed == 1 && deltaOff != 0) {
@@ -1419,20 +1441,24 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
 
     if (targetIdx > 0) {
         const Node& prevLine = *paraLines[static_cast<std::size_t>(targetIdx - 1)].line;
-        if (!prevLine.lineBreak && !prevLine.children.empty()) return false;
+        if (!prevLine.lineData().lineBreak && (!prevLine.children.empty() || !prevLine.glyphs().runs.empty())) return false;
     }
     std::int32_t nextObjWidth = 0;
     bool hasNextLine = (targetIdx + 1 < static_cast<int>(paraLines.size()));
     if (hasNextLine) {
         const Node& nextLine = *paraLines[static_cast<std::size_t>(targetIdx + 1)].line;
-        if (!targetLine.lineBreak) {
-            if (nextLine.children.empty() || nextLine.children.front().kind != NodeKind::Object) return false;
-            const Node& obj = nextLine.children.front();
+        if (!targetLine.lineData().lineBreak) {
+            if (!lineStartsWithObject(nextLine)) return false;
+            const bool headed = nextLine.glyphs().heading ||
+                                (!nextLine.children.empty() && nextLine.children.front().headingMark);
+            const Node& obj = headed ? nextLine.children.front() : nextLine.children[nextLine.glyphs().runs.front().slot];
             nextObjWidth = obj.width + obj.marginLeft + obj.marginRight;
         }
     }
-    for (const Node& ch : targetLine.children) {
-        if (ch.kind != NodeKind::Span || ch.headingMark || ch.text == "\t") return false;
+    // 머리·개체·탭 없이 글자만 있는 줄이다.
+    if (!targetLine.children.empty() || targetLine.glyphs().heading) return false;
+    for (const LineRun& run : targetLine.glyphs().runs) {
+        if (run.kind == RunKind::Object || run.kind == RunKind::Tab) return false;
     }
 
     const int deltaOff = spec.editNewEndOff - spec.editOldEndOff;
@@ -1442,8 +1468,9 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
         if (targetLine.start != 0 || paraLines.size() != 1) return false;
         evictNodeMeasures(targetLine);
         targetLine.end = targetLine.start;
-        targetLine.text.clear();
+        targetLine.textMut().clear();
         targetLine.children.clear();
+        targetLine.glyphsMut() = {};
         targetLine.contentHash = 0;
         targetLine.huBoundsReady = false;
         const ParaLineLoc& tLoc = paraLines[static_cast<std::size_t>(targetIdx)];
@@ -1457,9 +1484,9 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
         return true;
     }
 
-    std::vector<Node> newSpans;
+    Node built;
     std::string lineText;
-    SpanBuilder spans(doc, newSpans);
+    RunBuilder spans(built, lineText, true);
 
     int pos = 0;
     int matchedCount = 0;
@@ -1514,13 +1541,13 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
                     if (fontSize > maxTextHeight) maxTextHeight = fontSize;
                     if (cp == ' ' || cp == 0x2007) {
                         spans.flush();
-                        std::string gap;
-                        appendUtf8(gap, cp);
-                        newSpans.push_back(glyphSpan(doc, atom, gap));
+                        const std::size_t at = lineText.size();
+                        appendUtf8(lineText, cp);
+                        appendGlyphRun(built, atom, at, lineText.size());
                     } else {
                         spans.add(atom);
+                        appendUtf8(lineText, cp);
                     }
-                    appendUtf8(lineText, cp);
                     pen += atom.width;
                     lastTrail = atom.trail;
                 }
@@ -1536,7 +1563,7 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
     spans.flush();
     if (matchedCount != newLineEnd - targetLine.start) return false;
     if (pen - lastTrail > targetLine.width + kSlack) return false;
-    if (hasNextLine && !targetLine.lineBreak && nextObjWidth > 0 && pen + nextObjWidth <= targetLine.width + kSlack) {
+    if (hasNextLine && !targetLine.lineData().lineBreak && nextObjWidth > 0 && pen + nextObjWidth <= targetLine.width + kSlack) {
         return false;
     }
 
@@ -1548,24 +1575,25 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
     std::int32_t newLineBaseline = -1;
     std::int32_t pitch = pitchFor(kind, spacingValue, lineEm);
     // 글꼴에 어울리는 줄 높이면 글자 상자와 줄간격 추가분이 글꼴 상자에서 나온다.
-    if (targetLine.matchFontBaseline) {
-        const SpanFontBox box = spanFontBox(newSpans);
+    if (targetLine.lineData().matchFontBaseline) {
+        const SpanFontBox box = lineFontBox(built);
         if (box.baseline >= 0) {
             newLineBaseline = box.baseline;
             charBox = std::max(charBox, box.height);
             pitch = pitchFor(kind, spacingValue, charBox);
         }
     }
-    if (pitch != targetLine.height || charBox != targetLine.textHeight) return false;
-    if (newLineBaseline != targetLine.lineBaseline) return false;
+    if (pitch != targetLine.height || charBox != targetLine.lineData().textHeight) return false;
+    if (newLineBaseline != targetLine.lineData().lineBaseline) return false;
 
     evictNodeMeasures(targetLine);
     targetLine.end = newLineEnd;
     targetLine.charShapeId = firstShape;
     targetLine.font = firstFont;
     targetLine.fontSize = lineEm;
-    targetLine.text = std::move(lineText);
-    targetLine.children = std::move(newSpans);
+    targetLine.textMut() = std::move(lineText);
+    trimLineGlyphs(built.glyphsMut());
+    targetLine.glyphsMut() = std::move(built.glyphs());
     if (spec.story > 0) stampStory(targetLine, spec.story);
 
     if (deltaOff != 0) {
@@ -1598,8 +1626,8 @@ bool laidParagraphHasNoteMark(const std::vector<Node>& pages, int story, int par
             stack.pop_back();
             if (node->kind == NodeKind::Line && node->story == story && node->paragraph == paraIndex) {
                 saw = true;
-                for (const Node& child : node->children) {
-                    if (child.noteMark) return true;
+                for (const LineRun& run : node->glyphs().runs) {
+                    if (run.kind == RunKind::Note) return true;
                 }
                 continue;
             }
@@ -1697,6 +1725,17 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
     const std::vector<model::Paragraph>* paras = storyParagraphs(doc, spec.story);
     if (!slot || !paras || spec.paraIndex >= static_cast<int>(paras->size())) {
         return giveUp("스토리없음");
+    }
+    // 격자 구역의 본문은 줄 윗변을 격자에 맞춰 쌓는다. 문단 하나만 다시 짜는 길은 그 규칙이 없어 구역째 다시 놓는다.
+    if (slot->kind == model::StoryKind::Section && slot->sectionIndex >= 0 &&
+        slot->sectionIndex < static_cast<int>(doc.sections.size())) {
+        const model::Section& sec = doc.sections[static_cast<std::size_t>(slot->sectionIndex)];
+        if (sec.lineGrid > 0 || sec.charGrid > 0) return giveUp("격자");
+    }
+    // 세로쓰기 글상자·표 칸은 줄 길이가 상자 높이라 상자·줄 높이 계산이 가로와 다르다. 그 개체째 다시 놓는다.
+    if ((slot->subList && slot->subList->textDirection != 0) ||
+        (slot->tableCell && slot->tableCell->content.textDirection != 0)) {
+        return giveUp("세로쓰기 상자");
     }
     // 번호만 문단에서 빼면 줄은 그대로여도 쪽 아래 각주·미주가 남는다. 그때는 쪽을 다시 놓는다.
     if (!paragraphKeepsNote((*paras)[static_cast<std::size_t>(spec.paraIndex)]) &&
@@ -1870,7 +1909,7 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
             return giveUp("문단나누기가다음단까지");
         }
         Node& oldPara = col.children[static_cast<std::size_t>(targetParaChildIdx)];
-        if (oldPara.headingType == "NUMBER" || oldPara.headingType == "OUTLINE") {
+        if (oldPara.ext().headingType == "NUMBER" || oldPara.ext().headingType == "OUTLINE") {
             return giveUp("개요번호문단나누기");
         }
         SingleParaLayoutResult pRes0 = layoutSingleParagraphIncremental(
@@ -1891,6 +1930,7 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
         colHeightDelta = (pRes0.paragraph.height + pRes1.paragraph.height) - oldPara.height;
         oldPara = std::move(pRes0.paragraph);
         col.children.insert(col.children.begin() + targetParaChildIdx + 1, std::move(pRes1.paragraph));
+        out.paragraphsShifted = true;
         for (int i = targetParaChildIdx + 2; i < static_cast<int>(col.children.size()); ++i) {
             Node& sib = col.children[static_cast<std::size_t>(i)];
             sib.paragraph += 1;
@@ -1914,8 +1954,8 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
         }
         for (int k = 0; k <= removedCount; ++k) {
             const Node& victim = col.children[static_cast<std::size_t>(targetParaChildIdx + k)];
-            if (victim.kind != NodeKind::Paragraph || victim.headingType == "NUMBER" ||
-                victim.headingType == "OUTLINE") {
+            if (victim.kind != NodeKind::Paragraph || victim.ext().headingType == "NUMBER" ||
+                victim.ext().headingType == "OUTLINE") {
                 return giveUp("개요번호문단합치기");
             }
         }
@@ -1936,6 +1976,7 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
         firstOldPara = std::move(pRes.paragraph);
         col.children.erase(col.children.begin() + targetParaChildIdx + 1,
                            col.children.begin() + targetParaChildIdx + 1 + removedCount);
+        out.paragraphsShifted = true;
         for (int i = targetParaChildIdx + 1; i < static_cast<int>(col.children.size()); ++i) {
             Node& sib = col.children[static_cast<std::size_t>(i)];
             sib.paragraph += spec.paraDelta;
@@ -2074,8 +2115,8 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
             }
             const std::int32_t oldLineH = hostLine.height;
             const std::int32_t newCharBox = lineCharBox(hostLine);
-            hostLine.textHeight = std::max(hostLine.fontSize, newCharBox);
-            hostLine.height = std::max(hostLine.textHeight, hostLine.height + tableHDelta);
+            hostLine.editContent().textHeight = std::max(hostLine.fontSize, newCharBox);
+            hostLine.height = std::max(hostLine.lineData().textHeight, hostLine.height + tableHDelta);
             const std::int32_t lineHDelta = hostLine.height - oldLineH;
             const std::int32_t propagateDelta = (lineHDelta != 0) ? lineHDelta : tableHDelta;
             const int hostLineIdx = loc.ancestors[tableAncIdx - 2].childIndex;
@@ -2109,15 +2150,15 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
             const std::int32_t newUsed = columnContentBottom(*curCol);
             curCol->height = std::max<std::int32_t>(newUsed, 1);
             parentBody.height = std::max<std::int32_t>(newUsed, 1);
-            const std::int32_t need = grandParent.filePadTop + grandParent.filePadBottom + newUsed;
-            const std::int32_t newObjH = std::max(grandParent.fileHeight, need);
+            const std::int32_t need = grandParent.ext().obj().filePadTop + grandParent.ext().obj().filePadBottom + newUsed;
+            const std::int32_t newObjH = std::max(grandParent.ext().obj().fileHeight, need);
             const std::int32_t innerH =
-                std::max<std::int32_t>(200, newObjH - grandParent.filePadTop - grandParent.filePadBottom);
-            std::int32_t contentY = grandParent.filePadTop;
+                std::max<std::int32_t>(200, newObjH - grandParent.ext().obj().filePadTop - grandParent.ext().obj().filePadBottom);
+            std::int32_t contentY = grandParent.ext().obj().filePadTop;
             if (parentBody.vertAlign == "CENTER" && newUsed < innerH) {
-                contentY = grandParent.filePadTop + (innerH - newUsed) / 2;
+                contentY = grandParent.ext().obj().filePadTop + (innerH - newUsed) / 2;
             } else if (parentBody.vertAlign == "BOTTOM" && newUsed < innerH) {
-                contentY = grandParent.filePadTop + (innerH - newUsed);
+                contentY = grandParent.ext().obj().filePadTop + (innerH - newUsed);
             }
             if (contentY != parentBody.y) {
                 parentBody.y = contentY;
@@ -2141,7 +2182,7 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
                 }
             }
             if (!grandParent.treatAsChar) {
-                if (!textAvoids(grandParent.textWrap) && objAncIdx >= 1) {
+                if (!textAvoids(grandParent.ext().obj().textWrap) && objAncIdx >= 1) {
                     const Node& objHost = *loc.ancestors[objAncIdx - 1].parent;
                     if (objHost.kind != NodeKind::Object) {
                         out.incremental = true;
@@ -2162,8 +2203,8 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
             }
             const std::int32_t oldLineH = hostLine.height;
             const std::int32_t newCharBox = lineCharBox(hostLine);
-            hostLine.textHeight = std::max(hostLine.fontSize, newCharBox);
-            hostLine.height = std::max(hostLine.height + objHDelta, hostLine.textHeight);
+            hostLine.editContent().textHeight = std::max(hostLine.fontSize, newCharBox);
+            hostLine.height = std::max(hostLine.height + objHDelta, hostLine.lineData().textHeight);
             const std::int32_t lineHDelta = hostLine.height - oldLineH;
             const int hostLineIdx = loc.ancestors[objAncIdx - 2].childIndex;
             const int hostParaIdx = loc.ancestors[objAncIdx - 3].childIndex;
@@ -2195,4 +2236,4 @@ EditRelayoutResult relayoutAfterEditIncremental(const model::Document& doc, std:
     }
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

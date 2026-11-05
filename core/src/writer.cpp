@@ -1,9 +1,9 @@
-#include "noting/writer.hpp"
+#include "chwp/writer.hpp"
 
-#include "noting/hwp/hwp_writer.hpp"
-#include "noting/hwpx/hwpx_writer.hpp"
+#include "chwp/hwp/hwp_writer.hpp"
+#include "chwp/hwpx/hwpx_writer.hpp"
 
-namespace noting {
+namespace chwp {
 
 bool writeDocument(const model::Document& doc, model::SourceFormat format, Bytes& out,
                    ByteView sourceData, std::string* error) {
@@ -50,4 +50,4 @@ ExportResult writeDocument(const model::Document& doc, const ExportOptions& opti
     return res;
 }
 
-}  // namespace noting
+}  // namespace chwp

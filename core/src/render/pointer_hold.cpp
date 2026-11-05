@@ -1,4 +1,4 @@
-#include "noting/render/paint.hpp"
+#include "chwp/render/paint.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10,14 +10,16 @@
 #include <utility>
 #include <vector>
 
-#include "noting/common/unicode.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/render/scene.hpp"
 #include "render/paint_detail.hpp"
+#include "render/scene_detail.hpp"
+#include "render/picture.hpp"
 
 // 포인터를 누르고 끄는 동안의 상태. 캐럿, 범위 선택, 개체 선택과 크기 조절, 터치 제스처가 여기 있다.
 // 화면에 그리는 일은 paint.cpp 가 맡는다.
 
-namespace noting::render {
+namespace chwp::render {
 
 using namespace paint_detail;
 
@@ -34,11 +36,6 @@ std::int64_t nowCaretMs() {
 }
 
 void touchCaretBlink(PointerHold& hold) { hold.caretTouchMs = nowCaretMs(); }
-
-PointerHold& pointerHold() {
-    static PointerHold hold;
-    return hold;
-}
 
 int currentCaretPageHint() { return pointerHold().caretPage; }
 
@@ -171,6 +168,18 @@ void walkPlacedChildren(const Node& node, std::int32_t x, std::int32_t y, const 
     for (const Node& child : node.children) visit(child, x, y);
 }
 
+// 쪽의 노드를 그린 자리(쪽 좌표 왼쪽 위)와 함께 찾아 간다. 줄 속 글자처럼 넣은 개체도 그린 자리다.
+// visit 이 false 를 돌려주면 그 아래는 보지 않는다.
+template <typename Visit>
+void walkPlacedNodes(const model::Document& doc, const Node& node, std::int32_t ox, std::int32_t oy, Visit& visit) {
+    const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
+    const std::int32_t y = oy + node.y;
+    if (!visit(node, x, y)) return;
+    walkPlacedChildren(node, x, y, &doc, [&](const Node& child, std::int32_t cx, std::int32_t cy) {
+        walkPlacedNodes(doc, child, cx, cy, visit);
+    });
+}
+
 void walkDragHit(const model::Document& doc, const Node& node, std::int32_t ox, std::int32_t oy, int page, int px,
                  int py, ContainerHit& hit) {
     const std::int32_t x = ox + node.x + (node.kind == NodeKind::Paragraph ? node.marginLeft : 0);
@@ -186,10 +195,10 @@ void walkDragHit(const model::Document& doc, const Node& node, std::int32_t ox, 
             if (slot->kind == model::StoryKind::TableCell && slot->control) {
                 hit.inCell = true;
                 hit.control = slot->control;
-                hit.row = node.row;
-                hit.col = node.col;
-                hit.rowSpan = std::max(1, node.rowSpan);
-                hit.colSpan = std::max(1, node.colSpan);
+                hit.row = node.ext().row;
+                hit.col = node.ext().col;
+                hit.rowSpan = std::max(1, node.ext().rowSpan);
+                hit.colSpan = std::max(1, node.ext().colSpan);
                 hit.cellBox = DragBox{page, x, y, node.width, node.height};
             }
         }
@@ -272,7 +281,7 @@ void collectCellBoxes(const model::Document& doc, const Node& node, std::int32_t
         const int story = cellContentStory(node);
         if (const model::StorySlot* slot = story > 0 ? resolveStory(doc, story) : nullptr) {
             if (slot->control == control &&
-                cellIntersects(node.row, node.col, node.rowSpan, node.colSpan, row0, row1, col0, col1)) {
+                cellIntersects(node.ext().row, node.ext().col, node.ext().rowSpan, node.ext().colSpan, row0, row1, col0, col1)) {
                 appendHeldBox(hold, pages, DragBox{page, x, y, node.width, node.height});
             }
         }
@@ -462,6 +471,7 @@ struct LineRef {
     std::int32_t y = 0;
     std::int32_t w = 0;
     std::int32_t h = 0;
+    bool turned = false;  // 세로쓰기 본문의 줄. 상자는 종이 자리로 돌려 두었다
 };
 
 struct ObjRef {
@@ -483,7 +493,7 @@ struct PaperHit {
 
 int lineBoxH(const Node& node) {
     if (node.height > 0) return node.height;
-    if (node.textHeight > 0) return node.textHeight;
+    if (node.lineData().textHeight > 0) return node.lineData().textHeight;
     return std::max<std::int32_t>(node.fontSize, 1);
 }
 
@@ -522,11 +532,58 @@ bool lineUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int p
     return false;
 }
 
+// 세로쓰기 틀을 지나는 동안의 틀 원점·폭과 종이 점. 틀 안은 돌린 점으로 재고, 세운 개체를 만나면 종이로 돌아간다.
+struct HitTurn {
+    const Node* node = nullptr;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t span = 0;
+    int px = 0;
+    int py = 0;
+};
+thread_local HitTurn gHitTurn;
+thread_local std::int32_t gHitPaperW = 0;
+struct HitTurnScope {
+    HitTurn saved = gHitTurn;
+    ~HitTurnScope() { gHitTurn = saved; }
+};
+
+bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int py, bool allowBehind,
+                 const model::Document* doc, std::vector<ObjRef>& chain, LineRef& line);
+
+// 돌린 틀 안의 세운 개체 상자(틀 자리 bx, by). 실제 개체를 종이 자리와 종이 점으로 고른다.
+bool uprightUnder(const Node& box, std::int32_t bx, std::int32_t by, bool allowBehind, const model::Document* doc,
+                  std::vector<ObjRef>& chain, LineRef& line) {
+    const HitTurnScope scope;
+    const HitTurn turn = gHitTurn;
+    const std::int32_t paperX = turn.x + turn.span - by - box.height;
+    const std::int32_t paperY = turn.y + bx;
+    gHitTurn = {};
+    for (int i = static_cast<int>(box.children.size()) - 1; i >= 0; --i) {
+        if (objectUnder(box.children[static_cast<std::size_t>(i)], paperX, paperY, turn.px, turn.py, allowBehind, doc,
+                        chain, line)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int py, bool allowBehind,
                  const model::Document* doc, std::vector<ObjRef>& chain, LineRef& line) {
+    if (node.kind == NodeKind::Paper) gHitPaperW = node.width;
+    if (node.turned != 0 && gHitTurn.node != &node) {
+        const HitTurnScope scope;
+        const std::int32_t span = node.turnSpan > 0 ? node.turnSpan : gHitPaperW;
+        gHitTurn = {&node, ox, oy, span, px, py};
+        return objectUnder(node, 0, 0, py - oy, ox + span - px, allowBehind, doc, chain, line);
+    }
     const std::int32_t x = childX(node, ox);
     const std::int32_t y = oy + node.y;
     if (node.pageBand) return false;
+    if (node.upright && gHitTurn.node) {
+        if (!boxHas(x, y, node.width, node.height, px, py)) return false;
+        return uprightUnder(node, x, y, allowBehind, doc, chain, line);
+    }
     if (node.kind == NodeKind::Line) {
         // 글자처럼 넣은 개체는 줄의 x가 화면 위치가 아니다. 그리는 walkPlacedChildren 과 같은 자리를 쓴다.
         struct PlacedChild {
@@ -544,10 +601,14 @@ bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int
                 child.role == "pageFill") {
                 continue;
             }
-            if (child.textWrap == "BEHIND_TEXT" && !allowBehind) continue;
+            if (child.ext().obj().textWrap == "BEHIND_TEXT" && !allowBehind) continue;
             const std::int32_t hx = placed[static_cast<std::size_t>(i)].x + child.x;
             const std::int32_t hy = placed[static_cast<std::size_t>(i)].y + child.y;
             if (!boxHas(hx, hy, child.width, child.height, px, py)) continue;
+            if (child.upright && gHitTurn.node) {
+                if (uprightUnder(child, hx, hy, true, doc, chain, line)) return true;
+                continue;
+            }
             std::vector<ObjRef> nested;
             LineRef nestedLine;
             for (int j = static_cast<int>(child.children.size()) - 1; j >= 0; --j) {
@@ -568,7 +629,7 @@ bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int
         return false;
     }
     if (node.kind == NodeKind::Object && node.role != "caption" && node.role != "pageBorder" && node.role != "pageFill") {
-        const bool behind = node.textWrap == "BEHIND_TEXT";
+        const bool behind = node.ext().obj().textWrap == "BEHIND_TEXT";
         if (behind && !allowBehind) return false;
         if (!boxHas(x, y, node.width, node.height, px, py)) return false;
         for (int i = static_cast<int>(node.children.size()) - 1; i >= 0; --i) {
@@ -618,7 +679,7 @@ int storyFrame(const Node& node, std::int32_t ox, std::int32_t oy, const model::
     if (found != 1 || node.kind != NodeKind::Object) return found;
     if (node.role == "caption") return 2;
     if (node.role == "shape" && textHolder(node)) {
-        if (edgeVisible(node.borderTop) || edgeVisible(node.borderLeft)) return 2;
+        if (edgeVisible(node.ext().borderTop) || edgeVisible(node.ext().borderLeft)) return 2;
         out.push_back({x, y, x + node.width, y});
         out.push_back({x, y + node.height, x + node.width, y + node.height});
         out.push_back({x, y, x, y + node.height});
@@ -646,21 +707,21 @@ int storyFrame(const Node& node, std::int32_t ox, std::int32_t oy, const model::
             if (other.cell == self.cell) continue;
             if (vertical) {
                 if (!overlaps(from, to, other.t, other.b)) continue;
-                if (std::abs(other.r - at) <= 1 && edgeVisible(other.cell->borderRight)) return true;
-                if (std::abs(other.l - at) <= 1 && edgeVisible(other.cell->borderLeft)) return true;
+                if (std::abs(other.r - at) <= 1 && edgeVisible(other.cell->ext().borderRight)) return true;
+                if (std::abs(other.l - at) <= 1 && edgeVisible(other.cell->ext().borderLeft)) return true;
             } else {
                 if (!overlaps(from, to, other.l, other.r)) continue;
-                if (std::abs(other.b - at) <= 1 && edgeVisible(other.cell->borderBottom)) return true;
-                if (std::abs(other.t - at) <= 1 && edgeVisible(other.cell->borderTop)) return true;
+                if (std::abs(other.b - at) <= 1 && edgeVisible(other.cell->ext().borderBottom)) return true;
+                if (std::abs(other.t - at) <= 1 && edgeVisible(other.cell->ext().borderTop)) return true;
             }
         }
         return false;
     };
     for (const CellRect& c : cells) {
-        if (!edgeVisible(c.cell->borderTop) && !shown(c, false, c.t, c.l, c.r)) out.push_back({c.l, c.t, c.r, c.t});
-        if (!edgeVisible(c.cell->borderBottom) && !shown(c, false, c.b, c.l, c.r)) out.push_back({c.l, c.b, c.r, c.b});
-        if (!edgeVisible(c.cell->borderLeft) && !shown(c, true, c.l, c.t, c.b)) out.push_back({c.l, c.t, c.l, c.b});
-        if (!edgeVisible(c.cell->borderRight) && !shown(c, true, c.r, c.t, c.b)) out.push_back({c.r, c.t, c.r, c.b});
+        if (!edgeVisible(c.cell->ext().borderTop) && !shown(c, false, c.t, c.l, c.r)) out.push_back({c.l, c.t, c.r, c.t});
+        if (!edgeVisible(c.cell->ext().borderBottom) && !shown(c, false, c.b, c.l, c.r)) out.push_back({c.l, c.b, c.r, c.b});
+        if (!edgeVisible(c.cell->ext().borderLeft) && !shown(c, true, c.l, c.t, c.b)) out.push_back({c.l, c.t, c.l, c.b});
+        if (!edgeVisible(c.cell->ext().borderRight) && !shown(c, true, c.r, c.t, c.b)) out.push_back({c.r, c.t, c.r, c.b});
     }
     return 2;
 }
@@ -705,7 +766,8 @@ bool inEdgeBand(const ObjRef& obj, int px, int py, double band) {
     return px - obj.x < band || obj.x + obj.w - px <= band || py - obj.y < band || obj.y + obj.h - py <= band;
 }
 
-void gatherBodyLines(const Node& node, std::int32_t ox, std::int32_t oy, std::vector<LineRef>& out);
+void gatherBodyLines(const Node& node, std::int32_t ox, std::int32_t oy, std::vector<LineRef>& out,
+                     std::int32_t paperW = 0, std::int32_t turnW = 0);
 LineRef nearestLine(const std::vector<LineRef>& lines, int px, int py);
 
 // 표·글상자 안쪽에서 누른 자리에 가까운 줄. 표는 누른 칸의 줄만 본다.
@@ -735,7 +797,7 @@ void settleObjectHit(PaperHit& hit, int px, int py, double band, const model::Do
     const ObjRef& inner = hit.objects.back();
     const int last = static_cast<int>(hit.objects.size()) - 1;
     // 글상자는 줄 상자가 폭을 다 차지해도 글자가 없는 테두리 곁이 개체를 고르는 띠다.
-    // 표는 칸 안 여백도 글이라 줄 위면 커서다.
+    // 표는 칸 안 여백도 글이라 줄 위면 커서다. 표는 테두리선 위를 눌러 고른다(tableBorderAt).
     const bool edge = inEdgeBand(inner, px, py, band);
     const bool onInk = hit.line.node &&
                        (inner.node->role == "table" ||
@@ -751,8 +813,22 @@ void settleObjectHit(PaperHit& hit, int px, int py, double band, const model::Do
     if (!hit.line.node) hit.pick = last;
 }
 
-bool bodyLineAt(const Node& node, std::int32_t ox, std::int32_t oy, int px, int py, LineRef& out) {
+// 세로쓰기 본문(turned)의 줄 상자는 돌린 틀 좌표다. 종이 (X, Y) 는 틀의 (Y, 종이 폭 − X) 라 종이 상자로 돌린다.
+LineRef paperLineRef(const LineRef& line, std::int32_t turnW) {
+    if (turnW <= 0) return line;
+    return {line.node, turnW - (line.y + line.h), line.x, line.h, line.w, true};
+}
+
+bool bodyLineAt(const Node& node, std::int32_t ox, std::int32_t oy, int px, int py, LineRef& out,
+                std::int32_t paperW = 0, std::int32_t turnW = 0) {
     if (node.pageBand || node.kind == NodeKind::Object) return false;
+    if (node.kind == NodeKind::Paper) paperW = node.width;
+    if (node.turned != 0 && turnW == 0 && paperW > 0) {
+        LineRef inner;
+        if (!bodyLineAt(node, oy, -ox, py, paperW - px, inner, paperW, paperW)) return false;
+        out = paperLineRef(inner, paperW);
+        return true;
+    }
     const std::int32_t x = childX(node, ox);
     const std::int32_t y = oy + node.y;
     if (node.kind == NodeKind::Line) {
@@ -763,20 +839,26 @@ bool bodyLineAt(const Node& node, std::int32_t ox, std::int32_t oy, int px, int 
         return true;
     }
     for (int i = static_cast<int>(node.children.size()) - 1; i >= 0; --i) {
-        if (bodyLineAt(node.children[static_cast<std::size_t>(i)], x, y, px, py, out)) return true;
+        if (bodyLineAt(node.children[static_cast<std::size_t>(i)], x, y, px, py, out, paperW, turnW)) return true;
     }
     return false;
 }
 
-void gatherBodyLines(const Node& node, std::int32_t ox, std::int32_t oy, std::vector<LineRef>& out) {
+void gatherBodyLines(const Node& node, std::int32_t ox, std::int32_t oy, std::vector<LineRef>& out,
+                     std::int32_t paperW, std::int32_t turnW) {
     if (node.pageBand || node.kind == NodeKind::Object) return;
+    if (node.kind == NodeKind::Paper) paperW = node.width;
+    if (node.turned != 0 && turnW == 0 && paperW > 0) {
+        gatherBodyLines(node, oy, -ox, out, paperW, paperW);
+        return;
+    }
     const std::int32_t x = childX(node, ox);
     const std::int32_t y = oy + node.y;
     if (node.kind == NodeKind::Line) {
-        out.push_back({&node, x, y, std::max<std::int32_t>(node.width, 1), lineBoxH(node)});
+        out.push_back(paperLineRef({&node, x, y, std::max<std::int32_t>(node.width, 1), lineBoxH(node)}, turnW));
         return;
     }
-    for (const Node& child : node.children) gatherBodyLines(child, x, y, out);
+    for (const Node& child : node.children) gatherBodyLines(child, x, y, out, paperW, turnW);
 }
 
 bool bandAt(const Node& node, std::int32_t ox, std::int32_t oy, int px, int py, int paperH, int& story, bool& header,
@@ -920,6 +1002,25 @@ void showObject(PointerHold& hold, const std::vector<Node>& pages, int page, con
         hold.boxes.push_back(held);
     }
     bumpPointerPicture();
+}
+
+bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
+                            int paragraph, int item) {
+    if (page < 0 || page >= static_cast<int>(pages.size())) return false;
+    ObjRef found;
+    auto visit = [&](const Node& node, std::int32_t x, std::int32_t y) {
+        if (found.node || node.turned != 0) return false;
+        if (node.kind == NodeKind::Object && node.ext().obj().anchorStory == story && node.ext().obj().anchorParagraph == paragraph &&
+            node.ext().obj().anchorItem == item) {
+            found = ObjRef{&node, x, y, node.width, node.height};
+            return false;
+        }
+        return true;
+    };
+    walkPlacedNodes(doc, pages[static_cast<std::size_t>(page)], 0, 0, visit);
+    if (!found.node) return false;
+    showObject(pointerHold(), pages, page, found);
+    return true;
 }
 
 void refreshPins(PointerHold& hold, const model::Document& doc, const std::vector<Node>& pages) {
@@ -1114,7 +1215,7 @@ PaperHit hitPaper(const model::Document& doc, const Node& paper, int px, int py,
     std::vector<ObjRef> behind;
     LineRef behindLine;
     if (objectUnder(paper, 0, 0, px, py, true, &doc, behind, behindLine) && !behind.empty() && behind.front().node &&
-        behind.front().node->textWrap == "BEHIND_TEXT") {
+        behind.front().node->ext().obj().textWrap == "BEHIND_TEXT") {
         hit.objects = std::move(behind);
         hit.line = behindLine;
         settleObjectHit(hit, px, py, edgeBand, doc);
@@ -1366,6 +1467,180 @@ void resizeObjectBox(PointerHold& hold, int px, int py) {
     bumpPointerPicture();
 }
 
+// 표 칸 경계선 찾기. 가장 안쪽 표의 선이다. 왼쪽·위 바깥선은 번호 -1 로, 끌지 않고 표를 고르는 자리다.
+struct TableBorderHit {
+    const Node* table = nullptr;
+    int kind = 0;  // 1 세로선, 2 가로선
+    int index = -1;
+    bool outer = false;
+    std::int32_t at = 0;
+    std::int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    std::vector<std::int32_t> sizes;
+    std::vector<std::int32_t> least;  // 칸(줄)마다 끌어 줄일 수 있는 최소 크기
+};
+
+bool tableBorderAt(const model::Document& doc, const std::vector<Node>& pages, int page, int px, int py, double radius,
+                   TableBorderHit& out) {
+    if (page < 0 || page >= static_cast<int>(pages.size()) || radius <= 0) return false;
+    bool found = false;
+    auto visit = [&](const Node& node, std::int32_t x, std::int32_t y) {
+        if (node.turned != 0 || node.pageBand || node.upright) return false;
+        if (node.kind == NodeKind::Object && node.role == "table" && node.ext().obj().anchorItem >= 0 &&
+            px >= x - radius && px <= x + node.width + radius && py >= y - radius && py <= y + node.height + radius) {
+            std::vector<std::int32_t> cols;
+            std::vector<std::int32_t> rows;
+            std::vector<std::int32_t> rightEdge;
+            std::vector<std::int32_t> bottomEdge;
+            for (const Node& cell : node.children) {
+                if (cell.kind != NodeKind::Cell || cell.ext().row < 0 || cell.ext().col < 0) continue;
+                const auto c = static_cast<std::size_t>(cell.ext().col + std::max(1, cell.ext().colSpan) - 1);
+                const auto r = static_cast<std::size_t>(cell.ext().row + std::max(1, cell.ext().rowSpan) - 1);
+                if (rightEdge.size() <= c) rightEdge.resize(c + 1, 0);
+                if (bottomEdge.size() <= r) bottomEdge.resize(r + 1, 0);
+                rightEdge[c] = std::max(rightEdge[c], cell.x + cell.width);
+                bottomEdge[r] = std::max(bottomEdge[r], cell.y + cell.height);
+            }
+            // 한글처럼 칸 폭은 좌우 안쪽 여백 + 1mm, 줄 높이는 칸 내용 높이보다 작게 줄이지 않는다
+            // (한글 2024 칸 크기 줄이기, tmp/minsize). 여러 칸에 걸친 칸은 넣지 않는다.
+            std::vector<std::int32_t> colLeast(rightEdge.size(), 283);
+            std::vector<std::int32_t> rowLeast(bottomEdge.size(), 282);
+            for (const Node& cell : node.children) {
+                if (cell.kind != NodeKind::Cell || cell.ext().row < 0 || cell.ext().col < 0) continue;
+                const auto c = static_cast<std::size_t>(cell.ext().col);
+                const auto r = static_cast<std::size_t>(cell.ext().row);
+                if (cell.ext().colSpan <= 1 && c < colLeast.size()) {
+                    colLeast[c] = std::max(colLeast[c], cell.marginLeft + cell.marginRight + 283);
+                }
+                if (cell.ext().rowSpan <= 1 && r < rowLeast.size()) {
+                    std::int32_t used = 0;
+                    for (const Node& content : cell.children) {
+                        if (content.turned == 0) used = std::max(used, detail::rowContentBottom(content));
+                    }
+                    rowLeast[r] = std::max(rowLeast[r], cell.marginTop + cell.marginBottom + used);
+                }
+            }
+            std::int32_t prev = 0;
+            for (const std::int32_t edge : rightEdge) {
+                cols.push_back(std::max<std::int32_t>(0, edge - prev));
+                prev = edge;
+            }
+            prev = 0;
+            for (const std::int32_t edge : bottomEdge) {
+                rows.push_back(std::max<std::int32_t>(0, edge - prev));
+                prev = edge;
+            }
+            TableBorderHit best;
+            double bestDist = radius;
+            // 왼쪽·위 바깥선(번호 -1)은 끌지 않고 표만 고른다.
+            if (py >= y && py <= y + node.height && std::abs(px - x) <= bestDist) {
+                bestDist = std::abs(px - x);
+                best.kind = 1;
+                best.index = -1;
+                best.outer = true;
+                best.at = x;
+                best.sizes = cols;
+                best.least = colLeast;
+            }
+            if (px >= x && px <= x + node.width && std::abs(py - y) <= bestDist) {
+                bestDist = std::abs(py - y);
+                best.kind = 2;
+                best.index = -1;
+                best.outer = true;
+                best.at = y;
+                best.sizes = rows;
+                best.least = rowLeast;
+            }
+            if (py >= y && py <= y + node.height) {
+                for (std::size_t c = 0; c < rightEdge.size(); ++c) {
+                    const double dist = std::abs(px - (x + rightEdge[c]));
+                    if (dist <= bestDist) {
+                        bestDist = dist;
+                        best.kind = 1;
+                        best.index = static_cast<int>(c);
+                        best.outer = c + 1 == rightEdge.size();
+                        best.at = x + rightEdge[c];
+                        best.sizes = cols;
+                        best.least = colLeast;
+                    }
+                }
+            }
+            if (px >= x && px <= x + node.width) {
+                for (std::size_t r = 0; r < bottomEdge.size(); ++r) {
+                    const double dist = std::abs(py - (y + bottomEdge[r]));
+                    if (dist <= bestDist) {
+                        bestDist = dist;
+                        best.kind = 2;
+                        best.index = static_cast<int>(r);
+                        best.outer = r + 1 == bottomEdge.size();
+                        best.at = y + bottomEdge[r];
+                        best.sizes = rows;
+                        best.least = rowLeast;
+                    }
+                }
+            }
+            if (best.kind != 0) {
+                best.table = &node;
+                best.x0 = x;
+                best.y0 = y;
+                best.x1 = x + node.width;
+                best.y1 = y + node.height;
+                out = std::move(best);
+                found = true;
+            }
+        }
+        return true;
+    };
+    walkPlacedNodes(doc, pages[static_cast<std::size_t>(page)], 0, 0, visit);
+    return found;
+}
+
+// 개체 모습을 그려 둔다. 긴 변이 800 픽셀쯤 되게 그린다. 고른 개체만 빈 쪽에 올려 그려서
+// 위에 겹친 도형이나 밑의 글은 들어가지 않는다. 흰 바탕과 검은 바탕에 한 번씩 그려 두 색 차이로 투명도를 얻는다.
+// 그래서 새 자리에 실제 모양 그대로 얹어도 채우지 않은 곳으로 밑의 글이 보인다.
+void snapshotHeldObject(PointerHold& hold, const model::Document& doc, const std::vector<Node>& pages, int page) {
+    hold.dragSnapshot.reset();
+    if (hold.boxes.empty() || page < 0 || page >= static_cast<int>(pages.size())) return;
+    const HeldBox& box = hold.boxes.front();
+    const Node& sheet = pages[static_cast<std::size_t>(page)];
+    if (box.width <= 0 || box.height <= 0 || sheet.height <= 0) return;
+    Node solo;
+    if (hold.selectedObject) {
+        solo.kind = sheet.kind;
+        solo.width = sheet.width;
+        solo.height = sheet.height;
+        Node object = *hold.selectedObject;
+        object.x = box.x;
+        object.y = box.y;
+        object.treatAsChar = false;
+        solo.children.push_back(std::move(object));
+    }
+    const Node& paper = hold.selectedObject ? solo : sheet;
+    const double scale = std::clamp(800.0 / std::max(box.width, box.height), 0.01, 0.12);
+    const int pixelHeight = std::max(32, static_cast<int>(std::lround(paper.height * scale)));
+    const double s = static_cast<double>(pixelHeight) / static_cast<double>(paper.height);
+    const int vx = static_cast<int>(std::floor(box.x * s));
+    const int vy = static_cast<int>(std::floor(box.y * s));
+    const int vw = std::max(1, static_cast<int>(std::ceil((box.x + box.width) * s)) - vx);
+    const int vh = std::max(1, static_cast<int>(std::ceil((box.y + box.height) * s)) - vy);
+    PageBitmap bitmap = renderPageBitmap(doc, paper, pixelHeight, vx, vy, vw, vh);
+    if (bitmap.rgba.empty()) return;
+    const PageBitmap dark = renderPageBitmap(doc, paper, pixelHeight, vx, vy, vw, vh, PaintLayer::All, -1, 0);
+    if (dark.rgba.size() == bitmap.rgba.size()) {
+        for (std::size_t i = 0; i + 3 < bitmap.rgba.size(); i += 4) {
+            int spread = 0;
+            for (int c = 0; c < 3; ++c) spread += bitmap.rgba[i + c] - dark.rgba[i + c];
+            const int alpha = std::clamp(255 - spread / 3, 0, 255);
+            for (int c = 0; c < 3; ++c) {
+                bitmap.rgba[i + c] = static_cast<std::uint8_t>(alpha > 0 ? std::min(255, dark.rgba[i + c] * 255 / alpha) : 0);
+            }
+            bitmap.rgba[i + 3] = static_cast<std::uint8_t>(alpha);
+        }
+    }
+    static int serial = 0;
+    hold.dragSnapshotId = "@drag:" + std::to_string(++serial);
+    hold.dragSnapshot = pictureFromRgba(bitmap.width, bitmap.height, std::move(bitmap.rgba), false);
+}
+
 PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& pages, int page, int x, int y, const PointerSample& sample) {
     PointerHold& hold = pointerHold();
     if (page < 0 || page >= static_cast<int>(pages.size())) {
@@ -1399,11 +1674,31 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         hold.resizeOldH = static_cast<std::uint32_t>(box.height);
         hold.resizeNewW = hold.resizeOldW;
         hold.resizeNewH = hold.resizeOldH;
-        hold.resizeRole = hold.selectedObject ? hold.selectedObject->role : std::string();
-        hold.resizeBin = hold.selectedObject ? hold.selectedObject->binItemId : std::string();
+        hold.resizeRole = hold.selectedObject ? hold.selectedObject->role.str() : std::string();
+        // 표는 그린 줄 높이·칸 폭을 잡아 둔다. 늘릴 때 그 비율로 나눈다.
+        hold.resizeRows.clear();
+        hold.resizeCols.clear();
+        if (hold.selectedObject) {
+            const Node* table = hold.selectedObject;
+            if (table->upright && !table->children.empty()) table = &table->children.front();
+            for (const Node& cell : table->children) {
+                if (cell.kind != NodeKind::Cell || cell.ext().row < 0 || cell.ext().col < 0) continue;
+                const auto r = static_cast<std::size_t>(cell.ext().row);
+                const auto c = static_cast<std::size_t>(cell.ext().col);
+                if (cell.ext().rowSpan <= 1) {
+                    if (hold.resizeRows.size() <= r) hold.resizeRows.resize(r + 1, 0);
+                    hold.resizeRows[r] = std::max(hold.resizeRows[r], cell.height);
+                }
+                if (cell.ext().colSpan <= 1) {
+                    if (hold.resizeCols.size() <= c) hold.resizeCols.resize(c + 1, 0);
+                    hold.resizeCols[c] = std::max(hold.resizeCols[c], cell.width);
+                }
+            }
+        }
+        hold.resizeBin = hold.selectedObject ? hold.selectedObject->ext().obj().binItemId.str() : std::string();
         hold.resizeCrop = false;
         if (hold.selectedObject && hold.selectedObject->role == "picture") {
-            const model::PictureView& pic = hold.selectedObject->picture;
+            const model::PictureView& pic = hold.selectedObject->ext().obj().picture;
             const std::int32_t clipW = pic.clipRight - pic.clipLeft;
             const std::int32_t clipH = pic.clipBottom - pic.clipTop;
             const bool identity = pic.originWidth <= 0 || pic.originHeight <= 0 || clipW <= 0 || clipH <= 0 ||
@@ -1425,7 +1720,68 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         hold.edgeViewY = sample.viewY;
         hold.edgeDpr = dpr;
         hold.eventText = "크기";
+        if (hold.resizeRole != "picture") snapshotHeldObject(hold, doc, pages, page);
         return pointerViewOf(hold);
+    }
+    // 표 칸 경계선을 누르면 끌어 칸 폭·줄 높이를 바꾼다.
+    if (!readOnly()) {
+        TableBorderHit border;
+        if (tableBorderAt(doc, pages, page, x, y, handleRadius * 0.3, border)) {
+            hold.borderDrag = border.kind;
+            hold.borderMoved = false;
+            hold.borderPage = page;
+            hold.borderIndex = border.index;
+            hold.borderOuter = border.outer;
+            hold.borderStart = border.kind == 1 ? x : y;
+            hold.borderDelta = 0;
+            hold.borderAt = border.at;
+            hold.borderX0 = border.x0;
+            hold.borderY0 = border.y0;
+            hold.borderX1 = border.x1;
+            hold.borderY1 = border.y1;
+            hold.borderStory = border.table->ext().obj().anchorStory;
+            hold.borderParagraph = border.table->ext().obj().anchorParagraph;
+            hold.borderItem = border.table->ext().obj().anchorItem;
+            hold.borderSizes = border.sizes;
+            // 끌 수 있는 범위. 이 칸(줄)은 최소 크기, 세로 안쪽선은 오른쪽 이웃 칸도 최소 크기를 남긴다.
+            // 이미 최소보다 작으면 더 줄이지만 않는다.
+            const auto leastAt = [&](int i) {
+                return i >= 0 && i < static_cast<int>(border.least.size()) ? border.least[static_cast<std::size_t>(i)] : 283;
+            };
+            const auto sizeAt = [&](int i) {
+                return i >= 0 && i < static_cast<int>(border.sizes.size()) ? border.sizes[static_cast<std::size_t>(i)] : 0;
+            };
+            hold.borderMin = std::min(0, leastAt(border.index) - sizeAt(border.index));
+            hold.borderMax = 1000000;
+            if (border.kind == 1 && !border.outer && border.index + 1 < static_cast<int>(border.sizes.size())) {
+                hold.borderMax = std::max(0, sizeAt(border.index + 1) - leastAt(border.index + 1));
+            }
+            if (border.index < 0) hold.borderMin = hold.borderMax = 0;
+            hold.tracking = true;
+            hold.eventText = border.kind == 1 ? "칸 폭" : "줄 높이";
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
+    }
+    // 고른 띄운 개체 안을 누르면 끌어 옮긴다. 글자처럼 취급한 개체는 옮기지 않는다.
+    if (!readOnly() && hold.objectHandles && hold.selectedObject && !hold.selectedObject->treatAsChar &&
+        hold.selectedObject->ext().obj().anchorStory > 0 && hold.selectedObject->ext().obj().anchorItem >= 0 && !hold.boxes.empty()) {
+        const HeldBox& box = hold.boxes.front();
+        if (box.page == page && x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height) {
+            hold.moving = true;
+            hold.movePage = page;
+            hold.moveStartX = x;
+            hold.moveStartY = y;
+            hold.moveDX = 0;
+            hold.moveDY = 0;
+            hold.moveStory = hold.selectedObject->ext().obj().anchorStory;
+            hold.moveParagraph = hold.selectedObject->ext().obj().anchorParagraph;
+            hold.moveItem = hold.selectedObject->ext().obj().anchorItem;
+            snapshotHeldObject(hold, doc, pages, page);
+            hold.tracking = true;
+            hold.eventText = "옮기기";
+            return pointerViewOf(hold);
+        }
     }
     int which = 0;
     if (pinHit(hold, x, y, 22.0 * sample.huPerLogical, which)) {
@@ -1512,6 +1868,25 @@ PointerView applyTimedMove(const model::Document& doc, const std::vector<Node>& 
         hold.eventText = "크기";
         return pointerViewOf(hold);
     }
+    if (hold.moving) {
+        if (page == hold.movePage) {
+            hold.moveDX = x - hold.moveStartX;
+            hold.moveDY = y - hold.moveStartY;
+        }
+        hold.eventText = "옮기기";
+        bumpPointerPicture();
+        return pointerViewOf(hold);
+    }
+    if (hold.borderDrag != 0) {
+        if (page == hold.borderPage) {
+            const std::int32_t delta = (hold.borderDrag == 1 ? x : y) - hold.borderStart;
+            hold.borderDelta = std::clamp(delta, hold.borderMin, std::max(hold.borderMin, hold.borderMax));
+            if (hold.borderDelta != 0) hold.borderMoved = true;
+        }
+        hold.eventText = hold.borderDrag == 1 ? "칸 폭" : "줄 높이";
+        bumpPointerPicture();
+        return pointerViewOf(hold);
+    }
     if (hold.pinDrag != 0 && hold.story > 0) {
         // 손가락 떨림으로 블록 끝이 한 글자씩 움직이지 않게, 8픽셀을 넘긴 뒤부터 따라간다.
         if (!hold.pinMoved) {
@@ -1589,8 +1964,42 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
     hold.eventText.clear();
     hold.property.clear();
     if (percent > 0) hold.percent = percent;
+    // 도형 그리기: 누른 자리부터 끈 자리까지가 도형 상자다. 그 쪽 밖으로 나가면 쪽 끝에서 멈춘다.
+    if (hold.drawTool != 0 && !readOnly()) {
+        const auto clampToPage = [&](std::int32_t& px, std::int32_t& py) {
+            if (hold.drawPage < 0 || hold.drawPage >= static_cast<int>(pages.size())) return;
+            const Node& paper = pages[static_cast<std::size_t>(hold.drawPage)];
+            px = std::clamp<std::int32_t>(px, 0, std::max<std::int32_t>(0, paper.width));
+            py = std::clamp<std::int32_t>(py, 0, std::max<std::int32_t>(0, paper.height));
+        };
+        if (kind == 1 && page >= 0 && page < static_cast<int>(pages.size())) {
+            hold.drawing = true;
+            hold.drawPage = page;
+            hold.drawX0 = hold.drawX1 = x;
+            hold.drawY0 = hold.drawY1 = y;
+            clampToPage(hold.drawX0, hold.drawY0);
+            clampToPage(hold.drawX1, hold.drawY1);
+        } else if ((kind == 2 || kind == 3) && hold.drawing) {
+            if (page == hold.drawPage) {
+                hold.drawX1 = x;
+                hold.drawY1 = y;
+                clampToPage(hold.drawX1, hold.drawY1);
+            }
+            if (kind == 3) {
+                hold.drawing = false;
+                hold.drawPending = true;
+                hold.drawPendingTool = hold.drawTool;
+                hold.drawTool = 0;
+            }
+        } else if (kind == 4) {
+            hold.drawing = false;
+        }
+        bumpPointerPicture();
+        return pointerViewOf(hold);
+    }
     if (sample.time > 0 && kind == 1) return applyTimedDown(doc, pages, page, x, y, sample);
-    if (sample.time > 0 && kind == 2 && (hold.clickPending || hold.pinDrag != 0 || hold.resizeHandle >= 0)) {
+    if (sample.time > 0 && kind == 2 &&
+        (hold.clickPending || hold.pinDrag != 0 || hold.resizeHandle >= 0 || hold.moving || hold.borderDrag != 0)) {
         return applyTimedMove(doc, pages, page, x, y, sample);
     }
     if (sample.time > 0 && kind == 3 && hold.clickPending && !hold.clickDragged) {
@@ -1606,11 +2015,54 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
         return pointerViewOf(hold);
     }
     if (sample.time > 0 && kind == 3) {
+        hold.dragSnapshot.reset();
+        if (hold.borderDrag != 0) {
+            if (page == hold.borderPage) {
+                const std::int32_t delta = (hold.borderDrag == 1 ? x : y) - hold.borderStart;
+                hold.borderDelta = std::clamp(delta, hold.borderMin, std::max(hold.borderMin, hold.borderMax));
+            }
+            hold.borderPending = hold.borderMoved && hold.borderDelta != 0;
+            if (!hold.borderPending) hold.borderDrag = 0;
+            hold.tracking = false;
+            hold.edgeActive = false;
+            // 끌지 않고 뗐으면 그 표를 고른다.
+            if (!hold.borderPending) reselectAnchoredObject(doc, pages, hold.borderPage, hold.borderStory,
+                                                            hold.borderParagraph, hold.borderItem);
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
+        if (hold.moving) {
+            if (page == hold.movePage) {
+                hold.moveDX = x - hold.moveStartX;
+                hold.moveDY = y - hold.moveStartY;
+            }
+            hold.moving = false;
+            hold.movePending = hold.moveDX != 0 || hold.moveDY != 0;
+            hold.tracking = false;
+            hold.edgeActive = false;
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
         if (hold.resizeHandle >= 0) {
+            // 뗀 자리까지 크기에 넣는다.
+            if (!hold.boxes.empty() && hold.boxes.front().page == page) resizeObjectBox(hold, x, y);
             hold.resizeCommit = hold.resizeNewW > 0 &&
                                 (hold.resizeNewW != hold.resizeOldW || hold.resizeNewH != hold.resizeOldH);
             hold.resizeHandle = -1;
-            if (hold.resizeCommit) hold.selectedObject = nullptr;
+            // 그림이 아닌 개체는 문서의 그 컨트롤을 찾아 바꾼다(표는 칸까지). 그림은 원래 길(commitObjectResize)이다.
+            const Node* picked = hold.selectedObject;
+            if (hold.resizeCommit && picked && picked->role != "picture" && picked->ext().obj().anchorItem >= 0) {
+                hold.resizeCommit = false;
+                hold.resizeObjectPending = true;
+                hold.resizeStory = picked->ext().obj().anchorStory;
+                hold.resizeParagraph = picked->ext().obj().anchorParagraph;
+                hold.resizeItem = picked->ext().obj().anchorItem;
+                if (!hold.boxes.empty()) {
+                    hold.resizeNewLeft = hold.boxes.front().x;
+                    hold.resizeNewTop = hold.boxes.front().y;
+                }
+            }
+            if (hold.resizeCommit || hold.resizeObjectPending) hold.selectedObject = nullptr;
         }
         if (hold.clickDragged) {
             hold.clickCount = 0;
@@ -1805,17 +2257,53 @@ std::string hoverCursor(const model::Document& doc, const std::vector<Node>& pag
                         double handleRadius) {
     if (page < 0 || page >= static_cast<int>(pages.size())) return "default";
     const PointerHold& hold = pointerHold();
+    if (hold.drawTool != 0 && !readOnly()) return "crosshair";
     if (!readOnly() && (hold.boxes.empty() || hold.boxes.front().page == page)) {
         // 손잡이 번호는 왼쪽 위부터 0 1 2 / 3 4 / 5 6 7 이다.
         static const char* const kHandleCursor[8] = {"nwse-resize", "ns-resize", "nesw-resize", "ew-resize",
                                                      "ew-resize",   "nesw-resize", "ns-resize", "nwse-resize"};
         const int handle = objectHandleAt(hold, x, y, handleRadius);
         if (handle >= 0) return kHandleCursor[handle];
+        // 표 칸 경계선. 누를 때처럼 손잡이 다음이다.
+        TableBorderHit border;
+        if (tableBorderAt(doc, pages, page, x, y, handleRadius * 0.3, border)) {
+            if (border.index < 0) return "pointer";
+            return border.kind == 1 ? "col-resize" : "row-resize";
+        }
+        // 고른 띄운 개체 안은 끌어 옮기는 자리다.
+        if (hold.objectHandles && hold.selectedObject && !hold.selectedObject->treatAsChar &&
+            hold.selectedObject->ext().obj().anchorItem >= 0 && !hold.boxes.empty()) {
+            const HeldBox& box = hold.boxes.front();
+            if (box.page == page && x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height) {
+                return "move";
+            }
+        }
     }
     const PaperHit hit = hitPaper(doc, pages[static_cast<std::size_t>(page)], x, y, hold.bandStory, handleRadius * 0.3);
     // 머리말·꼬리말 편집 중에는 본문 줄 위도 글 커서를 보이지 않는다.
     if (hold.bandStory > 0 && hit.bandStory != hold.bandStory) return "default";
-    return hit.zone == ClickZone::Line ? "text" : "default";
+    if (hit.zone != ClickZone::Line) return "default";
+    return hit.line.turned ? "vertical-text" : "text";
+}
+
+void paint_detail::resizeControl(model::Control& ctrl, std::uint32_t oldW, std::uint32_t oldH, std::uint32_t newW,
+                   std::uint32_t newH) {
+    if (!ctrl.placement) return;
+    const double rx = oldW > 0 ? static_cast<double>(newW) / static_cast<double>(oldW) : 1.0;
+    const double ry = oldH > 0 ? static_cast<double>(newH) / static_cast<double>(oldH) : 1.0;
+    for (model::ShapePoint& pt : ctrl.points) {
+        pt.x = static_cast<std::int32_t>(std::llround(static_cast<double>(pt.x) * rx));
+        pt.y = static_cast<std::int32_t>(std::llround(static_cast<double>(pt.y) * ry));
+    }
+    applyObjectResize(*ctrl.placement, newW, newH);
+    // 저장된 글상자·캡션 폭은 새 크기로 맞춘다. 남겨 두면 줄 폭이 옛 크기로 잡힌다.
+    if (ctrl.boxTextWidth > 0) ctrl.boxTextWidth = ctrl.subLists.empty() || ctrl.subLists.front().textDirection == 0
+                                                       ? newW
+                                                       : newH;
+    if (ctrl.caption && (ctrl.caption->side == "TOP" || ctrl.caption->side == "BOTTOM") && ctrl.caption->lastWidth > 0) {
+        ctrl.caption->lastWidth =
+            newW + (ctrl.caption->fullSize ? static_cast<std::uint32_t>(std::max(0, ctrl.placement->marginLeft + ctrl.placement->marginRight)) : 0u);
+    }
 }
 
 bool commitObjectResize(model::Document& doc) {
@@ -1864,19 +2352,7 @@ bool commitObjectResize(model::Document& doc) {
         if (!ctrl.placement || ctrl.placement->width != oldW || ctrl.placement->height != oldH) return;
         if (!bin.empty() && ctrl.binItemId != bin) return;
         if (!role.empty() && std::string(model::controlKindName(ctrl.kind)) != role) return;
-        const double rx = oldW > 0 ? static_cast<double>(newW) / static_cast<double>(oldW) : 1.0;
-        const double ry = oldH > 0 ? static_cast<double>(newH) / static_cast<double>(oldH) : 1.0;
-        for (model::ShapePoint& pt : ctrl.points) {
-            pt.x = static_cast<std::int32_t>(std::llround(static_cast<double>(pt.x) * rx));
-            pt.y = static_cast<std::int32_t>(std::llround(static_cast<double>(pt.y) * ry));
-        }
-        applyObjectResize(*ctrl.placement, newW, newH);
-        // 저장된 글상자·캡션 폭은 새 크기로 맞춘다. 남겨 두면 줄 폭이 옛 크기로 잡힌다.
-        if (ctrl.boxTextWidth > 0) ctrl.boxTextWidth = newW;
-        if (ctrl.caption && (ctrl.caption->side == "TOP" || ctrl.caption->side == "BOTTOM") && ctrl.caption->lastWidth > 0) {
-            ctrl.caption->lastWidth =
-                newW + (ctrl.caption->fullSize ? static_cast<std::uint32_t>(std::max(0, ctrl.placement->marginLeft + ctrl.placement->marginRight)) : 0u);
-        }
+        resizeControl(ctrl, oldW, oldH, newW, newH);
         found = true;
     };
     for (model::Section& section : doc.sections) {
@@ -1954,7 +2430,7 @@ bool findPaintedBin(const model::Document& doc, const Node& node, std::int32_t o
             }
             const std::int32_t hx = item.x + child.x;
             const std::int32_t hy = item.y + child.y;
-            if (child.binItemId == bin && child.width == width && child.height == height) {
+            if (child.ext().obj().binItemId == bin && child.width == width && child.height == height) {
                 out = {&child, hx, hy, child.width, child.height};
                 return true;
             }
@@ -1963,7 +2439,7 @@ bool findPaintedBin(const model::Document& doc, const Node& node, std::int32_t o
         return false;
     }
     if (node.kind == NodeKind::Object && node.role != "caption" && node.role != "pageBorder" &&
-        node.role != "pageFill" && node.binItemId == bin && node.width == width && node.height == height) {
+        node.role != "pageFill" && node.ext().obj().binItemId == bin && node.width == width && node.height == height) {
         out = {&node, x, y, node.width, node.height};
         return true;
     }
@@ -2128,4 +2604,4 @@ std::vector<SelectionImage> pointerImages(const model::Document& doc, const std:
     return paintSelection(doc, pages, boxes, caret, hold.caretPage, hold.percent);
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

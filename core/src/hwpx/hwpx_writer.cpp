@@ -1,4 +1,4 @@
-#include "noting/hwpx/hwpx_writer.hpp"
+#include "chwp/hwpx/hwpx_writer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,15 +10,15 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "noting/container/zip.hpp"
-#include "noting/reader.hpp"
-#include "noting/unit.hpp"
+#include "chwp/container/zip.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/unit.hpp"
 
-namespace noting::hwpx {
+namespace chwp::hwpx {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 std::string serializeXml(const pugi::xml_document& doc) {
     std::ostringstream oss;
@@ -203,17 +203,21 @@ BinRegistry buildBinRegistry(const Document& doc, ByteView sourceData) {
 
 void writeFillBrushNode(pugi::xml_node parent, const std::string& faceColor,
                         const std::string& gradColor, std::int32_t gradAngle,
-                        const std::string& imageId, int imageMode, const BinRegistry& bins) {
+                        const std::string& imageId, int imageMode, const BinRegistry& bins,
+                        const std::string& hatchStyle = {}, const std::string& hatchColor = {}) {
     const bool hasFace = !faceColor.empty() && faceColor != "none";
     const bool hasGrad = !gradColor.empty() && gradColor != "none";
     const bool hasImg = !imageId.empty();
-    if (!hasFace && !hasGrad && !hasImg) return;
+    const bool hasHatch = !hatchStyle.empty() && hatchStyle != "NONE";
+    if (!hasFace && !hasGrad && !hasImg && !hasHatch) return;
 
     auto fb = parent.append_child("hc:fillBrush");
-    if (hasFace && !hasGrad) {
+    if ((hasFace || hasHatch) && !hasGrad) {
+        // 한글은 무늬만 있으면 faceColor 를 none 으로 적는다.
         auto wb = fb.append_child("hc:winBrush");
-        wb.append_attribute("faceColor") = faceColor.c_str();
-        wb.append_attribute("hatchColor") = "#000000";
+        wb.append_attribute("faceColor") = hasFace ? faceColor.c_str() : "none";
+        wb.append_attribute("hatchColor") = hasHatch && !hatchColor.empty() ? hatchColor.c_str() : "#000000";
+        if (hasHatch) wb.append_attribute("hatchStyle") = hatchStyle.c_str();
         wb.append_attribute("alpha") = "0";
     }
     if (hasGrad) {
@@ -348,7 +352,7 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
         writeBorderSide("hh:diagonal", bf.diagonal);
 
         writeFillBrushNode(node, bf.faceColor, bf.gradColor, bf.gradAngle, bf.imageId, bf.imageMode,
-                           bins);
+                           bins, bf.hatchStyle, bf.hatchColor);
     }
 
     // 3. charProperties (0-based ID)
@@ -614,10 +618,15 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
 void writeParagraphNode(pugi::xml_node parent, const Paragraph& para, const BinRegistry& bins,
                         const Section* firstParaSec = nullptr, std::size_t masterPageBaseIdx = 0);
 
+// 한글 2024 가 쓰는 글자 방향 이름과 같은 차례다.
+const char* textDirectionName(std::uint8_t dir) {
+    return dir == 2 ? "VERTICALALL" : (dir == 1 ? "VERTICAL" : "HORIZONTAL");
+}
+
 void writeSubListNode(pugi::xml_node parent, const SubList& sub, const BinRegistry& bins) {
     auto subList = parent.append_child("hp:subList");
     subList.append_attribute("id") = "";
-    subList.append_attribute("textDirection") = "HORIZONTAL";
+    subList.append_attribute("textDirection") = textDirectionName(sub.textDirection);
     subList.append_attribute("lineWrap") = "BREAK";
     subList.append_attribute("vertAlign") =
         sub.vertAlign.empty() ? "TOP" : sub.vertAlign.c_str();
@@ -642,11 +651,7 @@ void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinR
     const Placement p = ctrl.placement.value_or(Placement{});
     objNode.append_attribute("id") = defaultId;
     objNode.append_attribute("zOrder") = p.zOrder;
-    const char* numTypeStr = "NONE";
-    if (ctrl.kind == ControlKind::Table) numTypeStr = "TABLE";
-    else if (ctrl.kind == ControlKind::Picture) numTypeStr = "PICTURE";
-    else if (ctrl.kind == ControlKind::Equation) numTypeStr = "EQUATION";
-    objNode.append_attribute("numberingType") = numTypeStr;
+    objNode.append_attribute("numberingType") = objectNumberingType(ctrl.kind, p.numberingType);
     if (!grouped || !p.textWrap.empty()) {
         objNode.append_attribute("textWrap") =
             p.textWrap.empty() ? (p.treatAsChar ? "TOP_AND_BOTTOM" : "SQUARE") : p.textWrap.c_str();
@@ -712,6 +717,10 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
     const std::uint32_t pageStart =
         (secCtrl && secCtrl->number > 0) ? secCtrl->number
         : (secPtr ? secPtr->pageStart : 0);
+    // 격자는 구역 값이 기준이다. 편집은 구역만 고친다.
+    const std::int32_t lineGrid = secPtr ? secPtr->lineGrid : (secCtrl ? secCtrl->lineGrid : 0);
+    const std::int32_t charGrid = secPtr ? secPtr->charGrid : (secCtrl ? secCtrl->charGrid : 0);
+    const bool wongoji = secPtr ? secPtr->wongoji : (secCtrl && secCtrl->wongoji);
     const bool hideFirstHeader =
         (secCtrl && secCtrl->hideFirstHeader) || (secPtr && secPtr->hideFirstHeader);
     const bool hideFirstFooter =
@@ -723,7 +732,8 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
 
     auto secPr = runNode.append_child("hp:secPr");
     secPr.append_attribute("id") = "";
-    secPr.append_attribute("textDirection") = "HORIZONTAL";
+    secPr.append_attribute("textDirection") =
+        textDirectionName(secPtr ? secPtr->textDirection : (secCtrl ? secCtrl->textDirection : 0));
     secPr.append_attribute("spaceColumns") = colGap;
     secPr.append_attribute("tabStop") = defaultTab * 2;
     secPr.append_attribute("tabStopVal") = defaultTab;
@@ -735,9 +745,9 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
         static_cast<unsigned>(secPtr ? secPtr->masterPages.size() : 0);
 
     auto grid = secPr.append_child("hp:grid");
-    grid.append_attribute("lineGrid") = 0;
-    grid.append_attribute("charGrid") = 0;
-    grid.append_attribute("wonggojiFormat") = 0;
+    grid.append_attribute("lineGrid") = lineGrid;
+    grid.append_attribute("charGrid") = charGrid;
+    grid.append_attribute("wonggojiFormat") = wongoji ? 1 : 0;
 
     auto startNum = secPr.append_child("hp:startNum");
     startNum.append_attribute("pageStartsOn") = "BOTH";
@@ -758,9 +768,10 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
 
     auto pagePr = secPr.append_child("hp:pagePr");
     pagePr.append_attribute("landscape") = pd.landscape ? "NARROWLY" : "WIDELY";
-    pagePr.append_attribute("width") = pd.width;
-    pagePr.append_attribute("height") = pd.height;
-    pagePr.append_attribute("gutterType") = "LEFT_ONLY";
+    pagePr.append_attribute("width") = pd.storedWidth();
+    pagePr.append_attribute("height") = pd.storedHeight();
+    pagePr.append_attribute("gutterType") =
+        pd.gutterType == 1 ? "LEFT_RIGHT" : (pd.gutterType == 2 ? "TOP_BOTTOM" : "LEFT_ONLY");
 
     auto margin = pagePr.append_child("hp:margin");
     margin.append_attribute("left") = pd.marginLeft;
@@ -1737,5 +1748,5 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
     return zw.finalize(out, error);
 }
 
-}  // namespace noting::hwpx
+}  // namespace chwp::hwpx
 

@@ -1,11 +1,11 @@
-#include "noting/render/glyph_path.hpp"
+#include "chwp/render/glyph_path.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <utility>
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 int div3(std::int64_t value) { return static_cast<int>(value / 3); }
@@ -463,4 +463,4 @@ std::vector<GlyphCommand> commandsFromGgoNative(const std::uint8_t* data, int si
     return commands;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

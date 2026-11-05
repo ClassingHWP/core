@@ -15,7 +15,7 @@
 
 #include "export/font_metrics.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 // 1인치 = 7200 HWPUNIT. 화면 96dpi에서 1픽셀은 75 HWPUNIT이다.
@@ -592,7 +592,7 @@ std::string resolveFace(std::initializer_list<std::string_view> names) {
     for (std::string_view name : names) {
         if (name.empty()) continue;
         std::string face(name);
-        if (noting::layout::fontGlyphDesignAdvance(face, U'P') >= 0) return face;
+        if (chwp::layout::fontGlyphDesignAdvance(face, U'P') >= 0) return face;
     }
     return {};
 }
@@ -2169,7 +2169,7 @@ std::shared_ptr<const EquationFont> cachedEquationFont(const std::string& face) 
     auto sink = [](void* ctx, char32_t cp, std::int32_t advance) {
         static_cast<EquationFont*>(ctx)->advanceWidth.emplace(cp, advance);
     };
-    if (!noting::layout::fontCopyDesignAdvances(face, units, xAvg, cell, sink, font.get())) return empty;
+    if (!chwp::layout::fontCopyDesignAdvances(face, units, xAvg, cell, sink, font.get())) return empty;
     font->unitsPerEm = units;
     font->xAvgCharWidth = xAvg;
     font->winCell = cell;
@@ -2200,4 +2200,4 @@ EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUni
     return finishMeasure(parser);
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

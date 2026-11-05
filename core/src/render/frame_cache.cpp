@@ -1,4 +1,4 @@
-#include "noting/render/frame_cache.hpp"
+#include "chwp/render/frame_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -7,15 +7,15 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
-#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
 #include <thread>
-#endif
 
 #include "export/layout.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 constexpr int kPrepareBudget = 8;
@@ -162,7 +162,9 @@ int pageCachePercent(int percent) {
 
 int restingMaskZoom(int percent) { return maskZoomPercent(pageCachePercent(percent), false); }
 
-FrameCache::FrameCache() { registerCachePool(pool_, kNoCacheBudget); }
+FrameCache::FrameCache() { registerCachePool(pool_, kTileCacheBudget); }
+
+FrameCache::FrameCache(int firstId) : FrameCache() { nextId_ = firstId; }
 
 FrameCache::~FrameCache() { unregisterCachePool(pool_); }
 
@@ -173,6 +175,109 @@ std::size_t FrameCache::bitmapBytes() const {
         for (const RecycledTile& recycled : bucket) total += recycled.tile.bitmap.rgba.size();
     }
     return total;
+}
+
+std::size_t FrameCache::catalogBytes() const {
+    const auto descBytes = [](const FrameDesc& d) { return sizeof(FrameDesc) + d.path.capacity() * sizeof(int); };
+    std::size_t total = 0;
+    for (const auto& [id, desc] : catalog_) total += descBytes(desc) + 32;
+    for (const auto& [id, tile] : tiles_) total += sizeof(Tile) + tile.key.capacity() + tile.desc.path.capacity() * sizeof(int) + 32;
+    {
+        std::lock_guard lock(idMu_);
+        for (const auto& [key, id] : ids_) total += key.capacity() + sizeof(int) + 48;
+    }
+    std::lock_guard lock(pageFramesMu_);
+    for (const auto& [page, frames] : pageFrames_) {
+        if (!frames) continue;
+        for (const CachedFrameEntry& entry : frames->entries) total += descBytes(entry.baseDesc) + entry.key.capacity() + 32;
+        total += (frames->byYOrder.capacity() + frames->byHuYOrder.capacity()) * sizeof(std::size_t) +
+                 frames->maxHuBottomPrefix.capacity() * sizeof(std::int32_t);
+    }
+    return total;
+}
+
+void FrameCache::setFocus(int firstPage, int lastPage) {
+    focusFirst_ = firstPage;
+    focusLast_ = std::max(firstPage, lastPage);
+}
+
+int FrameCache::focusGap(int page) const {
+    if (focusFirst_ < 0) return 0;
+    if (page < focusFirst_) return focusFirst_ - page;
+    if (page > focusLast_) return page - focusLast_;
+    return 0;
+}
+
+std::size_t FrameCache::evictPage(int page) {
+    const auto found = pageTiles_.find(page);
+    if (found == pageTiles_.end()) return 0;
+    std::size_t freed = 0;
+    {
+        std::lock_guard lock(idMu_);
+        for (const int id : found->second) {
+            const auto tile = tiles_.find(id);
+            if (tile == tiles_.end()) continue;
+            freed += tile->second.bitmap.rgba.size();
+            tiles_.erase(tile);
+            tileIds_.erase(id);
+            nonBaseTiles_.erase(id);
+            dropScreenSprite(id);
+        }
+    }
+    pageTiles_.erase(found);
+    baseDone_.erase(page);
+    pageStamps_[page] = ++stamp_;
+    evictedPages_.push_back(page);
+    return freed;
+}
+
+std::size_t FrameCache::releaseTiles(CacheTier tier, std::size_t need) {
+    if (tier == CacheTier::Spare) {
+        std::size_t freed = 0;
+        for (const auto& [hash, bucket] : recycledByHash_) {
+            for (const RecycledTile& recycled : bucket) freed += recycled.tile.bitmap.rgba.size();
+        }
+        flushRecycledTiles();
+        return freed;
+    }
+    std::vector<std::pair<int, int>> far;
+    for (const auto& [page, ids] : pageTiles_) {
+        if (!ids.empty()) far.emplace_back(focusGap(page), page);
+    }
+    std::sort(far.begin(), far.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second > b.second;
+    });
+    // 보이는 쪽과 바로 옆 쪽은 스크롤하면 곧 들어오니 남긴다.
+    constexpr int kMinKeepRadius = 1;
+    std::size_t freed = 0;
+    for (const auto& [gap, page] : far) {
+        if (freed >= need || gap <= kMinKeepRadius) break;
+        if (tier == CacheTier::Recent) {
+            if (keepRadius_ < 0 || gap <= keepRadius_) break;
+        } else {
+            keepRadius_ = keepRadius_ < 0 ? gap - 1 : std::min(keepRadius_, gap - 1);
+        }
+        freed += evictPage(page);
+    }
+    return freed;
+}
+
+bool FrameCache::keepWithinBudget() {
+    const int before = keepRadius_;
+    enforceCacheBudget(pool_);
+    const std::size_t budget = cacheBudget(pool_);
+    // 편집·배율 바꿈으로 칸이 많이 비면 다시 끝까지 미리 굽는다. 넘으면 그때 또 줄인다.
+    if (keepRadius_ >= 0 && keepRadius_ == before && (budget == kNoCacheBudget || bitmapBytes() < budget / 2)) {
+        keepRadius_ = -1;
+    }
+    return keepRadius_ != before;
+}
+
+std::vector<int> FrameCache::takeEvictedPages() {
+    std::vector<int> pages = std::move(evictedPages_);
+    evictedPages_.clear();
+    return pages;
 }
 
 void FrameCache::flushRecycledTiles() {
@@ -310,6 +415,8 @@ void FrameCache::clear() {
     }
     baseDone_.clear();
     ready_.clear();
+    keepRadius_ = -1;
+    evictedPages_.clear();
     ++stamp_;
 }
 
@@ -376,6 +483,33 @@ void FrameCache::shiftPages(int fromPage, int delta) {
         if (next >= 0) shiftedBase.insert(next);
     }
     baseDone_ = std::move(shiftedBase);
+}
+
+// 칸 번호는 키로 정해져서, 문서를 통째로 다시 놓으면 같은 개체·줄이 같은 번호를 다시 받는다.
+// 옛 칸을 버리며 적어 둔 번호가 지금 칸 목록이나 캐시에 다시 쓰이면 빼고 넘긴다.
+// 넘기면 셸·일꾼이 그 번호의 굽기 일감을 버려 새 칸(그림·도형)이 끝내 구워지지 않는다.
+std::vector<int> FrameCache::takePendingDrops() {
+    std::vector<int> drop = std::move(pendingDrop_);
+    pendingDrop_.clear();
+    if (drop.empty()) return drop;
+    std::unordered_set<int> live;
+    for (const auto& [id, tile] : tiles_) live.insert(id);
+    for (const auto& [id, desc] : catalog_) live.insert(id);
+    {
+        std::lock_guard lock(pageFramesMu_);
+        for (const auto& [page, frames] : pageFrames_) {
+            if (!frames) continue;
+            for (const CachedFrameEntry& entry : frames->entries) live.insert(entry.baseDesc.id);
+        }
+    }
+    std::vector<int> stale;
+    stale.reserve(drop.size());
+    std::unordered_set<int> seen;
+    for (const int id : drop) {
+        if (live.count(id) || !seen.insert(id).second) continue;
+        stale.push_back(id);
+    }
+    return stale;
 }
 
 void FrameCache::prepareForFullRelayout() {
@@ -540,7 +674,22 @@ void FrameCache::reconcilePageTiles(int page, const CachedPageFrames& built) {
             changed = true;
             continue;
         }
-        if (tile.percent != 100 || !now) continue;
+        // 글자가 같은 줄이 다른 문단·시작 위치로 옮겨 가도 칸은 그대로 쓴다. 글자의 문단 위치만 지금 줄로 옮긴다.
+        if (now->lineStory != tile.desc.lineStory || now->lineParagraph != tile.desc.lineParagraph ||
+            now->lineStart != tile.desc.lineStart) {
+            const int deltaOff =
+                (now->lineStart >= 0 && tile.desc.lineStart >= 0) ? (now->lineStart - tile.desc.lineStart) : 0;
+            if (tile.hasGlyphs) cloneAndAdjustFrameGlyphs(id, id, now->lineStory, now->lineParagraph, deltaOff, 0, 0);
+            tile.desc.lineStory = now->lineStory;
+            tile.desc.lineParagraph = now->lineParagraph;
+            tile.desc.lineStart = now->lineStart;
+            if (const auto listed = catalog_.find(id); listed != catalog_.end()) {
+                listed->second.lineStory = now->lineStory;
+                listed->second.lineParagraph = now->lineParagraph;
+                listed->second.lineStart = now->lineStart;
+            }
+        }
+        if (tile.percent != 100) continue;
         if (tile.desc.x == now->x && tile.desc.y == now->y && tile.desc.huX == now->huX && tile.desc.huY == now->huY &&
             tile.desc.huW == now->huW && tile.desc.huH == now->huH) {
             continue;
@@ -555,7 +704,6 @@ void FrameCache::reconcilePageTiles(int page, const CachedPageFrames& built) {
         tile.desc.huH = now->huH;
         tile.desc.originX = now->originX;
         tile.desc.originY = now->originY;
-        tile.desc.lineStart = now->lineStart;
         tile.stamp = ++stamp_;
         catalog_[id] = tile.desc;
         changed = true;
@@ -916,8 +1064,7 @@ void FrameCache::plan(ViewPlan& plan, const std::vector<Node>& pages, const std:
     }
     if (catalogsCurrent && screenCrewFastPath && (scaleOnly || percent <= 100) && recycledByHash_.empty() &&
         recycledOldIds_.empty()) {
-        std::vector<int> drop = std::move(pendingDrop_);
-        pendingDrop_.clear();
+        std::vector<int> drop = takePendingDrops();
         for (auto it = nonBaseTiles_.begin(); it != nonBaseTiles_.end();) {
             const int id = *it;
             const auto tileIt = tiles_.find(id);
@@ -1052,8 +1199,7 @@ void FrameCache::plan(ViewPlan& plan, const std::vector<Node>& pages, const std:
         return a.pageX + a.frame.x < b.pageX + b.frame.x;
     });
 
-    std::vector<int> drop = std::move(pendingDrop_);
-    pendingDrop_.clear();
+    std::vector<int> drop = takePendingDrops();
     if (!nonBaseTiles_.empty() || !transientCatalog_.empty()) {
         std::unordered_set<std::string> wantedKeys;
         std::unordered_set<std::string> readyNow;
@@ -1442,12 +1588,6 @@ FramePrepare FrameCache::bake(const model::Document& doc, const std::vector<Node
     std::vector<PageBitmap> bitmaps(queued.size());
     int usedThreads = 1;
     const int count = static_cast<int>(queued.size());
-#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-    for (int i = 0; i < count; ++i) {
-        const QueuedFrame& work = queued[static_cast<std::size_t>(i)];
-        bitmaps[static_cast<std::size_t>(i)] = renderFrame(doc, pages[static_cast<std::size_t>(work.page)], work.frame);
-    }
-#else
     const int threads = layout::workerCount(count);
     if (threads <= 1) {
         for (int i = 0; i < count; ++i) {
@@ -1471,7 +1611,6 @@ FramePrepare FrameCache::bake(const model::Document& doc, const std::vector<Node
         }
         for (std::thread& worker : pool) worker.join();
     }
-#endif
     for (int i = 0; i < count; ++i) {
         QueuedFrame& work = queued[static_cast<std::size_t>(i)];
         PageBitmap bitmap = std::move(bitmaps[static_cast<std::size_t>(i)]);
@@ -1506,7 +1645,7 @@ FramePrepare FrameCache::bake(const model::Document& doc, const std::vector<Node
     }
     out.made = count;
     out.done = !more;
-    std::string line = "[noting] 스레드 " + std::to_string(usedThreads) + " 칸 " + std::to_string(count);
+    std::string line = "[ClassingHWP] 스레드 " + std::to_string(usedThreads) + " 칸 " + std::to_string(count);
     std::vector<int> seen;
     for (const QueuedFrame& work : queued) {
         if (std::find(seen.begin(), seen.end(), work.page) != seen.end()) continue;
@@ -1522,6 +1661,106 @@ FramePrepare FrameCache::bake(const model::Document& doc, const std::vector<Node
     }
     std::fprintf(stderr, "%s\n", line.c_str());
     return out;
+}
+
+void FrameCache::queueNear(const model::Document& doc, std::vector<Node>& pages, const ViewPlan& plan, int percent,
+                           bool baseNear, int margin, int budget, std::vector<QueuedFrame>& queued, bool& more) {
+    for (const ViewPage& page : plan.pages) {
+        if (page.index < 0 || page.index >= static_cast<int>(pages.size())) continue;
+        if (!ready_.empty() && !ready_.count(page.index)) continue;
+        if (!hits(page.x, page.y, page.w, page.h, plan.scrollX - margin, plan.scrollY - margin,
+                  plan.viewW + margin * 2, plan.viewH + margin * 2)) {
+            continue;
+        }
+        ensurePageSpans(doc, pages[static_cast<std::size_t>(page.index)]);
+        const Node& scene = pages[static_cast<std::size_t>(page.index)];
+        const int pixelH = pagePixelHeight(scene.height, percent);
+        if (pixelH < 32 || scene.height <= 0) continue;
+        const auto cachedPtr = ensurePageFrames(page.index, scene, &doc);
+        const CachedPageFrames& cached = *cachedPtr;
+        const FrameCull cull =
+            pageCull(page, scene.height, pixelH, plan.scrollX, plan.scrollY, plan.viewW, plan.viewH, margin);
+        const float scale = static_cast<float>(pixelH) / static_cast<float>(scene.height);
+        struct IdleCand {
+            FrameDesc frame;
+            std::string key;
+            const FrameDesc* base = nullptr;
+        };
+        std::vector<IdleCand> frames;
+        for (const CachedFrameEntry& entry : cached.entries) {
+            if (missesCull(entry.baseDesc, cull)) continue;
+            FrameDesc frame = scaleCachedFrame(entry.baseDesc, percent, pixelH, scale);
+            if (percent == 100) frame.id = entry.baseDesc.id;
+            frames.push_back(IdleCand{std::move(frame), entry.key, &entry.baseDesc});
+        }
+        const int total = static_cast<int>(frames.size());
+        std::stable_sort(frames.begin(), frames.end(), [&](const IdleCand& ca, const IdleCand& cb) {
+            const FrameDesc& a = ca.frame;
+            const FrameDesc& b = cb.frame;
+            const int ga = outsideGap(page.x + a.x, page.y + a.y, a.w, a.h, plan.scrollX, plan.scrollY, plan.viewW,
+                                      plan.viewH);
+            const int gb = outsideGap(page.x + b.x, page.y + b.y, b.w, b.h, plan.scrollX, plan.scrollY, plan.viewW,
+                                      plan.viewH);
+            if (ga != gb) return ga < gb;
+            if (ga == 0) {
+                const int bandA = std::max(0, page.y + a.y - plan.scrollY) / 160;
+                const int bandB = std::max(0, page.y + b.y - plan.scrollY) / 160;
+                if (bandA != bandB) return bandA < bandB;
+                const bool aObj = a.kind != 0;
+                const bool bObj = b.kind != 0;
+                if (aObj != bObj) return aObj;
+            }
+            if (a.y != b.y) return a.y < b.y;
+            return a.x < b.x;
+        });
+        for (IdleCand& cand : frames) {
+            FrameDesc& frame = cand.frame;
+            // 화면 밖 줄 칸은 여기서 굽지 않는다. 전진폭과 자리는 유휴가 적는다.
+            if (frame.kind == 0 &&
+                !hits(page.x + frame.x, page.y + frame.y, frame.w, frame.h, plan.scrollX, plan.scrollY, plan.viewW,
+                      plan.viewH)) {
+                continue;
+            }
+            if (baseNear) {
+                // 화면 자리로 고르고, 굽는 것은 100% 칸이다.
+                if (tiles_.count(cand.base->id)) continue;
+                if (!recycledByHash_.empty() && tryAdoptRecycledTile(*cand.base, page.index, 100)) continue;
+                if (static_cast<int>(queued.size()) >= budget) {
+                    more = true;
+                    break;
+                }
+                queued.push_back(QueuedFrame{*cand.base, page.index, 100, total});
+                continue;
+            }
+            frame.percent = percent;
+            if (!canBakeFrame(frame)) continue;
+            if (percent != 100) frame.id = idFor(cand.key, percent);
+            if (tiles_.count(frame.id)) continue;
+            if (!recycledByHash_.empty() && tryAdoptRecycledTile(frame, page.index, percent)) continue;
+            if (static_cast<int>(queued.size()) >= budget) {
+                more = true;
+                break;
+            }
+            queued.push_back(QueuedFrame{std::move(frame), page.index, percent, total});
+        }
+        if (more) break;
+    }
+}
+
+FramePrepare FrameCache::prepareView(const model::Document& doc, std::vector<Node>& pages, const ViewPlan& plan,
+                                     int maxTiles) {
+    if (plan.viewW <= 0 || plan.viewH <= 0) return {};
+    const int percent = plan.percent > 0 ? plan.percent : 100;
+    int visiblePages = 0;
+    for (const ViewPage& page : plan.pages) {
+        if (hits(page.x, page.y, page.w, page.h, plan.scrollX, plan.scrollY, plan.viewW, plan.viewH)) ++visiblePages;
+    }
+    // 여러 쪽 축소 보기는 plan 처럼 100% 칸을 줄여 쓴다.
+    const bool baseNear = overviewZoom(visiblePages, percent);
+    std::vector<QueuedFrame> queued;
+    bool more = false;
+    queueNear(doc, pages, plan, percent, baseNear, 0, std::max(1, maxTiles), queued, more);
+    return bake(doc, pages, std::move(queued), more);
 }
 
 IdleStep FrameCache::prepareIdle(const model::Document& doc, std::vector<Node>& pages, const ViewPlan& plan) {
@@ -1546,86 +1785,7 @@ IdleStep FrameCache::prepareIdle(const model::Document& doc, std::vector<Node>& 
         const int budget = std::max(kPrepareBudget, layout::workerCount(256));
         std::vector<QueuedFrame> queued;
         bool more = false;
-        for (const ViewPage& page : plan.pages) {
-            if (page.index < 0 || page.index >= static_cast<int>(pages.size())) continue;
-            if (!ready_.empty() && !ready_.count(page.index)) continue;
-            if (!hits(page.x, page.y, page.w, page.h, plan.scrollX - margin, plan.scrollY - margin,
-                      plan.viewW + margin * 2, plan.viewH + margin * 2)) {
-                continue;
-            }
-            ensurePageSpans(doc, pages[static_cast<std::size_t>(page.index)]);
-            const Node& scene = pages[static_cast<std::size_t>(page.index)];
-            const int pixelH = pagePixelHeight(scene.height, percent);
-            if (pixelH < 32 || scene.height <= 0) continue;
-            const auto cachedPtr = ensurePageFrames(page.index, scene, &doc);
-            const CachedPageFrames& cached = *cachedPtr;
-            const FrameCull cull =
-                pageCull(page, scene.height, pixelH, plan.scrollX, plan.scrollY, plan.viewW, plan.viewH, margin);
-            const float scale = static_cast<float>(pixelH) / static_cast<float>(scene.height);
-            struct IdleCand {
-                FrameDesc frame;
-                std::string key;
-                const FrameDesc* base = nullptr;
-            };
-            std::vector<IdleCand> frames;
-            for (const CachedFrameEntry& entry : cached.entries) {
-                if (missesCull(entry.baseDesc, cull)) continue;
-                FrameDesc frame = scaleCachedFrame(entry.baseDesc, percent, pixelH, scale);
-                if (percent == 100) frame.id = entry.baseDesc.id;
-                frames.push_back(IdleCand{std::move(frame), entry.key, &entry.baseDesc});
-            }
-            const int total = static_cast<int>(frames.size());
-            std::stable_sort(frames.begin(), frames.end(), [&](const IdleCand& ca, const IdleCand& cb) {
-                const FrameDesc& a = ca.frame;
-                const FrameDesc& b = cb.frame;
-                const int ga = outsideGap(page.x + a.x, page.y + a.y, a.w, a.h, plan.scrollX, plan.scrollY, plan.viewW,
-                                          plan.viewH);
-                const int gb = outsideGap(page.x + b.x, page.y + b.y, b.w, b.h, plan.scrollX, plan.scrollY, plan.viewW,
-                                          plan.viewH);
-                if (ga != gb) return ga < gb;
-                if (ga == 0) {
-                    const int bandA = std::max(0, page.y + a.y - plan.scrollY) / 160;
-                    const int bandB = std::max(0, page.y + b.y - plan.scrollY) / 160;
-                    if (bandA != bandB) return bandA < bandB;
-                    const bool aObj = a.kind != 0;
-                    const bool bObj = b.kind != 0;
-                    if (aObj != bObj) return aObj;
-                }
-                if (a.y != b.y) return a.y < b.y;
-                return a.x < b.x;
-            });
-            for (IdleCand& cand : frames) {
-                FrameDesc& frame = cand.frame;
-                // 화면 밖 줄 칸은 여기서 굽지 않는다. 전진폭과 자리는 유휴가 적는다.
-                if (frame.kind == 0 &&
-                    !hits(page.x + frame.x, page.y + frame.y, frame.w, frame.h, plan.scrollX, plan.scrollY, plan.viewW,
-                          plan.viewH)) {
-                    continue;
-                }
-                if (baseNear) {
-                    // 화면 자리로 고르고, 굽는 것은 100% 칸이다.
-                    if (tiles_.count(cand.base->id)) continue;
-                    if (!recycledByHash_.empty() && tryAdoptRecycledTile(*cand.base, page.index, 100)) continue;
-                    if (static_cast<int>(queued.size()) >= budget) {
-                        more = true;
-                        break;
-                    }
-                    queued.push_back(QueuedFrame{*cand.base, page.index, 100, total});
-                    continue;
-                }
-                frame.percent = percent;
-                if (!canBakeFrame(frame)) continue;
-                if (percent != 100) frame.id = idFor(cand.key, percent);
-                if (tiles_.count(frame.id)) continue;
-                if (!recycledByHash_.empty() && tryAdoptRecycledTile(frame, page.index, percent)) continue;
-                if (static_cast<int>(queued.size()) >= budget) {
-                    more = true;
-                    break;
-                }
-                queued.push_back(QueuedFrame{std::move(frame), page.index, percent, total});
-            }
-            if (more) break;
-        }
+        queueNear(doc, pages, plan, percent, baseNear, margin, budget, queued, more);
         if (!queued.empty()) {
             const FramePrepare baked = bake(doc, pages, std::move(queued), more);
             if (baked.made > 0) {
@@ -1659,7 +1819,7 @@ IdleStep FrameCache::prepareIdle(const model::Document& doc, std::vector<Node>& 
     for (const int page : order) {
         if (page < 0 || page >= pageCount) continue;
         if (!ready_.empty() && !ready_.count(page)) continue;
-        if (baseDone_.count(page)) continue;
+        if (baseDone_.count(page) || !withinKeep(page)) continue;
         ensurePageSpans(doc, pages[static_cast<std::size_t>(page)]);
         const Node& scene = pages[static_cast<std::size_t>(page)];
         const auto cachedPtr = ensurePageFrames(page, scene, &doc);
@@ -1783,4 +1943,124 @@ void FrameCache::bakeVisibleNow(const model::Document& doc, std::vector<Node>& p
     }
 }
 
-}  // namespace noting::render
+namespace {
+
+// 같은 칸의 두 배율 중 cand 가 cur 보다 목표에 맞는가.
+bool betterPercent(int cand, int cur, int target) {
+    if (cand == cur) return false;
+    if (cand == target) return true;
+    if (cur == target) return false;
+    if (target == 100) return cand < cur;
+    if (cand == 100) return false;
+    if (cur == 100) return true;
+    const int dc = std::abs(cand - target);
+    const int d0 = std::abs(cur - target);
+    if (dc != d0) return dc < d0;
+    return cand > cur;
+}
+
+}  // namespace
+
+std::vector<PageSprite> readyPageSprites(const FrameCache& frames, int page, int targetPercent, bool* multiPercent) {
+    std::vector<PageSprite> sprites;
+    std::unordered_map<std::string_view, std::size_t> placedByKey;
+    int firstTilePercent = -1;
+    bool mixed = false;
+    frames.forReadyPageTiles(page, [&](const FrameCache::ReadyTile& ready) {
+        if (!ready.desc || !ready.bitmap) return;
+        const FrameDesc& frame = *ready.desc;
+        const int framePercent = ready.percent;
+        const bool hasBitmap = ready.bitmap->width > 1 && ready.bitmap->height > 1 && !ready.bitmap->rgba.empty();
+        if (!hasBitmap && !ready.hasGlyphs) return;
+        if (frame.w <= 0 || frame.h <= 0) return;
+        if (firstTilePercent < 0) firstTilePercent = framePercent;
+        else if (firstTilePercent != framePercent) mixed = true;
+        const std::string_view key = ready.key ? std::string_view(*ready.key) : std::string_view{};
+        const auto found = key.empty() ? placedByKey.end() : placedByKey.find(key);
+        if (found != placedByKey.end()) {
+            if (!betterPercent(framePercent, sprites[found->second].percent, targetPercent)) return;
+        }
+        PageSprite item;
+        item.id = frame.id;
+        item.stamp = ready.stamp;
+        item.frameX = frame.x;
+        item.frameY = frame.y;
+        item.frameW = frame.w;
+        item.frameH = frame.h;
+        item.srcPixelH = frame.pixelHeight;
+        item.localX = frame.x;
+        item.localY = frame.y;
+        item.w = frame.w;
+        item.h = frame.h;
+        item.sw = ready.bitmap->width;
+        item.sh = ready.bitmap->height;
+        item.nearest = frame.kind >= 3;
+        item.percent = framePercent;
+        item.rgba = hasBitmap ? ready.bitmap->rgba.data() : nullptr;
+        item.layer = std::clamp(frame.layer, 0, 3);
+        item.z = frame.z;
+        item.rank = frame.rank;
+        item.huX = frame.huX;
+        item.huY = frame.huY;
+        item.huW = frame.huW;
+        item.huH = frame.huH;
+        if (found != placedByKey.end()) {
+            sprites[found->second] = item;
+        } else {
+            if (!key.empty()) placedByKey.emplace(key, sprites.size());
+            sprites.push_back(item);
+        }
+    });
+    std::stable_sort(sprites.begin(), sprites.end(), [](const PageSprite& a, const PageSprite& b) {
+        if (a.layer != b.layer) return a.layer < b.layer;
+        if (a.z != b.z) return a.z < b.z;
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (a.huY != b.huY) return a.huY < b.huY;
+        if (a.huX != b.huX) return a.huX < b.huX;
+        if (a.frameY != b.frameY) return a.frameY < b.frameY;
+        return a.frameX < b.frameX;
+    });
+    if (multiPercent) *multiPercent = mixed;
+    return sprites;
+}
+
+void placePageSprites(std::vector<PageSprite>& sprites, int spriteZoom, int dstPixelH, std::int32_t pageHeightHu) {
+    const auto framePxAt = [](std::int32_t hu, float scale) {
+        return static_cast<int>(hu * scale + (hu < 0 ? -0.5f : 0.5f));
+    };
+    const float dstScale = (pageHeightHu > 0 && dstPixelH > 0)
+                               ? (static_cast<float>(dstPixelH) / static_cast<float>(pageHeightHu))
+                               : 0.f;
+    for (PageSprite& item : sprites) {
+        int localX = item.frameX;
+        int localY = item.frameY;
+        int localW = item.frameW;
+        int localH = item.frameH;
+        const int srcPixelH = item.srcPixelH;
+        if (item.percent != spriteZoom || (srcPixelH > 0 && dstPixelH > 0 && dstPixelH != srcPixelH)) {
+            if (dstPixelH > 0 && srcPixelH > 0) {
+                int dstX = item.frameX;
+                int dstY = item.frameY;
+                if (dstScale > 0.f) {
+                    dstX = framePxAt(item.huX, dstScale) - kFramePad;
+                    dstY = framePxAt(item.huY, dstScale) - kFramePad;
+                } else {
+                    const double ratio = static_cast<double>(dstPixelH) / static_cast<double>(srcPixelH);
+                    dstX = static_cast<int>(std::lround(static_cast<double>(item.frameX + kFramePad) * ratio)) -
+                           kFramePad;
+                    dstY = static_cast<int>(std::lround(static_cast<double>(item.frameY + kFramePad) * ratio)) -
+                           kFramePad;
+                }
+                const int srcW = item.sw > 1 ? item.sw : item.frameW;
+                const int srcH = item.sh > 1 ? item.sh : item.frameH;
+                placeZoomedFrame(dstX, dstY, dstPixelH, srcPixelH, srcW, srcH, localX, localY, localW, localH);
+            }
+        }
+        item.localX = localX;
+        item.localY = localY;
+        item.w = std::max(1, localW);
+        item.h = std::max(1, localH);
+    }
+}
+
+}  // namespace chwp::render

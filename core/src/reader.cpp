@@ -1,16 +1,16 @@
-#include "noting/reader.hpp"
+#include "chwp/reader.hpp"
 
 #include <cctype>
 #include <memory>
 #include <mutex>
 
-#include "noting/container/cfb.hpp"
-#include "noting/container/zip.hpp"
-#include "noting/hwp/hwp_reader.hpp"
-#include "noting/hwp/records.hpp"
-#include "noting/hwpx/hwpx_reader.hpp"
+#include "chwp/container/cfb.hpp"
+#include "chwp/container/zip.hpp"
+#include "chwp/hwp/hwp_reader.hpp"
+#include "chwp/hwp/records.hpp"
+#include "chwp/hwpx/hwpx_reader.hpp"
 
-namespace noting {
+namespace chwp {
 
 model::SourceFormat detectFormat(ByteView data) {
     if (cfb::CompoundFile::isCompoundFile(data)) return model::SourceFormat::Hwp;
@@ -19,9 +19,13 @@ model::SourceFormat detectFormat(ByteView data) {
 }
 
 ParseResult parseDocument(ByteView data, const ParseOptions& options) {
+    const auto numbered = [](ParseResult result) {
+        if (result.ok) model::ensureParagraphIds(result.document);
+        return result;
+    };
     switch (detectFormat(data)) {
-        case model::SourceFormat::Hwp: return hwp::parse(data, options);
-        case model::SourceFormat::Hwpx: return hwpx::parse(data, options);
+        case model::SourceFormat::Hwp: return numbered(hwp::parse(data, options));
+        case model::SourceFormat::Hwpx: return numbered(hwpx::parse(data, options));
         case model::SourceFormat::Unknown: break;
     }
     ParseResult result;
@@ -114,4 +118,4 @@ const char* formatName(model::SourceFormat format) {
     return "Unknown";
 }
 
-}  // namespace noting
+}  // namespace chwp

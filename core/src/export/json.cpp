@@ -1,10 +1,10 @@
-#include "noting/export/json.hpp"
+#include "chwp/export/json.hpp"
 
 #include <cstdio>
 
-#include "noting/reader.hpp"
+#include "chwp/reader.hpp"
 
-namespace noting {
+namespace chwp {
 
 void JsonWriter::newline() {
     if (!pretty_) return;
@@ -109,7 +109,7 @@ void JsonWriter::writeUnsigned(std::uint64_t v) {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 void writeColor(JsonWriter& w, std::string_view name, const Color& color) {
     w.key(name);
@@ -610,4 +610,4 @@ std::string parseResultToJson(const ParseResult& result, const JsonOptions& opti
     return w.take();
 }
 
-}  // namespace noting
+}  // namespace chwp

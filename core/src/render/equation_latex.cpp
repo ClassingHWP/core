@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 enum class Kind { End, Space, Word, Number, Symbol, Thin, Wide, LBrace, RBrace, Hash, Amp, Sup, Sub, Quote };
@@ -878,4 +878,4 @@ std::string hangulEquationToLatex(std::string_view script) {
     return parser.lines();
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

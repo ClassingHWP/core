@@ -7,37 +7,37 @@
 #include <string_view>
 #include <vector>
 
-#include "noting/model/document.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/model/document.hpp"
+#include "chwp/render/scene.hpp"
 #include "render/line_breaker.hpp"
 
-namespace noting::render::detail {
+namespace chwp::render::detail {
 
-using noting::model::Bullet;
-using noting::model::Caption;
-using noting::model::CharShape;
-using noting::model::Control;
-using noting::model::ControlKind;
-using noting::model::Document;
-using noting::model::InlineItem;
-using noting::model::Lang;
-using noting::model::MasterPage;
-using noting::model::Numbering;
-using noting::model::PageDef;
-using noting::model::PageBorderFill;
-using noting::model::BorderFill;
-using noting::model::BorderSide;
-using noting::model::ParaHead;
-using noting::model::Paragraph;
-using noting::model::Run;
-using noting::model::SubList;
-using noting::model::ParaShape;
-using noting::model::Table;
-using noting::model::TableCell;
-using noting::model::Placement;
-using noting::model::LineSeg;
-using noting::model::NoteShape;
-using noting::model::Section;
+using chwp::model::Bullet;
+using chwp::model::Caption;
+using chwp::model::CharShape;
+using chwp::model::Control;
+using chwp::model::ControlKind;
+using chwp::model::Document;
+using chwp::model::InlineItem;
+using chwp::model::Lang;
+using chwp::model::MasterPage;
+using chwp::model::Numbering;
+using chwp::model::PageDef;
+using chwp::model::PageBorderFill;
+using chwp::model::BorderFill;
+using chwp::model::BorderSide;
+using chwp::model::ParaHead;
+using chwp::model::Paragraph;
+using chwp::model::Run;
+using chwp::model::SubList;
+using chwp::model::ParaShape;
+using chwp::model::Table;
+using chwp::model::TableCell;
+using chwp::model::Placement;
+using chwp::model::LineSeg;
+using chwp::model::NoteShape;
+using chwp::model::Section;
 
 struct HeadingState {
     struct Group {
@@ -97,8 +97,17 @@ std::int32_t glyphWidth(const Document& doc, char32_t cp, const CharShape& face)
 bool textAvoids(const std::string& wrap);
 bool visualObject(const Control& control);
 bool occupiesBodyLine(const Control& control);
+// deferSpans 면 안쪽 칸·글상자·캡션의 lineSeg 가 있는 줄은 글자 묶음을 그 쪽을 그릴 때 채운다.
 Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Document& doc, int depth,
-                std::int32_t defaultTab, bool useStoredLineHeight);
+                std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans = false);
+// 세로쓰기 틀의 개체 자리와 상자(scene.cpp). 개체는 세운 그대로라 틀에서는 너비·높이가 바뀐다.
+Placement turnedPlacement(const Placement& p);
+// 문단 runs 의 항목을 차례로 센 번호. 없으면 -1 이다. 개체 노드가 문서의 그 컨트롤을 가리킬 때 쓴다.
+int itemOrdinal(const model::Paragraph& para, const model::Control* control);
+Node uprightObject(Node object);
+// 세로쓰기 틀의 원자 폭. 세운 글자는 1em, 눕힌 글자는 가로 폭, 모두 4의 배수로 내리고 자간은 그 폭으로 잰다.
+// 글자처럼 넣은 개체는 세운 높이와 위·아래 여백이다. 원자마다 한 번만 넣는다.
+void verticalAtom(const Document& doc, Atom& atom, int direction);
 
 bool paragraphStartsPage(const Paragraph& para, const Document& doc);
 void applyParagraphBorder(Node& paragraph, const Document& doc, const ParaShape* paraShape);
@@ -129,6 +138,8 @@ std::int32_t scannedVertSize(const Document& doc, const std::vector<Atom>& atoms
 std::int32_t lineCharBox(const Node& line);
 
 std::int32_t rowContentBottom(const Node& node, bool keepPitch = false);
+// 문서에 개요 정의가 없을 때 쓰는 한컴 기본 번호 모양(1. 가. 1) 가) (1) (가) ① ㉮). 번호 문단을 새로 만들 때도 이것을 베낀다.
+const model::Numbering& builtinOutline();
 std::int32_t columnContentBottom(const Node& body, bool keepPitch = false);
 std::int32_t columnCharBottom(const Node& column);
 
@@ -140,4 +151,4 @@ int unseenSize(const std::vector<UnseenMark>& marks, int from, int to);
 
 void stampPageChrome(Node& paper, const Document& doc, const Section& section, int pageNumber);
 
-}  // namespace noting::render::detail
+}  // namespace chwp::render::detail

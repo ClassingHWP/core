@@ -4,7 +4,7 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace noting::render {
+namespace chwp::render {
 
 // 수식을 닫을 때 한글이 개체 크기로 넣는 값. 단위는 HWPUNIT.
 // baseLine 은 상자 위에서 기준선까지의 높이 비율이다. 0 은 쓰지 않는다(파일에서 0 은 85% 라는 뜻).
@@ -49,4 +49,4 @@ EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUni
 EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUnit,
                                    std::string_view symbolFont = "HYhwpEQ");
 
-}  // namespace noting::render
+}  // namespace chwp::render

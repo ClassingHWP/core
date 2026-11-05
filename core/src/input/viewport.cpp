@@ -1,9 +1,15 @@
-#include "noting/input/viewport.hpp"
+#include "chwp/input/viewport.hpp"
 
 #include <algorithm>
 #include <cmath>
 
-namespace noting::input {
+namespace chwp::input {
+
+int zoomLadderStep(int percent, int dir) {
+    if (dir < 0) return percent <= 25 ? 10 : std::clamp(((percent - 1) / 25) * 25, 10, 800);
+    if (dir > 0) return percent < 25 ? 25 : std::clamp(((percent / 25) + 1) * 25, 10, 800);
+    return percent;
+}
 namespace {
 
 bool contains(const render::Scrollbar& bar, double x, double y) {
@@ -209,7 +215,9 @@ Camera ViewportInput::pointer(render::PageView& view, const PointerEvent& event)
     if (event.id != activeId_) return snapshot(view, false, false, false);
     if (event.phase == Phase::Cancel || event.phase == Phase::Up) {
         const bool owned = barDrag_ || tracking_;
-        const bool flick = event.phase == Phase::Up && tracking_ && dragged_ && !barDrag_ && sampleVel_;
+        // 멈춘 채 누르고 있다가 떼면 이동 사건이 오지 않아 속도가 그대로 남는다. 마지막 움직임이 오래되었으면 관성이 없다.
+        const bool fresh = event.time <= 0 || sampleTime_ <= 0 || event.time - sampleTime_ <= kFlingFreshMs;
+        const bool flick = event.phase == Phase::Up && tracking_ && dragged_ && !barDrag_ && sampleVel_ && fresh;
         const double flickX = -velX_;
         const double flickY = -velY_;
         dropPointer();
@@ -285,11 +293,7 @@ Camera ViewportInput::wheel(render::PageView& view, const WheelEvent& event) {
         int next = before.percent;
         if (event.discrete) {
             int target = wasZoomAnim ? prevZoomTarget : before.percent;
-            if (event.dy > 0) {
-                target = (target <= 25) ? 10 : std::clamp(((target - 1) / 25) * 25, 10, 800);
-            } else if (event.dy < 0) {
-                target = (target < 25) ? 25 : std::clamp(((target / 25) + 1) * 25, 10, 800);
-            }
+            if (event.dy != 0) target = zoomLadderStep(target, event.dy > 0 ? -1 : 1);
             if (!wasZoomAnim && target == before.percent) {
                 return snapshot(view, false, false, false);
             }
@@ -546,4 +550,4 @@ Camera ViewportInput::setGridMode(render::PageView& view, render::PageGridMode m
                     after.percent != before.percent || after.fitPage != before.fitPage || after.fitWidth != before.fitWidth, true);
 }
 
-}  // namespace noting::input
+}  // namespace chwp::input

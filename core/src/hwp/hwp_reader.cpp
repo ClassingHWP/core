@@ -1,4 +1,4 @@
-#include "noting/hwp/hwp_reader.hpp"
+#include "chwp/hwp/hwp_reader.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,14 +8,14 @@
 #include <iterator>
 #include <vector>
 
-#include "noting/common/unicode.hpp"
-#include "noting/unit.hpp"
-#include "noting/container/cfb.hpp"
-#include "noting/hwp/records.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/unit.hpp"
+#include "chwp/container/cfb.hpp"
+#include "chwp/hwp/records.hpp"
 #include "common/time_format.hpp"
 #include "hwp/hwp_detail.hpp"
 
-namespace noting::hwp {
+namespace chwp::hwp {
 
 namespace detail {
 
@@ -107,6 +107,7 @@ model::Caption readCaptionHeader(ByteView data) {
     const unsigned valign = (listAttr >> 5) & 0x3;
     if (valign == 1) caption.content.vertAlign = "CENTER";
     else if (valign == 2) caption.content.vertAlign = "BOTTOM";
+    caption.content.textDirection = static_cast<std::uint8_t>(std::min<std::uint32_t>(listAttr & 0x7, 2));
     return caption;
 }
 
@@ -141,7 +142,7 @@ std::vector<std::size_t> ControlMatcher::remaining() const {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 constexpr char kSignature[] = "HWP Document File";
 
@@ -269,8 +270,13 @@ BorderFill readBorderFill(ByteReader r, std::uint32_t id) {
     const std::uint32_t type = r.u32();
     if ((type & 1u) != 0 && r.remaining() >= 16) {
         fill.faceColor = hexColor(fromColorRef(r.u32()));
-        r.u32();
-        r.i32();
+        const Color hatchColor = fromColorRef(r.u32());
+        const std::int32_t hatch = r.i32();
+        static const char* const hatches[] = {"HORIZONTAL", "VERTICAL", "SLASH", "BACK_SLASH", "CROSS", "CROSS_DIAGONAL"};
+        if (hatch >= 0 && hatch < static_cast<std::int32_t>(std::size(hatches))) {
+            fill.hatchStyle = hatches[hatch];
+            fill.hatchColor = hatchColor ? hexColor(hatchColor) : "#000000";
+        }
     }
     if ((type & 4u) != 0 && r.remaining() >= 21) {
         const unsigned gradKind = r.u8();
@@ -897,8 +903,9 @@ void Parser::parseCharShape(ByteReader& r) {
 
 void Parser::parseTabDef(ByteReader& r) {
     static const char* types[] = {"LEFT", "RIGHT", "CENTER", "DECIMAL"};
-    static const char* leaders[] = {"NONE",     "SOLID",    "DASH",
-                                    "DOT",      "DASH_DOT", "DASH_DOT_DOT",
+    // 탭 채움은 테두리 선과 달리 2 가 점선, 3 이 파선이다(한글 2024, tmp/roundtrip/leaders).
+    static const char* leaders[] = {"NONE",     "SOLID",    "DOT",
+                                    "DASH",     "DASH_DOT", "DASH_DOT_DOT",
                                     "LONG_DASH","CIRCLE",   "DOUBLE_SLIM",
                                     "SLIM_THICK","THICK_SLIM","SLIM_THICK_SLIM",
                                     "WAVE",     "DOUBLE_WAVE","THICK_3D",
@@ -954,11 +961,14 @@ void Parser::parseParaShape(ByteReader& r) {
         lineSpacingType = r.u32() & 0x1F;
         ps.lineSpacing = static_cast<std::int32_t>(r.u32());
     }
+    // 한글 2022 부터 문단 모양 끝에 수준(0~9)이 하나 더 있다. 속성 1 의 수준 3비트는 6 에서 멈춘다(tmp/roundtrip).
+    std::int32_t fullLevel = -1;
+    if (r.remaining() >= 4) fullLevel = static_cast<std::int32_t>(r.u32());
 
     const std::uint32_t align = (attr1 >> 2) & 0x7;
     ps.align = align < std::size(aligns) ? aligns[align] : "JUSTIFY";
     ps.breakLatinWord = latinBreaks[(attr1 >> 5) & 0x3];
-    // 규격은 bit 7 = 1 을 글자로 적지만, HWPX breakNonLatinWord 와 대조하면 1 이 어절이다.
+    // bit 7 = 1 은 규격대로 글자다. HWPX 는 이것을 KEEP_WORD 로, 어절(0)을 BREAK_WORD 로 적는다(tmp/wordbreak).
     ps.breakNonLatinWord = ((attr1 >> 7) & 0x1) ? "KEEP_WORD" : "BREAK_WORD";
     ps.snapToGrid = ((attr1 >> 8) & 0x1) != 0;
     ps.condense = std::min<std::int32_t>(75, static_cast<std::int32_t>((attr1 >> 9) & 0x7F));
@@ -978,6 +988,7 @@ void Parser::parseParaShape(ByteReader& r) {
     const std::uint32_t wrap = attr2 & 0x3;
     if (wrap < std::size(wraps)) ps.lineWrap = wraps[wrap];
     ps.headingLevel = (attr1 >> 25) & 0x7;
+    if (fullLevel >= 0 && fullLevel <= 9) ps.headingLevel = static_cast<std::uint32_t>(fullLevel);
     ps.lineSpacingType = lineSpacingType < std::size(lineSpacings) ? lineSpacings[lineSpacingType]
                                                                    : "PERCENT";
     // 고정값·여백만·최소는 여백처럼 2배로 저장된다. 고정값 2400은 줄 높이 1200이다.
@@ -1055,6 +1066,11 @@ void Parser::parseSection(ByteView stream, Section& section) {
                     section.page = item.control.page;
                     if (item.control.defaultTab > 0) section.defaultTab = item.control.defaultTab;
                     if (item.control.columnRegionGap > 0) section.columnRegionGap = item.control.columnRegionGap;
+                    section.textDirection = item.control.textDirection;
+                    section.sectionAttrKeep = item.control.sectionAttrKeep;
+                    section.lineGrid = item.control.lineGrid;
+                    section.charGrid = item.control.charGrid;
+                    section.wongoji = item.control.wongoji;
                     section.pageStart = item.control.number;
                     section.hideHeader = item.control.hideHeader;
                     section.hideFooter = item.control.hideFooter;
@@ -1322,6 +1338,10 @@ Placement Parser::readPlacement(ByteReader& r) {
     const std::uint32_t wrap = (attr >> 21) & 0x7;
     p.textWrap = wrap < std::size(wraps) ? wraps[wrap] : "SQUARE";
     p.textFlow = flows[(attr >> 24) & 0x3];
+    static const char* numberings[] = {"NONE", "PICTURE", "TABLE", "EQUATION"};
+    const std::uint32_t numbering = (attr >> 26) & 0x3;
+    p.numberingType = numbering < std::size(numberings) ? numberings[numbering] : "NONE";
+    p.attrKeep = attr & ~kObjectKnownBits;
     if (r.remaining() >= 8) {
         p.marginLeft = r.i16();
         p.marginRight = r.i16();
@@ -1397,7 +1417,9 @@ PageDef Parser::readPageDef(ByteView data) {
     page.marginHeader = r.u32();
     page.marginFooter = r.u32();
     page.marginGutter = r.u32();
-    page.landscape = (r.u32() & 0x1) != 0;
+    const std::uint32_t attr = r.u32();
+    page.landscape = (attr & 0x1) != 0;
+    page.gutterType = static_cast<std::uint8_t>(std::min<std::uint32_t>((attr >> 1) & 0x3, 2));
     page.applyOrientation();
     return page;
 }
@@ -1418,11 +1440,20 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                 c.hideFooter = (attr & 0x2) != 0;
                 c.hideMaster = (attr & 0x4) != 0;
                 c.hidePageNum = (attr & 0x20) != 0;
+                c.wongoji = (attr & (1u << 22)) != 0;
+                c.textDirection = static_cast<std::uint8_t>(std::min<std::uint32_t>((attr >> 16) & 0x7, 2));
+                c.sectionAttrKeep = attr & ~kSecdKnownBits;
+                // 한글 2024 는 속성 비트 16–18 을 비우고, 47바이트 레코드의 36번째 바이트에 방향 × 2 를 둔다.
+                // 가로 00, 세로(영문 눕힘) 02, 세로(영문 세움) 04 (tools/hwp_records.py 로 확인).
+                if (node.record->data.size() > 36) {
+                    const unsigned ext = (node.record->data[36] >> 1) & 0x3u;
+                    if (ext != 0 || c.textDirection == 0) c.textDirection = static_cast<std::uint8_t>(std::min(ext, 2u));
+                }
                 if (r.remaining() >= 10) {
                     const auto gap = r.u16();
                     if (gap > 0) c.columnRegionGap = gap;
-                    r.u16();
-                    r.u16();
+                    c.lineGrid = r.u16();
+                    c.charGrid = r.u16();
                     const std::uint32_t raw = r.u32();
                     c.defaultTab = raw > 0 ? static_cast<std::int32_t>(raw / 2) : 4000;
                     if (r.remaining() >= 4) {
@@ -1991,6 +2022,7 @@ void Parser::parseTable(const RecordTree& tree, const RecordTree::Node& node, Co
             const unsigned valign = (listAttr >> 5) & 0x3;
             if (valign == 1) cell.vertAlign = "CENTER";
             else if (valign == 2) cell.vertAlign = "BOTTOM";
+            cell.content.textDirection = static_cast<std::uint8_t>(std::min<std::uint32_t>(listAttr & 0x7, 2));
             cell.hasMargin = (listAttr & (1u << 16)) != 0;
             cell.header = (listAttr & (1u << 18)) != 0;
             cell.col = r.u16();
@@ -2065,9 +2097,11 @@ void Parser::collectSubLists(const RecordTree& tree, const RecordTree::Node& nod
             if (childNode.record->data.size() >= 8) {
                 ByteReader header(childNode.record->data);
                 header.seek(4);
-                const unsigned valign = (header.u32() >> 5) & 0x3;
+                const std::uint32_t listAttr = header.u32();
+                const unsigned valign = (listAttr >> 5) & 0x3;
                 if (valign == 1) out.back().vertAlign = "CENTER";
                 else if (valign == 2) out.back().vertAlign = "BOTTOM";
+                out.back().textDirection = static_cast<std::uint8_t>(std::min<std::uint32_t>(listAttr & 0x7, 2));
             }
             for (std::size_t grand : childNode.children) {
                 if (tree.at(grand).record->tag == tag::ParaHeader) {
@@ -2148,7 +2182,7 @@ void Parser::parseSummaryInformation() {
                 }
             }
         } else if (type == 0x40) {  // VT_FILETIME
-            value = noting::detail::fileTimeToIso8601(v.u64());
+            value = chwp::detail::fileTimeToIso8601(v.u64());
         } else {
             continue;
         }
@@ -2224,4 +2258,4 @@ ParseResult parse(ByteView data, const ParseOptions& options) {
     return result;
 }
 
-}  // namespace noting::hwp
+}  // namespace chwp::hwp

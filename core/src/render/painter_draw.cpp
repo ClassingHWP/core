@@ -2,14 +2,14 @@
 
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
-#include "noting/common/unicode.hpp"
-#include "noting/reader.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/render/view.hpp"
 #include "render/equation_raster.hpp"
 
 // Painter: 그리기 바탕: 잘라내기, 글리프, 상자, 그림
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 bool Painter::showGlyphs() const {
     if (pass == PaintLayer::All) return true;
@@ -18,9 +18,26 @@ bool Painter::showGlyphs() const {
     return pass == PaintLayer::Front && coverDepth > 0;
 }
 
-void Painter::stampHosts(TextHost* hosts, int& count) const {
-    count = objectHostCount;
-    for (int i = 0; i < count; ++i) hosts[i] = objectHosts[i];
+void Painter::stampHosts(FrameGlyph& glyph) const {
+    glyph.hostFirst = 0;
+    glyph.hostCount = static_cast<std::uint8_t>(objectHostCount);
+    if (objectHostCount == 0 || !glyphSink) return;
+    std::vector<TextHost>& hosts = glyphSink->hosts;
+    if (!glyphSink->glyphs.empty()) {
+        const FrameGlyph& last = glyphSink->glyphs.back();
+        bool same = last.hostCount == objectHostCount;
+        for (int i = 0; same && i < objectHostCount; ++i) {
+            const TextHost& a = hosts[static_cast<std::size_t>(last.hostFirst + i)];
+            same = a.story == objectHosts[i].story && a.paragraph == objectHosts[i].paragraph &&
+                   a.offset == objectHosts[i].offset;
+        }
+        if (same) {
+            glyph.hostFirst = last.hostFirst;
+            return;
+        }
+    }
+    glyph.hostFirst = static_cast<std::int32_t>(hosts.size());
+    hosts.insert(hosts.end(), objectHosts, objectHosts + objectHostCount);
 }
 
 Painter::ClipBounds Painter::intersectClip(const ClipBounds& a, std::int32_t x, std::int32_t y, std::int32_t w,
@@ -59,7 +76,7 @@ void Painter::seedObjectHosts(const Node& page, const std::vector<int>& path) {
         const Node& child = cur->children[static_cast<std::size_t>(childIndex)];
         if (cur->kind == NodeKind::Line && child.kind == NodeKind::Object && !child.headingMark &&
             objectHostCount < kObjectHostDepth) {
-            const std::vector<Mark> marks = collectMarks(*cur);
+            const std::vector<Mark> marks = caretMarks(*cur);
             for (std::size_t m = 0; m < marks.size(); ++m) {
                 if (marks[m].slot == childIndex) {
                     objectHosts[objectHostCount++] =
@@ -84,9 +101,56 @@ bool Painter::seedAncestorClips(const Node& page, const std::vector<int>& path, 
     const Node* cur = &page;
     std::int32_t ox = 0;
     std::int32_t oy = 0;
+    // 세로쓰기 틀은 FrameWalk::visit 과 같이 바꾼다. 돌린 틀은 부모 자리가 원점이고, 세운 개체 상자 안은 종이 자리다.
+    bool turned = false;
+    std::int32_t turnX = 0;
+    std::int32_t turnY = 0;
+    std::int32_t turnSpan = 0;
     for (std::size_t step = 0; step < path.size(); ++step) {
         const int childIndex = path[step];
         if (childIndex < 0 || childIndex >= static_cast<int>(cur->children.size())) break;
+        // 모은 자르기도 틀 좌표로 옮긴다. 종이 (X, Y) 는 틀의 (Y − 원점 Y, 원점 X + 폭 − X) 다.
+        const auto clipToTurn = [&]() {
+            if (clip.x1 == std::numeric_limits<std::int32_t>::max() || clip.y1 == std::numeric_limits<std::int32_t>::max()) {
+                return;
+            }
+            ClipBounds turnedClip;
+            turnedClip.x0 = clip.y0 - turnY;
+            turnedClip.x1 = clip.y1 - turnY;
+            turnedClip.y0 = turnX + turnSpan - clip.x1;
+            turnedClip.y1 = turnX + turnSpan - clip.x0;
+            clip = turnedClip;
+        };
+        const auto clipToPaper = [&]() {
+            if (clip.x1 == std::numeric_limits<std::int32_t>::max() || clip.y1 == std::numeric_limits<std::int32_t>::max()) {
+                return;
+            }
+            ClipBounds paperClip;
+            paperClip.x0 = turnX + turnSpan - clip.y1;
+            paperClip.x1 = turnX + turnSpan - clip.y0;
+            paperClip.y0 = turnY + clip.x0;
+            paperClip.y1 = turnY + clip.x1;
+            clip = paperClip;
+        };
+        if (cur->turned != 0) {
+            turned = true;
+            turnX = ox;
+            turnY = oy;
+            turnSpan = cur->turnSpan > 0 ? cur->turnSpan : page.width;
+            ox = 0;
+            oy = 0;
+            clipToTurn();
+        }
+        if (cur->upright && turned) {
+            const std::int32_t paperX = turnX + turnSpan - (oy + cur->y) - cur->height;
+            const std::int32_t paperY = turnY + ox + cur->x;
+            clipToPaper();
+            turned = false;
+            ox = paperX;
+            oy = paperY;
+            cur = &cur->children[static_cast<std::size_t>(childIndex)];
+            continue;
+        }
         const std::int32_t x = ox + cur->x + (cur->kind == NodeKind::Paragraph ? cur->marginLeft : 0);
         const std::int32_t y = oy + cur->y;
         const Node& child = cur->children[static_cast<std::size_t>(childIndex)];
@@ -137,7 +201,7 @@ bool Painter::behindOf(const Node& node) {
     const bool masterFront = node.fromMaster && node.masterOnTop;
     if (masterFront) return false;
     if (masterBack) return true;
-    return node.textWrap == "BEHIND_TEXT";
+    return node.ext().obj().textWrap == "BEHIND_TEXT";
 }
 
 PaintLayer Painter::objectPlace(const Node& node) const {
@@ -149,12 +213,12 @@ PaintLayer Painter::objectPlace(const Node& node) const {
 bool Painter::coversText(const Node& node) const {
     if (objectPlace(node) != PaintLayer::Front) return false;
     if (node.role == "equation") return true;
-    if (node.role == "picture" && !node.binItemId.empty()) return true;
-    return !node.fillColor.empty() && node.fillColor != "none";
+    if (node.role == "picture" && !node.ext().obj().binItemId.empty()) return true;
+    return !node.ext().fillColor.empty() && node.ext().fillColor != "none";
 }
 
 std::int32_t Painter::paintedExtent(const Node& node) {
-    std::int32_t bottom = std::max(node.height, node.textHeight);
+    std::int32_t bottom = std::max(node.height, node.lineData().textHeight);
     for (const Node& child : node.children) {
         bottom = std::max(bottom, child.y + child.marginTop + paintedExtent(child) + child.marginBottom);
     }
@@ -201,7 +265,6 @@ void Painter::pushClip(std::int32_t x, std::int32_t y, std::int32_t w, std::int3
     if (next.b < next.t) next.b = next.t;
     clips.push_back(next);
     applyCpuClip();
-#if NOTING_HAS_SKIA
     if (skiaCanvas) {
         skiaCanvas->save();
         skiaCanvas->clipRect(SkRect::MakeLTRB(static_cast<float>(next.l), static_cast<float>(next.t),
@@ -209,20 +272,16 @@ void Painter::pushClip(std::int32_t x, std::int32_t y, std::int32_t w, std::int3
                              false);
         ++skiaSaves;
     }
-#endif
 }
 
 void Painter::popClip() {
     if (!clips.empty()) clips.pop_back();
     applyCpuClip();
-#if NOTING_HAS_SKIA
     if (skiaCanvas && skiaSaves > 0) {
         skiaCanvas->restore();
         --skiaSaves;
     }
-#endif
 }
-#if NOTING_HAS_SKIA
 
 SkCanvas* Painter::canvas() {
     if (skiaCanvas) return skiaCanvas;
@@ -244,7 +303,6 @@ SkCanvas* Painter::canvas() {
     }
     return skiaCanvas;
 }
-#endif
 
 void Painter::paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, int ratio, int fitX, int fitY, float penX,
                          float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
@@ -253,10 +311,11 @@ void Painter::paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, 
     const float sy = unit * static_cast<float>(std::max(1, fitY)) / 1000.f;
     const float sx = unit * static_cast<float>(std::max(1, ratio)) / 100.f * static_cast<float>(std::max(1, fitX)) / 1000.f;
     const auto pxOf = [&](const GlyphPoint& point) {
-        return std::pair<float, float>{penX + static_cast<float>(point.x) * sx,
-                                        baseY - static_cast<float>(point.y) * sy};
+        float x = penX + static_cast<float>(point.x) * sx;
+        float y = baseY - static_cast<float>(point.y) * sy;
+        turnGlyphPoint(&glyphTurn, x, y);
+        return std::pair<float, float>{x, y};
     };
-#if NOTING_HAS_SKIA
     if (SkCanvas* canvas = this->canvas()) {
         SkPathBuilder path;
         for (const GlyphCommand& command : commands) {
@@ -277,10 +336,7 @@ void Painter::paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, 
         paint.setStyle(SkPaint::kFill_Style);
         paint.setColor(SkColorSetARGB(255, r, g, b));
         canvas->drawPath(path.detach(), paint);
-        return;
     }
-#endif
-    paintFlatGlyph(bitmap, contoursFromCommands(commands), emPx, ratio, fitX, fitY, penX, baseY, r, g, b);
 }
 
 float Painter::glyphPx(std::int32_t hu) const {
@@ -303,19 +359,16 @@ void Painter::replaySpots(const std::vector<GlyphSpot>& spots) {
     for (const GlyphSpot& spot : spots) {
         if (!spot.mem || !spot.mem->face || spot.fontSize <= 0) continue;
         const float pixel = std::max(1.f, static_cast<float>(spot.fontSize) * scale);
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
         if (glyphSink) {
             const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
             FrameGlyph drawn{spot.mem, ppem, spot.ratio, spot.bold, spot.italic,
                              glyphPx(spot.huX), glyphPx(spot.baseline),
-                             SkColorSetARGB(255, spot.r, spot.g, spot.b), spot.story, spot.paragraph,
+                             opaqueArgb(spot.r, spot.g, spot.b), spot.story, spot.paragraph,
                              spot.offset, pixel};
-            drawn.hostCount = spot.hostCount;
-            for (int i = 0; i < spot.hostCount && i < kObjectHostDepth; ++i) drawn.hosts[i] = spot.hosts[i];
-            glyphSink->push_back(drawn);
+            stampHosts(drawn);
+            glyphSink->glyphs.push_back(drawn);
             continue;
         }
-#endif
         const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
         const auto& commands = hangulCommands(spot.mem, spot.bold, spot.italic, ppem);
         const int fitX = spot.mem->fitX > 0 ? spot.mem->fitX : 1000;
@@ -338,22 +391,25 @@ void Painter::glyph(char32_t cp, const std::string& font, int fontSize, int rati
     std::uint8_t r, g, b;
     parseHex(color, r, g, b);
     if (placeSink) {
-        GlyphSpot spot{mem, bold, italic, fontSize, ratio, huX, baseline, r, g, b, story, paragraph, offset};
-        stampHosts(spot.hosts, spot.hostCount);
-        placeSink->push_back(spot);
+        placeSink->push_back(GlyphSpot{mem, bold, italic, fontSize, ratio, huX, baseline, r, g, b, story, paragraph, offset});
     }
     if (skipGlyphs) return;
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     if (glyphSink) {
         const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
         FrameGlyph drawn{mem, ppem, ratio, bold, italic, glyphPx(huX),
-                         glyphPx(baseline), SkColorSetARGB(255, r, g, b), story, paragraph,
+                         glyphPx(baseline), opaqueArgb(r, g, b), story, paragraph,
                          offset, pixel};
-        stampHosts(drawn.hosts, drawn.hostCount);
-        glyphSink->push_back(drawn);
+        stampHosts(drawn);
+        if (glyphTurn.on) {
+            drawn.upright = true;
+            drawn.turnCx = glyphTurn.cx;
+            drawn.turnCy = glyphTurn.cy;
+            drawn.turnDx = glyphTurn.dx;
+            drawn.turnDy = glyphTurn.dy;
+        }
+        glyphSink->glyphs.push_back(drawn);
         return;
     }
-#endif
     const int ppem = std::max(1, static_cast<int>(std::lround(pixel)));
     const auto& commands = hangulCommands(mem, bold, italic, ppem);
     const int fitX = mem->fitX > 0 ? mem->fitX : 1000;
@@ -387,7 +443,6 @@ void Painter::box(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h
     const int y1 = px(y + h);
     const int tw = std::max(0, x1 - x0);
     const int th = std::max(0, y1 - y0);
-#if NOTING_HAS_SKIA
     float intervals[8];
     const int dashes = gdiDash(edge, intervals);
     if (dashes >= 2 && tw > 0 && th > 0) {
@@ -410,7 +465,6 @@ void Painter::box(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h
             return;
         }
     }
-#endif
     const int t = std::max(1, px(edge.width > 0 ? edge.width : 28));
     const ClipSuspend open(bitmap);
     strokeEdge(edge, x0 - t / 2, y0 - t / 2, tw + t, t);
@@ -418,18 +472,15 @@ void Painter::box(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h
     strokeEdge(edge, x0 - t / 2, y0 - t / 2, t, th + t);
     strokeEdge(edge, x1 - t / 2, y0 - t / 2, t, th + t);
 }
-#if NOTING_HAS_SKIA
 
 void Painter::imageFlip(SkCanvas* canvas, int dw, int dh, bool flipH, bool flipV) const {
     if (!flipH && !flipV) return;
     canvas->translate(flipH ? static_cast<float>(dw) : 0.f, flipV ? static_cast<float>(dh) : 0.f);
     canvas->scale(flipH ? -1.f : 1.f, flipV ? -1.f : 1.f);
 }
-#endif
 
 bool Painter::nearestImage(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
                            const ImageDraw* draw, const CachedPicture* cached) {
-#if NOTING_HAS_SKIA
     SkCanvas* canvas = this->canvas();
     if (!canvas || !rgba) return false;
     sk_sp<SkImage> sk = cached ? cached->skImage : nullptr;
@@ -449,20 +500,6 @@ bool Painter::nearestImage(const std::uint8_t* rgba, int sw, int sh, int dx, int
                            SkSamplingOptions(SkFilterMode::kNearest), &paint, SkCanvas::kStrict_SrcRectConstraint);
     canvas->restore();
     return true;
-#else
-    (void)rgba;
-    (void)sw;
-    (void)sh;
-    (void)dx;
-    (void)dy;
-    (void)dw;
-    (void)dh;
-    (void)flipH;
-    (void)flipV;
-    (void)draw;
-    (void)cached;
-    return false;
-#endif
 }
 
 bool Painter::paintAreaImage(const std::uint8_t* src, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH,
@@ -588,7 +625,6 @@ bool Painter::paintAreaImage(const std::uint8_t* src, int sw, int sh, int dx, in
     }
     return true;
 }
-#if NOTING_HAS_SKIA
 
 bool Painter::mitchellCpu(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
                           const ImageDraw* draw, const CachedPicture* cached) {
@@ -612,28 +648,12 @@ bool Painter::mitchellCpu(const std::uint8_t* rgba, int sw, int sh, int dx, int 
     canvas->restore();
     return true;
 }
-#endif
 
 bool Painter::mitchellImage(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
                             const CachedPicture* key, const ImageDraw* draw) {
     PixelSpan vis;
     if (!visibleSpan(bitmap, dx, dy, dw, dh, vis)) return true;
-#if NOTING_HAS_SKIA
     return mitchellCpu(rgba, sw, sh, dx, dy, dw, dh, flipH, flipV, draw, key);
-#else
-    (void)rgba;
-    (void)sw;
-    (void)sh;
-    (void)dx;
-    (void)dy;
-    (void)dw;
-    (void)dh;
-    (void)flipH;
-    (void)flipV;
-    (void)key;
-    (void)draw;
-    return false;
-#endif
 }
 
 bool Painter::skiaImage(const CachedPicture& image, int dx, int dy, int dw, int dh, bool flipH, bool flipV, bool filter,
@@ -660,7 +680,6 @@ bool Painter::skiaImage(const CachedPicture& image, int dx, int dy, int dw, int 
 }
 
 bool Painter::skiaTile(const CachedPicture& image, int x, int y, int w, int h) {
-#if NOTING_HAS_SKIA
     SkCanvas* canvas = this->canvas();
     if (!canvas || image.rgba.empty() || w <= 0 || h <= 0) return false;
     sk_sp<SkImage> sk = image.skImage;
@@ -685,18 +704,10 @@ bool Painter::skiaTile(const CachedPicture& image, int x, int y, int w, int h) {
                      paint);
     canvas->restore();
     return true;
-#else
-    (void)image;
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    return false;
-#endif
 }
 
 void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
-    const std::shared_ptr<const CachedPicture> image = pictureFor(*doc, node.binItemId);
+    const std::shared_ptr<const CachedPicture> image = pictureFor(*doc, node.ext().obj().binItemId);
     const int dx = px(x);
     const int dy = px(y);
     const int dw = std::max(1, px(x + node.width) - dx);
@@ -710,7 +721,7 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
     int y0 = dy;
     int x1 = dx + dw;
     int y1 = dy + dh;
-    const model::PictureView& pic = node.picture;
+    const model::PictureView& pic = node.ext().obj().picture;
     if (pic.padLeft || pic.padRight || pic.padTop || pic.padBottom) {
         const int ix0 = px(x + pic.padLeft);
         const int iy0 = px(y + pic.padTop);
@@ -750,8 +761,8 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
     const int drawW = x1 - x0;
     const int drawH = y1 - y0;
     if (drawW <= 0 || drawH <= 0) return;
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-    if (pictureSink && image->skImage && image->width <= kMaxPictureTexture && image->height <= kMaxPictureTexture) {
+    if (pictureSink && !image->levelSizes.empty() && image->width <= kMaxPictureTexture &&
+        image->height <= kMaxPictureTexture) {
         // 확대해도 다시 굽지 않으므로 자리는 픽셀로 반올림하지 않는다.
         const auto at = [&](std::int32_t hu) { return static_cast<float>(hu) * scale; };
         float boxL = at(x);
@@ -767,23 +778,22 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
         const float boxW = boxR - boxL;
         const float boxH = boxB - boxT;
         FramePicture item;
-        item.id = node.binItemId;
+        item.id = node.ext().obj().binItemId;
         item.picture = image;
-        item.dst = SkRect::MakeLTRB(boxL + static_cast<float>(source.fracL) * boxW,
-                                    boxT + static_cast<float>(source.fracT) * boxH,
-                                    boxL + static_cast<float>(source.fracR) * boxW,
-                                    boxT + static_cast<float>(source.fracB) * boxH);
-        item.clip = SkRect::MakeLTRB(static_cast<float>(bitmap.clipL), static_cast<float>(bitmap.clipT),
-                                     static_cast<float>(bitmap.clipR), static_cast<float>(bitmap.clipB));
-        item.src = SkRect::MakeLTRB(static_cast<float>(source.srcL), static_cast<float>(source.srcT),
-                                    static_cast<float>(source.srcR), static_cast<float>(source.srcB));
+        item.dst = PictureRect{boxL + static_cast<float>(source.fracL) * boxW,
+                               boxT + static_cast<float>(source.fracT) * boxH,
+                               boxL + static_cast<float>(source.fracR) * boxW,
+                               boxT + static_cast<float>(source.fracB) * boxH};
+        item.clip = PictureRect{static_cast<float>(bitmap.clipL), static_cast<float>(bitmap.clipT),
+                                static_cast<float>(bitmap.clipR), static_cast<float>(bitmap.clipB)};
+        item.src = PictureRect{static_cast<float>(source.srcL), static_cast<float>(source.srcT),
+                               static_cast<float>(source.srcR), static_cast<float>(source.srcB)};
         item.flipH = node.flipHorizontal;
         item.flipV = node.flipVertical;
         item.tone = tone;
         pictureSink->push_back(std::move(item));
         return;
     }
-#endif
     if (skiaImage(*image, x0, y0, drawW, drawH, node.flipHorizontal, node.flipVertical, true, &draw)) return;
     const double spanW = draw.srcR - draw.srcL;
     const double spanH = draw.srcB - draw.srcT;
@@ -805,4 +815,4 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
     }
 }
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

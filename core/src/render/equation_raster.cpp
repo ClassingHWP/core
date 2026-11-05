@@ -14,17 +14,20 @@
 #include <unordered_map>
 #include <vector>
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkCanvas.h"
 #include "include/core/SkRect.h"
+
+#ifndef CHWP_MICROTEX_RES
+#define CHWP_MICROTEX_RES "res"
 #endif
 
-#ifndef NOTING_MICROTEX_RES
-#define NOTING_MICROTEX_RES "res"
-#endif
-
-namespace noting::render {
+namespace chwp::render {
 namespace {
+
+std::string& resourceDir() {
+    static std::string dir = CHWP_MICROTEX_RES;
+    return dir;
+}
 
 std::wstring widen(const std::string& text) {
     std::wstring out;
@@ -71,7 +74,7 @@ struct Engine {
         if (ready) return true;
         if (failed) return false;
         try {
-            tex::LaTeX::init(NOTING_MICROTEX_RES);
+            tex::LaTeX::init(resourceDir());
             ready = true;
             return true;
         } catch (const std::exception&) {
@@ -248,6 +251,11 @@ void clearEquationRasterCache() {
     spills().clear();
 }
 
+void setEquationResourceDir(std::string dir) {
+    std::lock_guard lock(microtexMu());
+    if (!dir.empty()) resourceDir() = std::move(dir);
+}
+
 EquationRaster rasterHangulEquation(const std::string& script, int targetWidth, int targetHeight,
                                     int baselinePercent) {
     std::lock_guard lock(microtexMu());
@@ -271,7 +279,6 @@ EquationRaster rasterHangulEquation(const std::string& script, int targetWidth, 
     return image;
 }
 
-#if NOTING_HAS_SKIA
 bool paintHangulEquation(SkCanvas& canvas, const std::string& script, int x, int y, int w, int h,
                          int baselinePercent) {
     std::lock_guard lock(microtexMu());
@@ -285,6 +292,5 @@ bool paintHangulEquation(SkCanvas& canvas, const std::string& script, int x, int
     canvas.restore();
     return true;
 }
-#endif
 
-}  // namespace noting::render
+}  // namespace chwp::render

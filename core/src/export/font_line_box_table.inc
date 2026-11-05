@@ -1,4 +1,4 @@
-// 글꼴 파일에서 뽑은 표다. 글꼴에 어울리는 줄 높이의 위·아래(1em = 1024).
+// tools/font_line_box.py 가 만든다. 글꼴에 어울리는 줄 높이의 위·아래(1em = 1024).
 // OS/2 usWinAscent·usWinDescent × 1024 / upm 을 반올림한 값이다.
 struct FontLineBoxRow {
     const char* name;

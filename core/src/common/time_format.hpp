@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <string>
 
-namespace noting::detail {
+namespace chwp::detail {
 
 // Windows FILETIME(1601-01-01 기준 100ns 단위) → "YYYY-MM-DDTHH:MM:SSZ".
 // <ctime> 의 시간대/로케일 영향을 받지 않도록 직접 계산한다.
@@ -39,4 +39,4 @@ inline std::string fileTimeToIso8601(std::uint64_t fileTime) {
     return buffer;
 }
 
-}  // namespace noting::detail
+}  // namespace chwp::detail

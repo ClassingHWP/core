@@ -1,13 +1,13 @@
-#include "noting/render/view.hpp"
+#include "chwp/render/view.hpp"
 
-#include "noting/render/paint.hpp"
+#include "chwp/render/paint.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 int roundPositive(double value) {
@@ -1323,6 +1323,11 @@ ViewPlan PageView::plan(bool includeTiles) {
         }
     }
     if (!anyVisible) covered = false;
+    // 그리는 차례: 확대해 늘린 조각(nearest 아님)은 제 배율 조각 위에 얹고, 같은 것끼리는 층 차례다.
+    std::stable_sort(out.draw.begin(), out.draw.end(), [](const ViewDraw& a, const ViewDraw& b) {
+        if (a.nearest != b.nearest) return a.nearest;
+        return a.layer < b.layer;
+    });
 
     if (covered) {
         for (std::size_t i = 0; i < tiles_.size();) {
@@ -1424,4 +1429,4 @@ ViewPlan PageView::plan(bool includeTiles) {
     return out;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

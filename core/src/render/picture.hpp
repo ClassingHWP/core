@@ -1,5 +1,7 @@
 #pragma once
 
+#include "render/gpu_config.hpp"
+
 // 그림 한 장이 화면에 오기까지의 단계를 한곳에 둔다.
 //   원본 바이트 → 풀린 픽셀(CPU) → 화면 텍스처(GPU)
 // 풀린 픽셀과 화면 텍스처는 예산 관리자에 따로 올라간다. 텍스처를 버려도 풀린 픽셀에서 다시 올리고,
@@ -14,16 +16,15 @@
 #include <string>
 #include <vector>
 
-#include "noting/model/document.hpp"
+#include "chwp/model/document.hpp"
+#include "render/picture_upload.hpp"
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkImage.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkRect.h"
-#endif
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
+#if CHWP_HAS_GPU
 class SkCanvas;
 class SkColorFilter;
 namespace skgpu::graphite {
@@ -31,7 +32,7 @@ class Recorder;
 }
 #endif
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 // ---------------------------------------------------------------------------
 // 풀린 그림 (CPU)
@@ -44,11 +45,11 @@ struct CachedPicture {
     std::size_t bytes = 0;  // 예산에 세는 크기. 밉맵을 만들었으면 그만큼 더한다
     // 마지막으로 꺼내 간 캐시 프레임. 버릴 때 오래된 것부터 고르는 데 쓴다.
     mutable std::atomic<std::uint64_t> lastFrame{0};
-#if NOTING_HAS_SKIA
+    // 화면 텍스처로 올릴 수 있는 단계들(0 은 rgba). 비어 있으면 화면이 텍스처로 그리지 못한다.
+    std::vector<PictureLevel> levelSizes;
     sk_sp<SkImage> skImage;  // rgba 를 빌려 쓰는 래스터 이미지. 밉맵이 붙어 있다
     // 0 은 rgba, 그 뒤는 밉맵 단계. 픽셀은 rgba 와 skImage 의 밉맵이 쥔다.
     std::vector<SkPixmap> levels;
-#endif
 };
 
 // 없으면 원본에서 푼다. 쓰는 동안 쥐고 있어야 한다. 예산 관리자가 캐시에서 빼도 쥔 쪽이 다 쓸 때까지 남는다.
@@ -57,6 +58,11 @@ std::shared_ptr<const CachedPicture> pictureFor(const model::Document& doc, cons
 std::shared_ptr<const CachedPicture> peekPicture(const std::string& id);
 // 풀린 그림과 화면 텍스처를 모두 버린다. 문서를 바꿀 때 쓴다.
 void clearPictures();
+// 그림 파일의 픽셀 크기와 종류(png·jpg·gif·bmp). 풀지 않고 머리만 읽는다. 모르는 파일이면 거짓이다.
+bool imageInfo(const std::uint8_t* bytes, std::size_t size, int& width, int& height, std::string& extension);
+// 이미 풀린 RGBA(불투명) 로 그림을 만든다. 화면에 올릴 밉맵까지 붙인다. 개체를 끄는 동안의 미리보기에 쓴다.
+// opaque 가 거짓이면 rgba 의 알파(미리 곱하지 않은 값)를 그대로 쓴다.
+std::shared_ptr<CachedPicture> pictureFromRgba(int width, int height, std::vector<std::uint8_t> rgba, bool opaque = true);
 // 화면 루프가 프레임마다 부른다. 그림 캐시를 예산 관리자에 올리고 예산을 지킨다.
 // 프레임당 텍스처 업로드 한도도 여기서 새로 센다.
 void keepPictureBudget();
@@ -64,7 +70,7 @@ void keepPictureBudget();
 // ---------------------------------------------------------------------------
 // 화면 텍스처 (GPU)
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
+#if CHWP_HAS_GPU
 // 올린 텍스처와, 원본 픽셀 좌표를 그 텍스처 좌표로 바꾸는 배율.
 struct PictureTextureView {
     sk_sp<SkImage> image;
@@ -81,11 +87,11 @@ PictureTextureView pictureTexture(skgpu::graphite::Recorder* recorder, const std
                                   const SkRect& src);
 // 프레임 앞에서 한 번 부른다. 나눠 쓰는 큰 단계를 한도만큼 이어 쓰고, 다 쓴 것은 텍스처로 바꿔 끼운다.
 void advancePictureUploads(skgpu::graphite::Recorder* recorder);
+#endif
 // 나눠 쓰는 중인 단계가 있다. 화면은 다음 프레임을 그려야 한다.
 bool pictureUploadsWaiting();
 // 텍스처를 바꿔 끼울 때마다 는다. 거친 그림으로 합성한 쪽 텍스처를 다시 만들 때 본다.
 std::uint32_t pictureTextureSeq();
-#endif
 
 // ---------------------------------------------------------------------------
 // 자르기와 색조
@@ -131,9 +137,7 @@ PictureTone pictureTone(const model::PictureView& view);
 
 void applyPictureTone(std::uint8_t& r, std::uint8_t& g, std::uint8_t& b, std::uint8_t& a, const PictureTone& tone);
 
-#if NOTING_HAS_SKIA
 void paintPictureTone(SkPaint& paint, const PictureTone* tone);
-#endif
 
 // Painter 가 그림 한 장을 칸에 그릴 때 넘기는 원본 범위와 색조.
 struct ImageDraw {
@@ -144,25 +148,31 @@ struct ImageDraw {
     const PictureTone* tone = nullptr;
 };
 
-#if NOTING_HAS_SKIA
 SkRect pictureSrc(int sw, int sh, const ImageDraw* draw);
-#endif
 
 // ---------------------------------------------------------------------------
 // 화면에서 바로 그리는 그림
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
 // 텍스처 한 변 한도. WebGPU 기본 한도다. 넘는 그림은 예전처럼 칸에 굽는다.
 inline constexpr int kMaxPictureTexture = 8192;
+
+// 칸 비트맵 픽셀 좌표의 사각형.
+struct PictureRect {
+    float l = 0.f;
+    float t = 0.f;
+    float r = 0.f;
+    float b = 0.f;
+    bool empty() const { return !(l < r && t < b); }
+};
 
 // 개체 칸을 구울 때 픽셀로 그리지 않고 남겨 두는 그림 한 장. 좌표는 칸 비트맵 픽셀(구운 배율)이다.
 // 화면은 칸 비트맵보다 먼저 이것을 텍스처로 그린다. 칸의 테두리는 비트맵에 남아 그림 위에 얹힌다.
 struct FramePicture {
     std::string id;
     std::shared_ptr<const CachedPicture> picture;
-    SkRect dst = SkRect::MakeEmpty();   // 그림이 들어갈 자리
-    SkRect clip = SkRect::MakeEmpty();  // 조상 개체가 자르는 범위. 자르지 않으면 칸 전체다
-    SkRect src = SkRect::MakeEmpty();   // 원본 픽셀
+    PictureRect dst;   // 그림이 들어갈 자리
+    PictureRect clip;  // 조상 개체가 자르는 범위. 자르지 않으면 칸 전체다
+    PictureRect src;   // 원본 픽셀
     bool flipH = false;
     bool flipV = false;
     PictureTone tone;
@@ -177,6 +187,7 @@ bool frameHasPictures(int id);
 bool cloneFramePictures(int srcId, int dstId);
 std::shared_ptr<const std::vector<FramePicture>> framePictures(int id);
 
+#if CHWP_HAS_GPU
 // 칸이 화면의 spriteDst 에 sx, sy 배율로 놓였을 때 그 칸의 그림을 그린다.
 // backs 는 선택으로 뒤집은 바탕이다. 겹친 부분은 색을 뒤집어 다시 그린다.
 // 텍스처를 하나라도 못 만들었으면 거짓이다.
@@ -185,4 +196,4 @@ bool drawFramePictures(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
                        bool dragging, const std::vector<SkRect>& backs, sk_sp<SkColorFilter>& inverted);
 #endif
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

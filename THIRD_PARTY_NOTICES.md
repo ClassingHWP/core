@@ -30,8 +30,8 @@ FreeType 의 FTL 은 문서에 위 출처 문장을 적도록 요구한다.
 | 묶음 | 라이선스 | 출처 |
 |---|---|---|
 | 바탕·바탕체·굴림·굴림체·돋움·돋움체·궁서·궁서체 | SIL OFL 1.1 | Google Fonts 의 [googlefonts/batang](https://github.com/googlefonts/batang), [googlefonts/gulim](https://github.com/googlefonts/gulim). 어센트·디센트 같은 세로 값만 바꿨다. |
-| 대체 글꼴 Noting Fallback 001~130 | SIL OFL 1.1 | 라이선스 때문에 내줄 수 없는 글꼴을 비슷하게 보여 주려고 OFL 글꼴 하나의 곡선으로 만든 읽기용 글꼴이다. 원래 글꼴과는 다른 글꼴이다. |
-| Noting Bullet | SIL OFL 1.1 | 글머리표 원 하나만 직접 그린 글꼴 |
+| 대체 글꼴 ClassingHWP Fallback 001~130 | SIL OFL 1.1 | 라이선스 때문에 내줄 수 없는 글꼴을 비슷하게 보여 주려고 OFL 글꼴 하나의 곡선으로 만든 읽기용 글꼴이다. 원래 글꼴과는 다른 글꼴이다. |
+| ClassingHWP Bullet | SIL OFL 1.1 | 글머리표 원 하나만 직접 그린 글꼴 |
 | 그 밖의 글꼴 | 글꼴마다 다르다(OFL, Apache-2.0, 공공누리 등) | 정보 창의 글꼴 탭 |
 
 ## 한글 문서 형식

@@ -3,16 +3,24 @@
 // paint.cpp 와 pointer_hold.cpp 가 함께 쓰는 그리기 내부 선언.
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "noting/model/document.hpp"
-#include "noting/render/paint.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/model/document.hpp"
+#include "chwp/render/glyph_path.hpp"
+#include "chwp/render/paint.hpp"
+#include "chwp/render/scene.hpp"
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
+
+// 화면이 글자·그림·테두리를 칸 비트맵 대신 직접 그리는가. 셸 Host 값으로 켜고, GPU 를 못 쓰게 되면 꺼진다.
+bool screenVectors();
+void enableScreenVectors(bool on);
+// GPU 화면이 실패해 2D 대체 화면으로 갔다(참), 화면을 다시 연다(거짓).
+void noteScreenFailed(bool failed);
 
 // ---------------------------------------------------------------------------
 // paint.cpp
@@ -29,6 +37,8 @@ bool treatAsCharBorders(const Node& line, const model::Document* doc, std::vecto
 
 // ---------------------------------------------------------------------------
 // pointer_hold.cpp. 누르고 끄는 동안의 캐럿·선택 상태
+
+struct CachedPicture;
 
 struct HeldBox {
     int page = 0;
@@ -151,6 +161,62 @@ struct PointerHold {
     };
     std::vector<BandArea> bandAreas;
     int resizeHandle = -1;
+    // 도형 그리기. drawTool 이 0 이 아니면 다음 끌기 한 번으로 그 도형을 그린다(1 직사각형, 2 타원, 3 직선,
+    // 4 글상자, 5 세로 글상자). 다 끌면 drawPending 이 켜지고 editInsertDrawnShape 가 문서에 넣는다.
+    int drawTool = 0;
+    int drawPendingTool = 0;
+    // 고른 띄운 개체를 끌어 옮기는 중. 뗄 때 movePending 이 켜지고 editMoveObject 가 위치를 옮긴다.
+    bool moving = false;
+    bool movePending = false;
+    int movePage = -1;
+    std::int32_t moveStartX = 0;
+    std::int32_t moveStartY = 0;
+    std::int32_t moveDX = 0;
+    std::int32_t moveDY = 0;
+    int moveStory = -1;
+    int moveParagraph = -1;
+    int moveItem = -1;
+    // 그림이 아닌 개체(표·도형·글상자)의 크기 조절. 뗄 때 resizeObjectPending 이 켜지고 editResizeObject 가 반영한다.
+    // 표는 그린 줄 높이·칸 폭(resizeRows·resizeCols)을 비율대로 늘린다.
+    bool resizeObjectPending = false;
+    int resizeStory = -1;
+    int resizeParagraph = -1;
+    int resizeItem = -1;
+    std::int32_t resizeNewLeft = 0;
+    std::int32_t resizeNewTop = 0;
+    std::vector<std::int32_t> resizeRows;
+    std::vector<std::int32_t> resizeCols;
+    // 표 칸 경계 끌기. 1 세로선(칸 폭), 2 가로선(줄 높이). borderIndex 는 그 선 왼쪽(위) 칸·줄 번호다.
+    // 뗄 때 borderPending 이 켜지고 editResizeTableBorder 가 칸 폭·줄 높이를 바꾼다. 안 끌고 떼면 표를 고른다.
+    int borderDrag = 0;
+    bool borderPending = false;
+    bool borderMoved = false;
+    int borderPage = -1;
+    int borderIndex = -1;
+    bool borderOuter = false;  // 오른쪽·아래 바깥선이면 표 폭·높이가 바뀐다
+    std::int32_t borderStart = 0;
+    std::int32_t borderDelta = 0;
+    std::int32_t borderMin = 0;  // 끌 수 있는 범위(이웃 칸이 너무 좁아지지 않게)
+    std::int32_t borderMax = 0;
+    std::int32_t borderX0 = 0;  // 미리보기 선을 그릴 표 상자(쪽 좌표)
+    std::int32_t borderY0 = 0;
+    std::int32_t borderX1 = 0;
+    std::int32_t borderY1 = 0;
+    std::int32_t borderAt = 0;  // 처음 선 자리(세로선이면 x, 가로선이면 y)
+    int borderStory = -1;
+    int borderParagraph = -1;
+    int borderItem = -1;
+    std::vector<std::int32_t> borderSizes;  // 그린 칸 폭(세로선) 또는 줄 높이(가로선)
+    // 개체를 끌어 옮기거나 크기를 바꾸는 동안 보일 그 개체 모습. 누를 때 그 자리를 그려 둔다.
+    std::shared_ptr<const CachedPicture> dragSnapshot;
+    std::string dragSnapshotId;
+    bool drawing = false;
+    bool drawPending = false;
+    int drawPage = -1;
+    std::int32_t drawX0 = 0;
+    std::int32_t drawY0 = 0;
+    std::int32_t drawX1 = 0;
+    std::int32_t drawY1 = 0;
     int resizePage = -1;
     std::int32_t resizeLeft = 0;
     std::int32_t resizeTop = 0;
@@ -183,6 +249,7 @@ struct PointerHold {
 
 void bumpPointerPicture();
 void touchCaretBlink(PointerHold& hold);
+// 지금 편집 상태(EditState)의 커서·블록·조합. 아무 상태도 잡지 않았으면 프로세스 기본 상태다.
 PointerHold& pointerHold();
 int currentCaretPageHint();
 void clearPendingCharShape(PointerHold& hold);
@@ -213,7 +280,83 @@ bool lineInkHas(const model::Document& doc, const Node& line, std::int32_t lineX
 
 bool formatFieldsTouchChar(const FormatFields& fields);
 bool formatFieldsTouchPara(const FormatFields& fields);
+bool isTabKey(const std::string& key);
 void applyCharFields(model::CharShape& shape, const FormatFields& fields);
 void applyParaFields(model::ParaShape& shape, const FormatFields& fields);
+// 테두리/배경("char." · "para." 이름). 바뀐 값의 테두리/배경을 문서에서 찾아 쓰거나 새로 넣고 그 번호를 붙인다.
+void applyCharFillFields(model::Document& doc, model::CharShape& shape, const FormatFields& fields);
+void applyParaFillFields(model::Document& doc, model::ParaShape& shape, const FormatFields& fields);
+// 문단 종류(headingType)를 바꾸면 그 종류가 가리킬 번호·글머리표 정의를 고르거나 만든다.
+void applyParaHeadingFields(model::Document& doc, model::ParaShape& shape, const FormatFields& fields);
+// 막힌 글꼴 때문에 남겨 둔 개체 넣기를 이어서 한다. 남은 것이 없으면 문서를 바꾸지 않은 결과다.
+EditResult resumePendingInsert(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 그린 도형만 버린다. dropPendingInsert 가 부른다.
+void dropPendingDrawnShape();
+// 탭 설정(tabStops · tabAutoLeft · tabAutoRight). 같은 탭 정의를 찾아 쓰거나 새로 넣는다.
+void applyParaTabFields(model::Document& doc, model::ParaShape& shape, const FormatFields& fields);
+// 구역 기본 탭 간격(sectionDefaultTab). 있으면 그 값을 넣고 참을 돌려준다.
+bool sectionDefaultTabOf(const FormatFields& fields, std::int32_t& value);
+// 탭 목록 글("위치,종류,채움;...", 위치는 HWPUNIT)과 목록 사이를 오간다. 위치 차례로 두고 같은 위치는 나중 것만 남긴다.
+std::vector<model::TabStop> parseTabStops(const std::string& text);
+std::string tabStopsTextOf(const std::vector<model::TabStop>& stops);
+// 글자·문단 모양 번호로 대화 상자 값을 읽는다. sectionDefaultTab 이 0 이면 넣지 않는다.
+FormatFields formatFieldsOf(const model::Document& doc, const CursorStyle& st, std::int32_t sectionDefaultTab);
+// 패치를 적용한 글자·문단 모양 번호. 같은 모양이 있으면 그 번호, 없으면 새로 넣은 번호다.
+std::uint32_t deriveCharShapeId(model::Document& doc, std::uint32_t baseId, const FormatPatch& patch);
+std::uint32_t deriveParaShapeId(model::Document& doc, std::uint32_t baseId, const FormatPatch& patch);
 
-}  // namespace noting::render::paint_detail
+// ---------------------------------------------------------------------------
+// edit_commands.cpp. 고친 자리를 다시 놓고 편집 결과를 만든다. 되돌리기(undo.cpp)도 쓴다
+
+int charIndexToOffset(const model::Document& doc, const std::vector<Node>& pages, int story, int paraIdx, int charIndex);
+EditRelayoutResult relayoutAfterEdit(model::Document& doc, std::vector<Node>& pages, const EditRelayoutSpec& spec);
+EditResult makeEditResult(const model::Document& doc, bool handled, bool changed, int story, int paraIdx,
+                          const EditRelayoutResult* relayout = nullptr);
+
+// 다시 짠 쪽에서 붙은 문단·zOrder 로 그 개체를 찾아 다시 고른다. 없으면 거짓이다.
+bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
+                            int paragraph, int item);
+// 개체 노드가 가리키는 문서의 컨트롤. 없으면 nullptr 이다.
+model::Control* anchoredControl(model::Document& doc, int story, int paragraph, int item);
+// 개체 하나의 크기를 바꾼다(점·글상자 폭·캡션 폭을 같이). 표는 따로 칸을 늘린다.
+void resizeControl(model::Control& ctrl, std::uint32_t oldW, std::uint32_t oldH, std::uint32_t newW,
+                   std::uint32_t newH);
+
+// 글자 외곽선(글꼴 단위 1000 = emPx)을 쪽 그림과 같은 Painter 로 width x height 판에 칠한 알파. 시험이 쓴다.
+std::vector<std::uint8_t> glyphAlpha(const std::vector<GlyphCommand>& commands, float emPx, float penX, float baseY,
+                                     int width, int height);
+
+}  // namespace chwp::render::paint_detail
+
+namespace chwp::render {
+
+// 편집 명령 본체. 되돌리기 칸은 남기지 않는다. 공개 함수(undo.cpp)가 앞뒤로 되돌리기 칸을 남긴다.
+// editSwapLicenseFonts 의 본체. 되돌리기 기록은 undo.cpp 가 감싼다.
+EditResult swapLicenseFontsNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight,
+                               const std::vector<std::pair<std::string, std::string>>& chosen);
+EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const std::string& text, bool composing,
+                         bool useStoredLineHeight);
+EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey key, bool shift, bool ctrl, bool alt,
+                      bool useStoredLineHeight);
+EditResult applyFormatNow(model::Document& doc, std::vector<Node>& pages, const FormatPatch& patch,
+                          bool useStoredLineHeight);
+// 칸 블록이 골라져 있으면 그 표를 품은 바깥 문단. 되돌리기는 이 문단을 베껴 칸 전부를 함께 되돌린다.
+bool cellBlockHost(int& story, int& paragraph);
+// 칸 블록의 칸마다 문단 전체에 서식을 건다(한글 칸 블록 + 글자·문단 모양). 블록은 그대로 둔다.
+EditResult applyFormatToCellsNow(model::Document& doc, std::vector<Node>& pages, const FormatPatch& patch,
+                                 bool useStoredLineHeight);
+EditResult applyPageSetupNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                             bool wholeDocument, bool useStoredLineHeight);
+EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int rows, int cols, bool useStoredLineHeight);
+EditResult insertPictureNow(model::Document& doc, std::vector<Node>& pages, const Bytes& image, bool useStoredLineHeight);
+EditResult insertShapeNow(model::Document& doc, std::vector<Node>& pages, int tool, int page, std::int32_t x0,
+                          std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight);
+EditResult insertDrawnShapeNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+EditResult moveObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+EditResult resizeTableBorderNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 도형을 붙일 문단(쪽 page 의 y 자리). 되돌리기 칸을 그 문단 둘레로 잡을 때 쓴다.
+bool shapeAnchor(const model::Document& doc, const std::vector<Node>& pages, int page, std::int32_t y, int& story,
+                 int& paragraph);
+
+}  // namespace chwp::render

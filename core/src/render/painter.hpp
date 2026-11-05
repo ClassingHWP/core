@@ -1,5 +1,7 @@
 #pragma once
 
+#include "render/gpu_config.hpp"
+
 // 쪽 노드 트리를 비트맵이나 Skia 캔버스에 그리고, 캐럿·선택 칸을 찾는 Painter.
 // 메서드 정의는 painter_draw.cpp, painter_shape.cpp, painter_table.cpp, painter_text.cpp, painter_caret.cpp 에 있다.
 // 이 파일의 도우미 함수와 전역 값의 정의는 paint.cpp 에 있다.
@@ -14,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -26,16 +29,15 @@
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
 
-#include "noting/render/decorate.hpp"
-#include "noting/render/glyph_path.hpp"
-#include "noting/render/paint.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/render/decorate.hpp"
+#include "chwp/render/glyph_path.hpp"
+#include "chwp/render/paint.hpp"
+#include "chwp/render/scene.hpp"
 #include "render/paint_detail.hpp"
 #include "render/border_mesh.hpp"
 #include "render/picture.hpp"
 #include "stb_truetype.h"
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkBlendMode.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColorFilter.h"
@@ -56,10 +58,14 @@
 #include "include/core/SkVertices.h"
 #include "include/effects/SkColorMatrix.h"
 #include "include/effects/SkRuntimeEffect.h"
-#endif
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
+#if CHWP_HAS_GPU
+#if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
+#else
+#include "dawn/dawn_proc.h"
+#include "dawn/native/DawnNative.h"
+#endif
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -76,7 +82,7 @@
 #include "src/gpu/graphite/RendererProvider.h"
 #endif
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 struct Bitmap {
     int width = 0;
@@ -94,6 +100,9 @@ struct Face {
     stbtt_fontinfo info{};
     bool ok = false;
     bool fallbackOutline = false;
+    // 접힌 글꼴. bytes 와 info 를 놓았다. 쓸 때 reopenFaceLocked 가 다시 연다. 객체는 남아 GlyphMem 이 가리킨다.
+    bool folded = false;
+    int offset = 0;
 };
 
 // 한 번 찾은 글꼴 글자. 자리는 이 노드를 가리키고, 글자 코드로 다시 찾지 않는다.
@@ -104,6 +113,8 @@ struct GlyphMem {
     // 1000 이 1배. 폴백 윤곽만 원래 글꼴의 진행 폭·어센더에 맞춘다.
     int fitX = 1000;
     int fitY = 1000;
+    // 글꼴 파일의 진행 폭(1000 em 기준). 찾을 때 한 번 읽어 두어, 글꼴을 접어도 쓴다.
+    float advance1000 = 0.f;
 };
 
 void ensureBitmap(Bitmap& bitmap);
@@ -190,10 +201,23 @@ void parseHex(const std::string& text, std::uint8_t& r, std::uint8_t& g, std::ui
 
 const std::vector<GlyphCommand>& hangulCommands(const GlyphMem* mem, bool bold, bool italic, int ppem);
 
-std::vector<std::vector<GlyphPoint>> contoursFromCommands(const std::vector<GlyphCommand>& commands);
+// 세로쓰기에서 세우는 글자. 돌린 틀에 그린 뒤 쪽째 시계 방향으로 돌리므로, 글자는 칸 가운데(cx, cy)를 축으로
+// 반시계 방향 90° 돌려 둔다. dx·dy 는 돌린 뒤 미는 픽셀이다(。、 를 칸 오른쪽 위로).
+struct GlyphTurn {
+    bool on = false;
+    float cx = 0.f;
+    float cy = 0.f;
+    float dx = 0.f;
+    float dy = 0.f;
+};
 
-void paintFlatGlyph(Bitmap& bitmap, const std::vector<std::vector<GlyphPoint>>& contours, float emPx, int ratio, int fitX,
-                    int fitY, float penX, float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b);
+inline void turnGlyphPoint(const GlyphTurn* turn, float& x, float& y) {
+    if (!turn || !turn->on) return;
+    const float rx = turn->cx + (y - turn->cy);
+    const float ry = turn->cy - (x - turn->cx);
+    x = rx + turn->dx;
+    y = ry + turn->dy;
+}
 
 // 칸 선은 경계 한가운데라 바깥 절반이 표 상자 밖에 있다. 픽셀로 반올림해도 잘리지 않게 선 굵기만큼 여유를 둔다.
 std::int32_t tableBorderBleed(const Node& node);
@@ -207,8 +231,12 @@ struct TextHost {
 
 constexpr int kObjectHostDepth = 8;
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-// 글자 하나. 글꼴 글자는 GlyphMem 을 가리키고, 색과 위치만 칸에 둔다.
+// 불투명 ARGB 색. 화면 쪽 자료는 Skia 없이 이 값으로 색을 들고, 그리는 쪽이 그대로 SkColor 로 쓴다.
+inline std::uint32_t opaqueArgb(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    return 0xFF000000u | (static_cast<std::uint32_t>(r) << 16) | (static_cast<std::uint32_t>(g) << 8) | b;
+}
+
+// 화면이 칸 비트맵 대신 그리는 글자 하나. 글꼴 글자는 GlyphMem 을 가리키고, 색과 위치만 칸에 둔다.
 struct FrameGlyph {
     GlyphMem* mem = nullptr;
     int ppem = 0;
@@ -217,20 +245,28 @@ struct FrameGlyph {
     bool italic = false;
     float penX = 0.f;
     float penY = 0.f;
-    SkColor color = SK_ColorBLACK;
+    std::uint32_t color = 0xFF000000u;
     int story = -1;
     int paragraph = -1;
     int offset = -1;
     float exactPpem = 0.f;
-    TextHost hosts[kObjectHostDepth]{};
-    int hostCount = 0;
+    // 개체 안 글자의 바깥 개체 자리. 칸의 FrameGlyphs::hosts[hostFirst, hostFirst + hostCount) 이다.
+    std::int32_t hostFirst = 0;
+    std::uint8_t hostCount = 0;
+    // 1 이면 펜을 축으로 마스크를 시계 방향 90° 돌려 찍는다(세로쓰기에서 눕힌 글자).
+    std::uint8_t turn = 0;
+    // 세로쓰기에서 세운 글자. 돌린 틀의 칸 가운데(turnCx, turnCy)와 미는 픽셀. 칸을 종이로 돌릴 때 펜을 다시 잡는다.
+    bool upright = false;
+    float turnCx = 0.f;
+    float turnCy = 0.f;
+    float turnDx = 0.f;
+    float turnDy = 0.f;
     mutable int cachedWant = 0;
     mutable int cachedDrawnPpem = 0;
     mutable std::uint32_t cachedGen = 0;
     mutable std::uint32_t cachedBuiltSeq = 0;
     mutable const void* cachedMask = nullptr;
 };
-#endif
 
 // 줄 자리. 글꼴 글자는 GlyphMem 을 가리킨다. 윤곽은 그 포인터로 읽는다.
 struct GlyphSpot {
@@ -247,32 +283,21 @@ struct GlyphSpot {
     int story = -1;
     int paragraph = -1;
     int offset = -1;
-    TextHost hosts[kObjectHostDepth]{};
-    int hostCount = 0;
 };
 
-struct SpanMeasure {
-    std::string text;
-    std::uint32_t charShapeId = 0;
-    std::int32_t fontSize = 0;
-    std::int32_t ratio = 100;
-    std::vector<std::int32_t> advances;
-    std::vector<std::int32_t> inks;
+// 한 칸의 화면 글자. 같은 칸 글자는 대개 바깥 개체 자리가 같아서, 그 자리는 글자마다 두지 않고 여기 한 번만 둔다.
+struct FrameGlyphs {
+    std::vector<FrameGlyph> glyphs;
+    std::vector<TextHost> hosts;
 };
-
-struct TabMeasure {
-    std::int32_t pen = 0;
-    std::int32_t width = 0;
-    std::string leader;
-};
-
-std::map<const Node*, TabMeasure>& tabMeasures();
 
 GlyphMem* glyphMemory(const std::string& font, char32_t cp);
 
 extern std::shared_mutex gSpanMu;
 
-const SpanMeasure& rememberSpanMeasure(const Node& slot, const model::Document* doc);
+// 글자마다 폭(다음 글자까지, 자간 포함)과 잉크 폭을 잰다. 잰 값은 글자 모양·글자별로 남겨 다시 쓴다.
+void measureText(const model::Document* doc, std::string_view text, std::uint32_t charShapeId, int size, int ratio,
+                 std::vector<std::int32_t>& advances, std::vector<std::int32_t>& inks);
 
 struct LineBlockFullRun {
     std::int32_t relLeft = 0;
@@ -337,7 +362,9 @@ struct TabGap {
 };
 
 // 탭 위치는 본문 왼쪽 끝 기준이다. pen 은 줄 원점에서의 글자 폭이고, 줄의 x 와 문단 왼쪽 여백을 더한다.
-TabGap tabGapAt(const Node& line, std::int32_t pen, std::size_t index, const model::Document* doc);
+// 줄 글자 표로 같은 탭 자리를 정한다. runIndex 는 그 탭 구간이다.
+TabGap tabGapAtRun(const Node& line, const LineGlyphs& glyphs, std::int32_t pen, std::size_t runIndex,
+                   const model::Document* doc);
 
 bool claimLineWarn(const std::string& key);
 
@@ -355,15 +382,15 @@ struct Painter {
     Bitmap bitmap;
     float scale = 1;
     bool limitView = false;
+    // 쪽을 통째로 그릴 때는 띄운 개체의 캡션 글도 이 걸음에서 그린다. 줄 칸으로 그릴 때는 캡션 줄이 따로 칸이 된다.
+    bool floatCaptions = false;
     float viewRightHu = 0;
     float viewBottomHu = 0;
     PaintLayer pass = PaintLayer::All;
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
     // 켜져 있으면 글자 픽셀 대신 제어점 경로를 담는다.
-    std::vector<FrameGlyph>* glyphSink = nullptr;
+    FrameGlyphs* glyphSink = nullptr;
     // 켜져 있으면 그림 픽셀 대신 화면에서 그릴 자리와 원본 범위를 담는다.
     std::vector<FramePicture>* pictureSink = nullptr;
-#endif
     // 켜져 있으면 표 테두리 선분과 모서리 잇기를 칠하지 않고 HU 로 적는다. 화면 셰이더가 그린다.
     // 비트맵이 잘려 있을 때는 CPU 로 칠한다. 화면은 칸 범위로만 자른다.
     std::vector<BorderPiece>* borderSink = nullptr;
@@ -410,7 +437,8 @@ struct Painter {
         ObjectHostScope& operator=(const ObjectHostScope&) = delete;
     };
 
-    void stampHosts(TextHost* hosts, int& count) const;
+    // 지금 그리는 바깥 개체 자리를 글자에 붙인다. 앞 글자와 같으면 그 자리를 같이 쓴다.
+    void stampHosts(FrameGlyph& glyph) const;
 
     struct NestedCaret {
         std::int32_t x = 0;
@@ -514,12 +542,10 @@ struct Painter {
     void pushClip(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h);
 
     void popClip();
-#if NOTING_HAS_SKIA
     sk_sp<SkSurface> skiaSurface;
     SkCanvas* skiaCanvas = nullptr;
 
     SkCanvas* canvas();
-#endif
 
     // 윤곽은 이미 한글 방식으로 편 직선이다. Skia 가 있으면 그 직선을 채우고, 없으면 우리 스캔라인이 채운다.
     void paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, int ratio, int fitX, int fitY, float penX,
@@ -533,6 +559,7 @@ struct Painter {
               std::uint8_t b, bool colored);
 
     bool skipGlyphs = false;
+    GlyphTurn glyphTurn;  // 지금 그리는 글자를 세로쓰기로 세운다
     // 자리만 남길 때는 칠·안내선·개체 그림을 그리지 않고 펜만 옮긴다.
     bool placesOnly = false;
     // 칸으로 나눌 때 글자처럼 넣은 개체는 줄 비트맵에 그리지 않는다. 그 개체 칸이 따로 있다.
@@ -549,9 +576,7 @@ struct Painter {
 
     void box(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h, const std::string& fill,
              const BorderEdge& edge, const std::string& role, PaintLayer place);
-#if NOTING_HAS_SKIA
     void imageFlip(SkCanvas* canvas, int dw, int dh, bool flipH, bool flipV) const;
-#endif
 
     // 같은 크기이거나 바둑판은 원본 픽셀 하나를 집는다.
     bool nearestImage(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
@@ -560,10 +585,8 @@ struct Painter {
     // 축소. 2-Pass 분리형 Scaled Catmull-Rom + 로컬 극값 클램핑(Anti-ringing)으로 선명도와 안티앨리어싱을 함께 유지한다.
     bool paintAreaImage(const std::uint8_t* src, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH,
                         bool flipV, const ImageDraw* draw = nullptr);
-#if NOTING_HAS_SKIA
     bool mitchellCpu(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
                      const ImageDraw* draw = nullptr, const CachedPicture* cached = nullptr);
-#endif
 
     // 확대는 Catmull-Rom. CPU Skia가 그린다. 글자 폭은 조판 advance를 그대로 쓴다.
     bool mitchellImage(const std::uint8_t* rgba, int sw, int sh, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
@@ -644,6 +667,9 @@ struct Painter {
     // 칸은 변마다 선이 다르다. 없는 변은 그리지 않고, 있는 변은 칸 경계에 맞춘다.
     // 채우기는 내용보다 먼저, 선은 내용 뒤에 그린다. 글이 선 안쪽을 덮지 않게 한다.
     void cellChrome(const Node& node, std::int32_t x, std::int32_t y, bool borders);
+    // 테두리/배경 무늬. 비트맵 픽셀 상자에 1픽셀 줄을 긋는다. 간격은 한글처럼 1/12 인치(600)이고,
+    // 칸이 갈려도 줄이 이어지게 쪽 원점에 맞춘다(한글 2024, tmp/hatch).
+    void hatchRect(int x0, int y0, int w, int h, const std::string& style, const std::string& color);
 
     // 맞닿은 변은 칸마다 적혀 있고, 그릴 때는 하나만 남긴다.
     // 없는 선은 진다. 종류 번호가 작은 쪽이 이긴다. 실선 1, 파선 2, 점선 3, … 삼중선 11.
@@ -654,8 +680,10 @@ struct Painter {
 
     void cellDiagonals(const Node& node, std::int32_t x, std::int32_t y);
 
+    // strip 범위는 표 HU. 띠가 겹치는 여백에서 같은 선을 두 띠가 서로 다른 반올림으로 긋지 않게,
+    // 가로선은 Y 띠, 세로선은 X 띠 하나만 맡는다. -1 이면 자르지 않는다.
     void paintTableBorders(const Node& tableNode, std::int32_t ox, std::int32_t oy, std::int32_t stripY0 = 0,
-                           std::int32_t stripY1 = -1);
+                           std::int32_t stripY1 = -1, std::int32_t stripX0 = 0, std::int32_t stripX1 = -1);
 
     struct Mark {
         char32_t cp = 0;
@@ -672,15 +700,24 @@ struct Painter {
         bool superscript = false;
         bool subscript = false;
         bool adjustable = false;
+        bool synthetic = false;  // 자동 번호 대신 넣은 글자. 그리기만 하고 커서 칸에서는 뺀다
+        std::int32_t lead = 0;   // 글자 격자 칸 안에서 글자를 오른쪽으로 미는 폭. 캐럿은 칸 경계에 선다
+    bool upright = false;    // 세로쓰기에서 세우는 글자. 칸 가운데를 축으로 돌려 그린다
         std::string font;
         std::string color;
         std::string background;
+        std::string hatchStyle;
+        std::string hatchColor;
         std::string shade;
         std::string markpen;
         std::string leader;
         const Node* object = nullptr;
-        const Node* noteSpan = nullptr;  // 각주·미주 번호 전체. 1) 은 한 글자다.
+        // 각주·미주 번호 전체와 글자마다의 폭. 1) 은 한 마크다. 비어 있으면 번호가 아니다.
+        std::string noteText;
+        std::vector<std::int32_t> noteAdvances;
+        std::vector<std::int32_t> noteInks;
         int slot = -1;
+        int run = -1;  // 줄 글자 표에서 만든 마크의 구간 번호
     };
 
     static const model::Style* findStyle(const model::Document& doc, std::uint32_t id);
@@ -697,11 +734,16 @@ struct Painter {
         std::int32_t perSpace = 0;
         std::int32_t spaceLeft = 0;
         std::int32_t perGap = 0;
+        // 띄어쓰기 없는 양쪽 정렬 줄은 남은 폭을 글자 뒤마다 나눈다(줄 마지막 글자와 개체 뒤는 뺀다).
+        std::int32_t perChar = 0;
+        std::int32_t charLeft = 0;
         int contentCount = 0;
         int firstGlyph = 0;
     };
 
     static bool markPads(const Mark& mark);
+    // 띄어쓰기 없는 양쪽 정렬 줄에서 이 마크 뒤에 남은 폭을 나눠 주는가.
+    static bool takesCharGap(const std::vector<Mark>& marks, std::size_t index, const LineFit& fit);
 
     // 글자 폭을 뺀 뒤의 들여쓰기와 정렬. 줄 비트맵과 글자처럼 넣은 개체 칸이 같은 값을 쓴다.
     LineFit fitLine(const Node& node, const std::vector<Mark>& marks) const;
@@ -742,7 +784,15 @@ struct Painter {
 
     void reportLineSeg(const Node& node, std::int32_t pageX, std::int32_t pageY, bool force);
 
+    // 줄의 글자 칸. 줄 글자 표(lineGlyphs)로 만든다.
     std::vector<Mark> collectMarks(const Node& node);
+    // 줄 글자 표로 collectMarks 와 같은 마크를 만든다. 노드 주소로 찾는 캐시를 쓰지 않는다.
+    std::vector<Mark> marksFromRuns(const Node& node, const LineGlyphs& glyphs);
+    // 커서가 서는 글자만. 커서 칸 i 가 이 목록의 i 번째 글자다.
+    std::vector<Mark> caretMarks(const Node& node);
+    static void applyCharGrid(std::vector<Mark>& marks, std::int32_t cell, bool wongoji);
+    // 세로쓰기: 세우는 글자는 1em 칸을 쓰고 그 칸 가운데에 선다. 줄을 나눌 때와 같은 verticalUpright 로 가른다.
+    void applyVertical(std::vector<Mark>& marks, int direction) const;
 
     // 상대 크기는 그리는 글자만 바꾼다. 크기 × 상대 크기 / 100 을 반올림한다. 100이면 그대로다.
     // 위첨자·아래첨자는 그 글자 상자를 다시 크기 × 16 / 25 로 줄인다.
@@ -782,7 +832,8 @@ struct Painter {
     void strokePageBorderNode(const Node& node, std::int32_t x, std::int32_t y);
 
     void paintPiece(const Node& node, int kind, std::int32_t x, std::int32_t y, bool inObject,
-                    std::int32_t stripY0 = 0, std::int32_t stripY1 = -1);
+                    std::int32_t stripY0 = 0, std::int32_t stripY1 = -1, std::int32_t stripX0 = 0,
+                    std::int32_t stripX1 = -1);
 
     void paintPageFill(const Node& paper, std::int32_t ox, std::int32_t oy);
 
@@ -791,6 +842,18 @@ struct Painter {
     void paintPageBorder(const Node& paper, std::int32_t ox, std::int32_t oy);
 
     void walk(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject = false, int borderJoin = 0);
+    // 세로쓰기 본문(turned). 돌린 틀의 비트맵에 그린 뒤 시계 방향으로 돌려 붙인다.
+    void walkTurned(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin);
+    bool turning = false;
+    // 돌린 틀 안에서 만난 세운 개체. 틀을 종이로 돌려 놓은 뒤 종이 자리(x, y)에 그대로 그린다.
+    struct UprightLater {
+        const Node* node = nullptr;
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        bool inObject = false;
+    };
+    std::vector<UprightLater> uprightLater;
+    std::int32_t turnedBitmapHu = 0;  // 돌린 틀로 그리는 동안 종이 비트맵 폭(HU)
 
     // 글 뒤 개체를 먼저 깔고, 글자를 그린 다음, 글 앞 개체를 올린다. 같은 층은 zOrder가 클수록 위다.
     void paintStackedChildren(const Node& node, std::int32_t x, std::int32_t y, bool inObject);
@@ -827,11 +890,90 @@ struct Painter {
     void walkCaret(const Node& node, std::int32_t ox, std::int32_t oy, std::int32_t px, std::int32_t py,
                    CaretPlace& best, bool drag, int anchorPara, int anchorOff);
 
+    // 세로쓰기 틀. 원점은 종이의 (x, y), 가로 폭은 span 이다. 틀의 (lx, ly) 는 종이의 (x + span − ly, y + lx) 다.
+    // span 이 0 이면 돌리지 않은 종이 그대로다.
+    struct TurnFrame {
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::int32_t span = 0;
+        bool on() const { return span > 0; }
+    };
+    // x, y 는 줄이 든 틀의 좌표다. turn 이 켜져 있으면 세로쓰기 틀의 줄이라 돌린 틀 좌표다.
     struct StoryLine {
         const Node* node = nullptr;
         std::int32_t x = 0;
         std::int32_t y = 0;
+        TurnFrame turn;
     };
+    // 종이 점을 줄 방향 좌표로. 세로쓰기 줄은 종이 Y 가 줄 방향이다.
+    static std::int32_t alongLine(const StoryLine& line, std::int32_t x, std::int32_t y) {
+        return line.turn.on() ? y - line.turn.y : x;
+    }
+    // 돌린 틀에서 잡은 커서를 종이 자리로 바꾼다. 막대는 눕는다.
+    static void turnCaretToPaper(CaretPlace& place, const TurnFrame& turn) {
+        if (!turn.on() || !place.hit) return;
+        const std::int32_t along = place.x;
+        place.x = turn.x + turn.span - (place.y + place.height);
+        place.y = turn.y + along;
+        place.turned = true;
+    }
+    // 종이 점 → 돌린 틀 점.
+    static void paperToTurn(const TurnFrame& turn, std::int32_t& x, std::int32_t& y) {
+        if (!turn.on()) return;
+        const std::int32_t lx = y - turn.y;
+        y = turn.x + turn.span - x;
+        x = lx;
+    }
+    // 줄·커서·블록을 모을 때 지금 든 종이 폭과 세로쓰기 틀. 돌린 틀 노드에 들어갈 때 하나씩 바꾼다.
+    std::int32_t caretPaperW = 0;
+    TurnFrame caretTurn;
+    const Node* caretTurnNode = nullptr;
+    // 돌린 틀(turned)이나 세운 개체 상자(upright)에 들어갈 때 틀을 바꾸고, 나올 때 되돌린다.
+    // turned: 원점은 부모 자리(ox, oy)고 그 아래 좌표는 (0, 0)부터다. upright: 틀의 상자를 종이 자리로 돌려 그 자리가 원점이다.
+    struct CaretTurnScope {
+        Painter& painter;
+        TurnFrame saved;
+        const Node* savedNode;
+        explicit CaretTurnScope(Painter& p) : painter(p), saved(p.caretTurn), savedNode(p.caretTurnNode) {}
+        ~CaretTurnScope() {
+            painter.caretTurn = saved;
+            painter.caretTurnNode = savedNode;
+        }
+    };
+    // node 가 돌린 틀이면 틀을 켜고 (ox, oy) 를 (0, 0) 으로, 세운 상자면 틀을 끄고 (ox, oy) 를 그 종이 자리로 바꾼다.
+    // 바꿨으면 true 다. 자식은 바뀐 (ox, oy) 에 node.x·node.y 를 더하지 않고 놓아야 하는 세운 상자만 uprightBox 를 켠다.
+    // 글자처럼 넣은 세운 개체 상자의 자식 원점. 틀의 상자 원점 (x, y) 를 종이 자리로 바꾸고 틀을 끈다.
+    void enterUprightObject(const Node& object, std::int32_t& x, std::int32_t& y) {
+        if (!object.upright || !caretTurn.on()) return;
+        const std::int32_t paperX = caretTurn.x + caretTurn.span - y - object.height;
+        const std::int32_t paperY = caretTurn.y + x;
+        caretTurn = {};
+        x = paperX;
+        y = paperY;
+    }
+    bool enterCaretFrame(const Node& node, std::int32_t& ox, std::int32_t& oy, bool& uprightBox) {
+        uprightBox = false;
+        if (node.kind == NodeKind::Paper) caretPaperW = node.width;
+        if (node.turned != 0 && caretTurnNode != &node) {
+            caretTurn = {ox, oy, node.turnSpan > 0 ? node.turnSpan : caretPaperW};
+            caretTurnNode = &node;
+            ox = 0;
+            oy = 0;
+            return true;
+        }
+        if (node.upright && caretTurn.on()) {
+            const std::int32_t bx = ox + node.x;
+            const std::int32_t by = oy + node.y;
+            const std::int32_t paperX = caretTurn.x + caretTurn.span - by - node.height;
+            const std::int32_t paperY = caretTurn.y + bx;
+            caretTurn = {};
+            ox = paperX;
+            oy = paperY;
+            uprightBox = true;
+            return true;
+        }
+        return false;
+    }
 
     static bool posBefore(int paragraph, int offset, int otherParagraph, int otherOffset) {
         return paragraph < otherParagraph || (paragraph == otherParagraph && offset < otherOffset);
@@ -854,8 +996,12 @@ struct Painter {
         for (const LineBlockNested& item : cached.relNested) {
             if (!item.object) continue;
             entered.insert(item.object);
+            const CaretTurnScope scope(*this);
+            std::int32_t cx = lineX + item.relX;
+            std::int32_t cy = lineY + item.relY;
+            enterUprightObject(*item.object, cx, cy);
             for (const Node& child : item.object->children) {
-                visit(child, lineX + item.relX, lineY + item.relY, item.object);
+                visit(child, cx, cy, item.object);
             }
         }
         for (const Node& child : line.children) {
@@ -967,4 +1113,4 @@ void forEachStoryParagraphPage(const std::vector<Node>& pages, int story, int fr
     }
 }
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

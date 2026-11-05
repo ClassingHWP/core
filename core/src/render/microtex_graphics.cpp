@@ -14,11 +14,9 @@
 #include <utility>
 #include <vector>
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkCanvas.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPathBuilder.h"
-#endif
 
 namespace {
 
@@ -128,12 +126,10 @@ private:
 class StbGraphics : public tex::Graphics2D {
 public:
     StbGraphics(std::uint8_t* pixels, int width, int height) : pixels_(pixels), width_(width), height_(height) {}
-#if NOTING_HAS_SKIA
     StbGraphics(SkCanvas* canvas, float originX, float originY) : canvas_(canvas) {
         e_ = originX;
         f_ = originY;
     }
-#endif
 
     void setColor(tex::color c) override { color_ = c; }
     tex::color getColor() const override { return color_; }
@@ -185,12 +181,10 @@ public:
         if (!font) return;
         Face& face = faceFor(font->path());
         if (!face.ok) return;
-#if NOTING_HAS_SKIA
         if (canvas_) {
             drawCharPath(face, ch, x, y, font->getSize());
             return;
         }
-#endif
         const float pixel = std::max(1.f, font->getSize() * sy());
         const float scale = stbtt_ScaleForMappingEmToPixels(&face.info, pixel);
         int bw = 0;
@@ -236,7 +230,6 @@ public:
         float by = 0.f;
         map(x1, y1, ax, ay);
         map(x2, y2, bx, by);
-#if NOTING_HAS_SKIA
         if (canvas_) {
             const int ca = static_cast<int>((color_ >> 24) & 255);
             if (ca == 0) return;
@@ -250,7 +243,6 @@ public:
             canvas_->drawLine(ax, ay, bx, by, paint);
             return;
         }
-#endif
         const float thick = std::max(1.f, stroke_.lineWidth * std::max(sx(), sy()));
         const int radius = std::max(0, static_cast<int>(thick * 0.5f));
         const int x0 = static_cast<int>(std::lround(ax));
@@ -345,7 +337,6 @@ private:
         const int cg = static_cast<int>((color_ >> 8) & 255);
         const int cb = static_cast<int>(color_ & 255);
         const int ca = static_cast<int>((color_ >> 24) & 255);
-#if NOTING_HAS_SKIA
         if (canvas_) {
             if (ca == 0) return;
             SkPathBuilder path;
@@ -361,13 +352,11 @@ private:
             canvas_->drawPath(path.detach(), paint);
             return;
         }
-#endif
         for (int py = y0; py < y1; ++py) {
             for (int px = x0; px < x1; ++px) blend(px, py, cr, cg, cb, ca);
         }
     }
 
-#if NOTING_HAS_SKIA
     SkColor skColor() const {
         return SkColorSetARGB(static_cast<U8CPU>((color_ >> 24) & 255), static_cast<U8CPU>((color_ >> 16) & 255),
                               static_cast<U8CPU>((color_ >> 8) & 255), static_cast<U8CPU>(color_ & 255));
@@ -418,14 +407,11 @@ private:
         paint.setColor(skColor());
         canvas_->drawPath(path.detach(), paint);
     }
-#endif
 
     std::uint8_t* pixels_ = nullptr;
     int width_ = 0;
     int height_ = 0;
-#if NOTING_HAS_SKIA
     SkCanvas* canvas_ = nullptr;
-#endif
     tex::color color_ = tex::black;
     tex::Stroke stroke_{};
     const tex::Font* font_ = nullptr;
@@ -451,7 +437,7 @@ tex::sptr<tex::TextLayout> tex::TextLayout::create(const std::wstring& src, cons
     return std::make_shared<StbTextLayout>(src, font);
 }
 
-namespace noting::render {
+namespace chwp::render {
 
 void drawMicrotex(tex::TeXRender& render, std::uint8_t* pixels, int width, int height, float originX, float originY,
                   float scale) {
@@ -461,12 +447,10 @@ void drawMicrotex(tex::TeXRender& render, std::uint8_t* pixels, int width, int h
     render.draw(graphics, 0, 0);
 }
 
-#if NOTING_HAS_SKIA
 void drawMicrotex(tex::TeXRender& render, SkCanvas& canvas, float originX, float originY, float scale) {
     StbGraphics graphics(&canvas, originX, originY);
     if (scale != 1.f) graphics.scale(scale, scale);
     render.draw(graphics, 0, 0);
 }
-#endif
 
-}  // namespace noting::render
+}  // namespace chwp::render

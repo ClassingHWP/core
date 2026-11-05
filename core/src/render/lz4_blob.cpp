@@ -1,8 +1,8 @@
-#include "noting/render/lz4_blob.hpp"
+#include "chwp/render/lz4_blob.hpp"
 
 #include "lz4.h"
 
-namespace noting::render {
+namespace chwp::render {
 
 std::vector<std::uint8_t> compressLz4(const std::uint8_t* data, std::size_t size) {
     if (!data || size == 0 || size > static_cast<std::size_t>(LZ4_MAX_INPUT_SIZE)) return {};
@@ -29,4 +29,4 @@ std::vector<std::uint8_t> decompressLz4(const std::uint8_t* data, std::size_t si
     return out;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

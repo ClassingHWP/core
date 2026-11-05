@@ -1,8 +1,8 @@
-#include "noting/hwp/records.hpp"
+#include "chwp/hwp/records.hpp"
 
-#include "noting/container/zip.hpp"
+#include "chwp/container/zip.hpp"
 
-namespace noting::hwp {
+namespace chwp::hwp {
 
 const char* tagName(std::uint16_t t) {
     switch (t) {
@@ -117,4 +117,4 @@ bool decompressStream(ByteView input, Bytes& out) {
     return zip::inflateRaw(input, out);
 }
 
-}  // namespace noting::hwp
+}  // namespace chwp::hwp

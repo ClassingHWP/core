@@ -195,13 +195,13 @@ template <class T> struct Result { Status status; T value; };
                            "text": "인수분해"}]}
 ```
 
-CLI 는 `noting-dump` 에 `call` 명령 하나를 더한다: `noting-dump call 문서.hwp req.json [-o out.json] [--save out.hwp]`.
+CLI 는 `chwp-dump` 에 `call` 명령 하나를 더한다: `chwp-dump call 문서.hwp req.json [-o out.json] [--save out.hwp]`.
 요청 파일에 여러 줄(JSON Lines)을 주면 같은 세션에서 차례로 부른다. 그림은 `--out-dir` 에 쓰고 JSON 에는 경로를 남긴다.
 WASM 은 `agentCall` 을 그대로 내보낸다.
 
 ## 9. 문서화 규칙
 
-- 공개 헤더(`noting/agent.hpp`)의 모든 함수 위에: 무엇을 하는지, 좌표·위치 단위, 실패 코드, 부작용(조판·되돌리기 기록).
+- 공개 헤더(`chwp/agent.hpp`)의 모든 함수 위에: 무엇을 하는지, 좌표·위치 단위, 실패 코드, 부작용(조판·되돌리기 기록).
 - 구조체 필드마다 단위와 원점.
 - 예시 요청·응답은 `docs/agent-api.md` 와 테스트(`tests/test_agent.cpp`)가 같은 JSON 을 쓴다. 문서 예시가 테스트로 검증된다.
 
@@ -211,7 +211,7 @@ WASM 은 `agentCall` 을 그대로 내보낸다.
 2. 판정 코드를 `hit_test.cpp` 로 옮기고 `hitTest`/`itemsIn`. 포인터 처리도 같은 코드를 쓰게.
 3. `renderPage`/`renderRegion`/`renderRange`/`renderObject`.
 4. 위치 기반 `insertText`/`delete`/`replace`/서식, 트랜잭션·되돌리기.
-5. `agentCall` JSON, `noting-dump call`, WASM 내보내기.
+5. `agentCall` JSON, `chwp-dump call`, WASM 내보내기.
 6. `insertTable`/`insertPicture`/`insertEquation`, 칸·글상자 편집의 다시 조판 보강.
 
 각 단계마다 `tests/test_agent.cpp` 에 샘플 문서(커밋된 `samples/shortcut.hwp` 등)로 왕복 테스트를 붙인다.
@@ -226,7 +226,7 @@ AI 웹(claude.ai 등)에서 문서를 보여 주는 길은 세 가지다. 2026-1
   Node 는 기본 목록에 없다. 런타임에 패키지를 설치할 수 없다.
 - 네트워크: Claude API 는 **완전히 막힘**. claude.ai 는 사용자·관리자 설정에 따라 다름. Claude Code 는 열림.
   → 글꼴·WASM 을 내려받는 방식은 쓸 수 없다. **필요한 것은 모두 Skill 안에 넣는다.**
-- 그래서 Skill 에는 **Linux x86_64 정적 빌드 CLI**(`noting-dump call`)를 넣는다. Python 으로 부르기만 한다.
+- 그래서 Skill 에는 **Linux x86_64 정적 빌드 CLI**(`chwp-dump call`)를 넣는다. Python 으로 부르기만 한다.
   글꼴은 자유 글꼴 묶음(함초롬 등)만 넣고, 없는 글꼴은 대체 규칙으로 그린다. 대체가 일어나면 결과 JSON 에 적는다.
 - `renderPage`/`renderRegion` 이 만든 PNG 를 Claude 가 대화에 보여 준다. 편집 결과는 HWP/HWPX 파일로 돌려준다.
 - 정할 것: Skill 묶음 크기 한도(공식 수치를 찾지 못함), 넣을 글꼴과 라이선스.

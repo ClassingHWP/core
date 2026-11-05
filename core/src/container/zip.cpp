@@ -1,10 +1,10 @@
-#include "noting/container/zip.hpp"
+#include "chwp/container/zip.hpp"
 
 #include <cstring>
 
 #include "miniz.h"
 
-namespace noting::zip {
+namespace chwp::zip {
 
 struct Archive::Impl {
     mz_zip_archive zip{};
@@ -172,4 +172,4 @@ bool Writer::finalize(Bytes& out, std::string* error) {
     return true;
 }
 
-}  // namespace noting::zip
+}  // namespace chwp::zip

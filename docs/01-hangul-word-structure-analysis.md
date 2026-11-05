@@ -1,6 +1,6 @@
 # 한글(HWP) · Word 앱 구조 분석
 
-> Noting(한글 워드프로세서) 개발을 위한 사전 조사 문서
+> ClassingHWP(한글 워드프로세서) 개발을 위한 사전 조사 문서
 > 대상: 한컴오피스 **한글**(HWP 5.0 / HWPX), Microsoft **Word**(DOCX / DOC)
 
 ---
@@ -18,7 +18,7 @@
 9. [자동화·확장 API](#9-자동화확장-api)
 10. [기능 목록 비교](#10-기능-목록-비교)
 11. [단위 체계](#11-단위-체계)
-12. [Noting 설계에 주는 시사점](#12-noting-설계에-주는-시사점)
+12. [ClassingHWP 설계에 주는 시사점](#12-classinghwp-설계에-주는-시사점)
 13. [참고 자료](#13-참고-자료)
 
 ---
@@ -104,7 +104,7 @@ flowchart TB
 | 셀 블록 | `F5` (표 안에서) | - |
 | 셀 합치기/나누기 | 셀 블록 후 `M` / `S` | - |
 
-> 한글 사용자는 `Alt+L`, `Alt+T`, `F5`, `Ctrl+N,T` 같은 단축키에 매우 익숙하므로 **Noting에서 한글식 단축키 프리셋 제공**이 중요합니다.
+> 한글 사용자는 `Alt+L`, `Alt+T`, `F5`, `Ctrl+N,T` 같은 단축키에 매우 익숙하므로 **ClassingHWP에서 한글식 단축키 프리셋 제공**이 중요합니다.
 
 ### 2.2 Word UI
 
@@ -257,7 +257,7 @@ Word는 **Story(이야기 흐름)** 단위로 나뉘며, 각 Story가 블록(단
 | 색 | 글자 색, 음영 색 | 글자 색, 강조(하이라이트), 음영 |
 | 기타 | 커닝, 테두리/배경(BorderFill ID) | 커닝, 테두리, 숨김, 작은 대문자 등 |
 
-> **한글 고유**: 장평·자간·상대 크기를 **언어별로** 따로 지정할 수 있음. 한국 공문서/보고서에서 장평 95%, 자간 -5% 같은 설정이 매우 흔함 → Noting은 반드시 지원해야 함.
+> **한글 고유**: 장평·자간·상대 크기를 **언어별로** 따로 지정할 수 있음. 한국 공문서/보고서에서 장평 95%, 자간 -5% 같은 설정이 매우 흔함 → ClassingHWP은 반드시 지원해야 함.
 
 ### 4.2 문단 모양 (한글 ParaShape / Word pPr)
 
@@ -459,7 +459,7 @@ file.hwpx (ZIP)
                      header="4252" footer="4252" gutter="0"/>
         </hp:pagePr>
       </hp:secPr>
-      <hp:t>안녕하세요, Noting입니다.</hp:t>
+      <hp:t>안녕하세요, ClassingHWP입니다.</hp:t>
     </hp:run>
     <hp:run charPrIDRef="1">
       <hp:tbl rowCnt="2" colCnt="2" ...>   <!-- 표도 run 안의 개체 -->
@@ -479,7 +479,7 @@ file.hwpx (ZIP)
 
 주요 네임스페이스: `hh`(head), `hp`(paragraph), `hs`(section), `hc`(core), `ha`(app), `hpf`(package)
 
-> HWPX는 HWP 5.0 바이너리 구조를 **거의 1:1로 XML화**한 것입니다. 개념(ID 참조, 구역 정의 위치, 컨트롤 앵커)이 동일하므로 **Noting의 내부 모델을 HWPX 개념에 맞추면 HWP/HWPX 호환이 쉬워집니다.**
+> HWPX는 HWP 5.0 바이너리 구조를 **거의 1:1로 XML화**한 것입니다. 개념(ID 참조, 구역 정의 위치, 컨트롤 앵커)이 동일하므로 **ClassingHWP의 내부 모델을 HWPX 개념에 맞추면 HWP/HWPX 호환이 쉬워집니다.**
 
 ### 6.3 DOCX (Office Open XML)
 
@@ -517,7 +517,7 @@ file.docx (ZIP)
       <w:pPr><w:pStyle w:val="Heading1"/><w:jc w:val="center"/></w:pPr>
       <w:r>
         <w:rPr><w:b/><w:rFonts w:eastAsia="맑은 고딕"/><w:sz w:val="32"/></w:rPr>
-        <w:t>안녕하세요, Noting입니다.</w:t>
+        <w:t>안녕하세요, ClassingHWP입니다.</w:t>
       </w:r>
     </w:p>
     <w:tbl>                                    <!-- 표는 블록 레벨 -->
@@ -550,7 +550,7 @@ file.docx (ZIP)
 | 서식 | ID 참조 | ID 참조 | 속성 직접 + 스타일 |
 | 레이아웃 캐시 | 있음(LineSeg) | 있음(linesegarray) | 없음 |
 | 파싱 난이도 | 높음 | 중간 | 중간~높음(스펙 방대) |
-| Noting 우선순위 | 읽기 지원 | **읽기/쓰기(기본 포맷 후보)** | 읽기/쓰기 |
+| ClassingHWP 우선순위 | 읽기 지원 | **읽기/쓰기(기본 포맷 후보)** | 읽기/쓰기 |
 
 ---
 
@@ -601,7 +601,7 @@ flowchart LR
 HWP/HWPX는 조판 결과(각 줄의 시작 위치, 세로 위치, 높이, 기준선 등)를 **파일에 저장**합니다.
 - 장점: 큰 문서도 열자마자 빠르게 표시, 다른 뷰어가 조판 엔진 없이도 근사 렌더링 가능
 - 단점: 글꼴 환경이 다르면 캐시가 무효 → 결국 재조판 필요
-- **Noting 활용**: HWP/HWPX 뷰어 초기 단계에서 LineSeg를 참고해 조판 정확도를 검증하는 **테스트 오라클**로 사용 가능
+- **ClassingHWP 활용**: HWP/HWPX 뷰어 초기 단계에서 LineSeg를 참고해 조판 정확도를 검증하는 **테스트 오라클**로 사용 가능
 
 ### 7.5 증분 조판(Incremental Layout)
 
@@ -641,7 +641,7 @@ HWP/HWPX는 조판 결과(각 줄의 시작 위치, 세로 위치, 높이, 기�
 
 - 모든 편집은 **명령(Command) 객체**로 실행 → 역연산을 스택에 저장
 - 연속 타이핑은 하나의 실행 취소 단위로 병합
-- 한글 자동화의 `HAction` / `HParameterSet` 구조 = 명령 이름 + 파라미터 셋 → Noting도 **명령 이름 + 직렬화 가능한 파라미터** 구조로 설계하면 매크로·단축키·API를 통합 가능
+- 한글 자동화의 `HAction` / `HParameterSet` 구조 = 명령 이름 + 파라미터 셋 → ClassingHWP도 **명령 이름 + 직렬화 가능한 파라미터** 구조로 설계하면 매크로·단축키·API를 통합 가능
 
 ---
 
@@ -692,7 +692,7 @@ Application
 
 ## 10. 기능 목록 비교
 
-| 분류 | 기능 | 한글 | Word | Noting MVP 우선순위 |
+| 분류 | 기능 | 한글 | Word | ClassingHWP MVP 우선순위 |
 |---|---|:-:|:-:|:-:|
 | 기본 편집 | 입력/삭제/복사/붙여넣기, 실행 취소 | ✅ | ✅ | P0 |
 | | 찾기/바꾸기 (서식 포함, 정규식) | ✅ | ✅ | P0 |
@@ -755,11 +755,11 @@ Application
 | 기본 글꼴 | 함초롬바탕 10pt | 맑은 고딕 10pt |
 | 기본 줄 간격 | 160% | 배수 1.08 ~ 1.15, 단락 뒤 8pt |
 
-> Noting 내부 단위는 **HWPUNIT(1/7200 inch) 정수** 채택을 권장합니다. HWP/HWPX와 무손실이고, twip(×5), EMU(÷127)와도 정수 환산이 됩니다.
+> ClassingHWP 내부 단위는 **HWPUNIT(1/7200 inch) 정수** 채택을 권장합니다. HWP/HWPX와 무손실이고, twip(×5), EMU(÷127)와도 정수 환산이 됩니다.
 
 ---
 
-## 12. Noting 설계에 주는 시사점
+## 12. ClassingHWP 설계에 주는 시사점
 
 ### 12.1 핵심 설계 방향 제안
 
@@ -784,10 +784,10 @@ Application
 
 6. **파일 IO 순서 제안**: HWPX 읽기/쓰기 → PDF 내보내기 → DOCX 읽기/쓰기 → HWP 5.0 읽기
 
-### 12.2 Noting 모듈 구조 초안
+### 12.2 ClassingHWP 모듈 구조 초안
 
 ```
-noting/
+chwp/
 ├── core/
 │   ├── model/        # Document, Section, Paragraph, Run/Shape 구간, Control
 │   ├── style/        # CharShape, ParaShape, Style, BorderFill, 상속 계산, ID 풀

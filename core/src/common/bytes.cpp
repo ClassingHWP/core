@@ -1,10 +1,10 @@
-#include "noting/common/bytes.hpp"
+#include "chwp/common/bytes.hpp"
 
 #include <cstring>
 
-#include "noting/common/unicode.hpp"
+#include "chwp/common/unicode.hpp"
 
-namespace noting {
+namespace chwp {
 
 std::uint16_t readU16LE(const std::uint8_t* p) {
     return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
@@ -160,4 +160,4 @@ void ByteWriter::hwpString(std::string_view utf8) {
     utf16(std::u16string_view(w.data(), len));
 }
 
-}  // namespace noting
+}  // namespace chwp

@@ -1,6 +1,9 @@
-#include "noting/model/document.hpp"
+#include "chwp/model/document.hpp"
 
-namespace noting::model {
+#include <algorithm>
+#include <atomic>
+
+namespace chwp::model {
 
 const char* langName(Lang lang) {
     switch (lang) {
@@ -13,6 +16,16 @@ const char* langName(Lang lang) {
         case Lang::User: return "USER";
     }
     return "UNKNOWN";
+}
+
+const char* objectNumberingType(ControlKind kind, const std::string& stored) {
+    for (const char* name : {"NONE", "PICTURE", "TABLE", "EQUATION"}) {
+        if (stored == name) return name;
+    }
+    if (kind == ControlKind::Table) return "TABLE";
+    if (kind == ControlKind::Equation) return "EQUATION";
+    if (kind == ControlKind::Picture) return "PICTURE";
+    return "NONE";
 }
 
 const char* controlKindName(ControlKind kind) {
@@ -115,6 +128,61 @@ void accumulate(const std::vector<Paragraph>& paragraphs, DocumentStats& stats) 
 
 }  // namespace
 
+namespace {
+
+void visitParagraphs(std::vector<Paragraph>& paragraphs, const std::function<void(Paragraph&)>& fn);
+
+void visitControl(Control& control, const std::function<void(Paragraph&)>& fn) {
+    if (control.table) {
+        for (auto& cell : control.table->cells) visitParagraphs(cell.content.paragraphs, fn);
+    }
+    if (control.caption) visitParagraphs(control.caption->content.paragraphs, fn);
+    for (auto& sub : control.subLists) visitParagraphs(sub.paragraphs, fn);
+    for (auto& child : control.children) visitControl(child, fn);
+}
+
+void visitParagraphs(std::vector<Paragraph>& paragraphs, const std::function<void(Paragraph&)>& fn) {
+    for (auto& para : paragraphs) {
+        fn(para);
+        for (auto& run : para.runs) {
+            for (auto& item : run.items) {
+                if (item.type == InlineItem::Type::Control) visitControl(item.control, fn);
+            }
+        }
+    }
+}
+
+std::atomic<std::uint32_t> gNextParagraphId{1};
+
+}  // namespace
+
+void forEachParagraph(Document& doc, const std::function<void(Paragraph&)>& fn) {
+    for (auto& section : doc.sections) {
+        for (auto& master : section.masterPages) visitParagraphs(master.content.paragraphs, fn);
+        visitParagraphs(section.paragraphs, fn);
+    }
+}
+
+int ensureParagraphIds(Document& doc) {
+    // 본 번호 표. 번호는 1 부터 차례로 나오므로 번호를 칸 번호로 쓴다. 다 쓰고 나면 찍은 칸만 지운다.
+    thread_local std::vector<std::uint8_t> seen;
+    thread_local std::vector<std::uint32_t> marked;
+    marked.clear();
+    int assigned = 0;
+    forEachParagraph(doc, [&](Paragraph& para) {
+        if (para.id != 0 && para.id < seen.size() && seen[para.id]) para.id = 0;
+        if (para.id == 0) {
+            para.id = gNextParagraphId.fetch_add(1, std::memory_order_relaxed);
+            ++assigned;
+        }
+        if (para.id >= seen.size()) seen.resize(std::max<std::size_t>(para.id + 1, seen.size() * 2), 0);
+        seen[para.id] = 1;
+        marked.push_back(para.id);
+    });
+    for (const std::uint32_t id : marked) seen[id] = 0;
+    return assigned;
+}
+
 DocumentStats computeStats(const Document& doc) {
     DocumentStats stats;
     stats.sections = doc.sections.size();
@@ -140,6 +208,7 @@ void StoryMap::clear() {
     doc_ = nullptr;
     slots_.clear();
     byPtr_.clear();
+    byId_.clear();
 }
 
 void StoryMap::build(Document& doc) {
@@ -245,6 +314,20 @@ void StoryMap::build(Document& doc) {
             walkParagraphs(walkParagraphs, master.content.paragraphs, static_cast<int>(si), masterStory);
         }
     }
+    // 문단 번호 색인. 별칭 없이 처음 붙인 글 묶음 번호를 쓴다.
+    for (std::size_t story = 1; story < slots_.size(); ++story) {
+        const std::vector<Paragraph>* paragraphs = slots_[story].paragraphs;
+        if (!paragraphs) continue;
+        for (std::size_t pi = 0; pi < paragraphs->size(); ++pi) {
+            const std::uint32_t id = (*paragraphs)[pi].id;
+            if (id != 0) byId_.try_emplace(id, ParagraphAt{static_cast<int>(story), static_cast<int>(pi)});
+        }
+    }
+}
+
+StoryMap::ParagraphAt StoryMap::findParagraph(std::uint32_t id) const {
+    const auto found = byId_.find(id);
+    return found == byId_.end() ? ParagraphAt{} : found->second;
 }
 
 void StoryMap::build(const Document& doc) {
@@ -453,6 +536,7 @@ Document blankDocument() {
     paragraph.lineSegs.push_back(line);
     section.paragraphs.push_back(std::move(paragraph));
     doc.sections.push_back(std::move(section));
+    ensureParagraphIds(doc);
     return doc;
 }
 
@@ -473,4 +557,4 @@ int replaceFontFace(Document& doc, const std::string& from, const std::string& t
     return changed;
 }
 
-}  // namespace noting::model
+}  // namespace chwp::model

@@ -8,10 +8,10 @@
 #include <string>
 #include <vector>
 
-#include "noting/export/text.hpp"
-#include "noting/model/document.hpp"
+#include "chwp/export/text.hpp"
+#include "chwp/model/document.hpp"
 
-namespace noting::layout {
+namespace chwp::layout {
 
 // 글꼴 파일이 있으면 hmtx advance를 그 파일의 unitsPerEm으로 나눈다.
 // 크기는 상대 크기를 먼저 반영하고, 위·아래 첨자는 이어서 16/25다. 줄 높이는 이 크기를 쓰지 않는다.
@@ -52,7 +52,16 @@ inline std::int32_t glyphBaseline(std::int32_t size) {
     return static_cast<std::int32_t>((static_cast<std::int64_t>(size) * 85 + 50) / 100);
 }
 
-// 작업 수와 코어 수 중 작은 값. 스레드 없는 wasm 빌드에서는 1이다.
+// 일꾼 스레드 수를 정하는 플랫폼 값. 셸이 Host 로 넘기고 세션이 여기에 옮긴다.
+// cores 가 0 이면 스레드를 띄우지 않고, 음수면 하드웨어에서 읽는다. maxWorkers 가 0 이면 한도가 없다.
+struct WorkerLimits {
+    int cores = -1;
+    int minWorkers = 8;
+    int maxWorkers = 0;
+};
+void setWorkerLimits(const WorkerLimits& limits);
+
+// 작업 수와 일꾼 수 중 작은 값. 스레드를 못 쓰는 곳(cores 0)에서는 1이다.
 int workerCount(int jobs);
 
 // 문단마다 글자 폭을 워커가 재고, 메인 스레드가 문단 순서대로 받아 둔다.
@@ -71,4 +80,4 @@ std::vector<std::string> paginate(const model::Document& doc, const TextOptions&
                                   std::vector<std::vector<int>>* paragraphPages = nullptr,
                                   std::vector<std::vector<LineRange>>* lineRanges = nullptr);
 
-}  // namespace noting::layout
+}  // namespace chwp::layout

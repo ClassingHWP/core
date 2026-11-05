@@ -1,5 +1,5 @@
-#include "noting/render/scene.hpp"
-#include "noting/render/paint.hpp"
+#include "chwp/render/scene.hpp"
+#include "chwp/render/paint.hpp"
 
 #include "render/column_geom.hpp"
 #include "render/line_breaker.hpp"
@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -22,7 +23,7 @@
 #include "export/layout.hpp"
 #include "render/equation_layout.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 
 using namespace detail;
 
@@ -30,7 +31,7 @@ using namespace detail;
 // 간격이 음수여서 합이 음수면 그만큼 상자가 줄고, 개체는 줄 위로 올라간다.
 std::int32_t inlineObjectCaptionDrop(const Node& child) {
     for (const Node& cap : child.children) {
-        if (cap.role == "caption" && cap.fileHorzRel == "TOP") return -cap.y;
+        if (cap.role == "caption" && cap.ext().obj().fileHorzRel == "TOP") return -cap.y;
     }
     return 0;
 }
@@ -41,7 +42,7 @@ std::int32_t inlineObjectCaptionDrop(const Node& child) {
 std::int32_t inlineObjectOuter(const Node& child) {
     std::int32_t height = child.height;
     for (const Node& cap : child.children) {
-        if (cap.role != "caption" || cap.fileHorzRel != "BOTTOM") continue;
+        if (cap.role != "caption" || cap.ext().obj().fileHorzRel != "BOTTOM") continue;
         height = std::max(height, cap.y + columnContentBottom(cap));
     }
     return inlineObjectCaptionDrop(child) + height + child.marginTop + child.marginBottom;
@@ -75,7 +76,7 @@ std::int32_t measuredTextBox(const Node& line, std::int32_t charBox) {
 // 글자 기준선, 그림·표·도형은 위에서 85%, 수식은 수식 높이×그 백분율. 가장 큰 값이 줄 기준선이다.
 // 수식 백분율도 0.5는 0에서 멀어지게 올린다. 1350의 71%는 959, 2745의 68%는 1867이다.
 std::int32_t equationBaselinePoint(const Node& child) {
-    const int percent = child.baseLine == 0 ? 85 : child.baseLine;
+    const int percent = child.ext().obj().baseLine == 0 ? 85 : child.ext().obj().baseLine;
     const std::int32_t outer = inlineObjectOuter(child);
     if (outer <= 0 || percent <= 0) return 0;
     const std::int64_t scaled = static_cast<std::int64_t>(outer) * percent;
@@ -86,7 +87,7 @@ std::int32_t equationBaselinePoint(const Node& child) {
 std::int32_t measuredLineBaseline(const Node& line, std::int32_t baseline) {
     for (const Node& child : line.children) {
         if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
-        if (child.baseLine >= 0) baseline = std::max(baseline, equationBaselinePoint(child));
+        if (child.ext().obj().baseLine >= 0) baseline = std::max(baseline, equationBaselinePoint(child));
         else baseline = std::max(baseline, inlineObjectBaseline(child));
     }
     return baseline;
@@ -337,6 +338,10 @@ struct Frame {
     int story = -1;                    // 이 문단 목록의 블록 범위. 섹션과 개체는 각각 하나다
     std::int32_t bottomReserve = 0;    // 쪽 아래에 각주·미주를 둘 높이
     int pageParagraph = 0;             // 이 쪽이 시작한 문단. 쪽마다 번호를 다시 셀 때 쓴다
+    std::int32_t lineGrid = 0;         // 구역 줄 격자. 본문 단에만 쓴다
+    std::int32_t charGrid = 0;         // 구역 글자 격자. 본문 단에만 쓴다
+    bool wongoji = false;              // 원고지 정서법
+    std::uint8_t textDirection = 0;    // 구역 글자 방향. 0 이 아니면 돌린 틀에서 세로쓰기 폭으로 줄을 나눈다
 };
 
 constexpr int kMaxDepth = 8;
@@ -389,7 +394,7 @@ const CharShape* findCharShape(const Document& doc, std::uint32_t id) {
     return nullptr;
 }
 
-const noting::model::BorderFill* findBorderFill(const Document& doc, std::uint32_t id) {
+const chwp::model::BorderFill* findBorderFill(const Document& doc, std::uint32_t id) {
     if (id == 0) return nullptr;
     const auto& fills = doc.header.borderFills;
     if (id - 1 < fills.size() && fills[id - 1].id == id) return &fills[id - 1];
@@ -488,14 +493,14 @@ struct ColumnResume;
 Node layoutFrame(const Frame& frame, int startParagraph, std::size_t startAtom, ColumnResume* resume);
 Node layoutFrame(const Frame& frame) { return layoutFrame(frame, 0, 0, nullptr); }
 
-void copyEdge(BorderEdge& edge, const noting::model::BorderSide& side) {
+void copyEdge(BorderEdge& edge, const chwp::model::BorderSide& side) {
     if (side.type.empty() || side.type == "NONE") return;
     edge.type = side.type;
     edge.color = side.color.empty() ? "#000000" : side.color;
     edge.width = side.width;
 }
 
-std::string colorHex(const noting::model::Color& color) {
+std::string colorHex(const chwp::model::Color& color) {
     if (!color) return {};
     char buf[8];
     std::snprintf(buf, sizeof(buf), "#%06X", static_cast<unsigned>(*color & 0xFFFFFFu));
@@ -504,27 +509,33 @@ std::string colorHex(const noting::model::Color& color) {
 
 }  // namespace detail
 
-void detail::paintCharStyle(Node& node, const Document& doc, std::uint32_t charShapeId) {
+detail::CharPaint detail::charPaint(const Document& doc, std::uint32_t charShapeId) {
+    CharPaint out;
     const CharShape* shape = findCharShape(doc, charShapeId);
-    if (!shape) return;
-    node.color = colorHex(shape->textColor);
-    node.shade = colorHex(shape->shadeColor);
+    if (!shape) return out;
+    out.color = colorHex(shape->textColor);
+    out.shade = colorHex(shape->shadeColor);
     // 글자 배경은 음영과 따로다. 글자 모양의 테두리/배경 면색을 글자 상자에 칠한다.
     bool borderStroke = false;
     if (const auto* fill = findBorderFill(doc, shape->borderFillId)) {
-        if (!fill->faceColor.empty() && fill->faceColor != "none") node.fillColor = fill->faceColor;
-        auto side = [](const noting::model::BorderSide& edge) {
+        if (!fill->faceColor.empty() && fill->faceColor != "none") out.fillColor = fill->faceColor;
+        if (!fill->hatchStyle.empty()) {
+            out.hatchStyle = fill->hatchStyle;
+            out.hatchColor = fill->hatchColor;
+        }
+        auto side = [](const chwp::model::BorderSide& edge) {
             return !edge.type.empty() && edge.type != "NONE";
         };
         borderStroke = side(fill->left) || side(fill->right) || side(fill->top) || side(fill->bottom);
     }
-    node.bold = shape->bold;
-    node.italic = shape->italic;
-    if (!shape->underline.empty() && shape->underline != "NONE") node.underline = shape->underline;
-    node.strikeout = shape->strikeout;
-    node.superscript = shape->superscript;
-    node.subscript = shape->subscript;
-    node.bitmapDeco = !node.underline.empty() || node.strikeout || shape->emphasis != 0 || borderStroke;
+    out.bold = shape->bold;
+    out.italic = shape->italic;
+    if (!shape->underline.empty() && shape->underline != "NONE") out.underline = shape->underline;
+    out.strikeout = shape->strikeout;
+    out.superscript = shape->superscript;
+    out.subscript = shape->subscript;
+    out.bitmapDeco = !out.underline.empty() || out.strikeout || shape->emphasis != 0 || borderStroke;
+    return out;
 }
 
 namespace detail {
@@ -532,40 +543,51 @@ namespace detail {
 void applyBorderFill(Node& node, const Document& doc, std::uint32_t id) {
     const auto* fill = findBorderFill(doc, id);
     if (!fill) return;
-    copyEdge(node.borderLeft, fill->left);
-    copyEdge(node.borderRight, fill->right);
-    copyEdge(node.borderTop, fill->top);
-    copyEdge(node.borderBottom, fill->bottom);
-    node.slash = fill->slash;
-    node.backSlash = fill->backSlash;
-    copyEdge(node.borderDiagonal, fill->diagonal);
-    node.centerLine = fill->centerLine;
-    node.breakCellSeparateLine = fill->breakCellSeparateLine;
-    if (!fill->faceColor.empty() && fill->faceColor != "none") node.fillColor = fill->faceColor;
+    copyEdge(node.extMut().borderLeft, fill->left);
+    copyEdge(node.extMut().borderRight, fill->right);
+    copyEdge(node.extMut().borderTop, fill->top);
+    copyEdge(node.extMut().borderBottom, fill->bottom);
+    node.extMut().slash = fill->slash;
+    node.extMut().backSlash = fill->backSlash;
+    copyEdge(node.extMut().borderDiagonal, fill->diagonal);
+    node.extMut().centerLine = fill->centerLine;
+    node.extMut().breakCellSeparateLine = fill->breakCellSeparateLine;
+    if (!fill->faceColor.empty() && fill->faceColor != "none") node.extMut().fillColor = fill->faceColor;
+    node.extMut().hatchStyle = fill->hatchStyle;
+    node.extMut().hatchColor = fill->hatchColor;
     if (!fill->gradColor.empty() && fill->gradColor != "none") {
-        node.gradColor = fill->gradColor;
-        node.gradAngle = fill->gradAngle;
+        node.extMut().gradColor = fill->gradColor;
+        node.extMut().gradAngle = fill->gradAngle;
     }
     if (!fill->imageId.empty() && fill->imageMode >= 0 && fill->imageMode != 15) {
-        node.binItemId = fill->imageId;
-        node.imageFillMode = fill->imageMode;
+        node.extMut().objMut().binItemId = fill->imageId;
+        node.extMut().objMut().imageFillMode = fill->imageMode;
     }
 }
 
 void applyParagraphBorder(Node& paragraph, const Document& doc, const ParaShape* paraShape) {
     if (!paraShape || !paraShape->borderFillId) return;
+    // 대부분의 문단 모양은 아무것도 그리지 않는 테두리/배경(보통 1번)을 가리킨다. 그런 문단에는 꼬리(ext)를 만들지 않는다.
+    const auto* fill = findBorderFill(doc, paraShape->borderFillId);
+    if (!fill) return;
+    const auto side = [](const chwp::model::BorderSide& edge) { return !edge.type.empty() && edge.type != "NONE"; };
+    const auto paint = [](const std::string& color) { return !color.empty() && color != "none"; };
+    const bool shows = side(fill->left) || side(fill->right) || side(fill->top) || side(fill->bottom) ||
+                       paint(fill->faceColor) || !fill->hatchStyle.empty() || paint(fill->gradColor) ||
+                       (!fill->imageId.empty() && fill->imageMode >= 0 && fill->imageMode != 15);
+    if (!shows) return;
     applyBorderFill(paragraph, doc, paraShape->borderFillId);
-    paragraph.borderOffsetLeft = paraShape->borderOffsetLeft;
-    paragraph.borderOffsetRight = paraShape->borderOffsetRight;
-    paragraph.borderOffsetTop = paraShape->borderOffsetTop;
-    paragraph.borderOffsetBottom = paraShape->borderOffsetBottom;
-    paragraph.borderConnect = paraShape->borderConnect;
-    paragraph.borderIgnoreMargin = paraShape->borderIgnoreMargin;
+    paragraph.extMut().borderOffsetLeft = paraShape->borderOffsetLeft;
+    paragraph.extMut().borderOffsetRight = paraShape->borderOffsetRight;
+    paragraph.extMut().borderOffsetTop = paraShape->borderOffsetTop;
+    paragraph.extMut().borderOffsetBottom = paraShape->borderOffsetBottom;
+    paragraph.extMut().borderConnect = paraShape->borderConnect;
+    paragraph.extMut().borderIgnoreMargin = paraShape->borderIgnoreMargin;
 }
 
 void applyStroke(Node& node, const Control& control) {
     if (control.strokeType.empty() || control.strokeType == "NONE") {
-        if (!control.fillColor.empty() && control.fillColor != "none") node.fillColor = control.fillColor;
+        if (!control.fillColor.empty() && control.fillColor != "none") node.extMut().fillColor = control.fillColor;
         return;
     }
     BorderEdge edge;
@@ -573,8 +595,8 @@ void applyStroke(Node& node, const Control& control) {
     edge.color = control.strokeColor.empty() ? "#000000" : control.strokeColor;
     edge.width = control.strokeWidth;
     edge.end = control.strokeEnd == 0 ? 0 : 1;
-    node.borderLeft = node.borderRight = node.borderTop = node.borderBottom = edge;
-    if (!control.fillColor.empty() && control.fillColor != "none") node.fillColor = control.fillColor;
+    node.extMut().borderLeft = node.extMut().borderRight = node.extMut().borderTop = node.extMut().borderBottom = edge;
+    if (!control.fillColor.empty() && control.fillColor != "none") node.extMut().fillColor = control.fillColor;
 }
 
 // 칸 내용의 아래. 마지막 줄은 글자(와 글자처럼 취급하는 개체) 높이만 넣고, 줄 간격 추가분과
@@ -592,7 +614,7 @@ std::int32_t rowContentBottom(const Node& node, bool keepPitch) {
             return;
         }
         if (current.kind == NodeKind::Line) {
-            std::int32_t content = current.textHeight > 0 ? current.textHeight : current.fontSize;
+            std::int32_t content = current.lineData().textHeight > 0 ? current.lineData().textHeight : current.fontSize;
             for (const auto& child : current.children) {
                 if (child.kind != NodeKind::Object) continue;
                 content = std::max(content, inlineObjectBottom(child));
@@ -632,12 +654,78 @@ std::int32_t columnContentBottom(const Node& body, bool keepPitch) {
 }
 
 Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Document& doc, int depth,
-                std::int32_t defaultTab, bool useStoredLineHeight);
+                std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans);
+
+// 세로쓰기 틀에서 개체가 흐르는 자리. 한글은 세로쓰기에서도 표·그림·글상자를 돌리지 않아서, 돌린 틀에서는
+// 너비와 높이가 바뀐다. 틀의 왼쪽(줄 앞)은 종이 위, 오른쪽은 종이 아래, 틀의 위(앞 줄 쪽)는 종이 오른쪽,
+// 아래는 종이 왼쪽이다. 거리는 틀 기준 그대로다(한글 2024 PDF, tmp/vert-obj).
+Placement turnedPlacement(const Placement& p) {
+    Placement out = p;
+    out.width = p.height;
+    out.height = p.width;
+    out.marginLeft = p.marginTop;
+    out.marginRight = p.marginBottom;
+    out.marginTop = p.marginRight;
+    out.marginBottom = p.marginLeft;
+    return out;
+}
+
+void verticalAtom(const Document& doc, Atom& atom, int direction) {
+    if (direction == 0 || atom.vertical) return;
+    // 글자처럼 넣은 개체는 세운 그대로라 줄 방향으로는 높이와 위·아래 여백을 차지한다.
+    if (atom.control && atom.control->placement && visualObject(*atom.control)) {
+        const Placement turned = turnedPlacement(*atom.control->placement);
+        atom.width = static_cast<std::int32_t>(turned.width) + turned.marginLeft + turned.marginRight;
+        atom.vertical = true;
+        return;
+    }
+    if (atom.control || atom.tab || atom.hard || atom.occupiesLine || atom.width <= 0) return;
+    const CharShape* shape = findCharShape(doc, atom.charShapeId);
+    if (!shape) shape = &fallbackCharShape();
+    const std::size_t slot = static_cast<std::size_t>(isHangul(atom.cp) ? Lang::Hangul : Lang::Latin);
+    const std::int32_t spacing = atom.trail != 0 && slot < shape->spacing.size() ? shape->spacing[slot] : 0;
+    const VerticalCell cell = verticalCell(atom.cp, direction, atom.width - atom.trail, atom.fontSize, atom.relSize,
+                                           shape->superscript || shape->subscript, spacing);
+    // 줄 조각에는 가로 폭을 남긴다. 그릴 때 같은 식(Painter::applyVertical)으로 칸을 다시 잡는다.
+    if (atom.natural <= 0) {
+        atom.natural = atom.width;
+        atom.naturalTrail = atom.trail;
+    }
+    atom.width = cell.ink + cell.trail;
+    atom.trail = cell.trail;
+    atom.vertical = true;
+}
+
+// 세로쓰기 틀의 개체 상자. 실제 개체는 세운 그대로 자식에 두고, 틀에서는 너비·높이·여백을 바꾼 이 상자로 흐른다.
+Node uprightObject(Node object) {
+    Node box;
+    box.kind = NodeKind::Object;
+    box.role = "upright";
+    box.upright = true;
+    box.x = object.x;
+    box.y = object.y;
+    box.width = object.height;
+    box.height = object.width;
+    box.marginLeft = object.marginTop;
+    box.marginRight = object.marginBottom;
+    box.marginTop = object.marginRight;
+    box.marginBottom = object.marginLeft;
+    box.treatAsChar = object.treatAsChar;
+    box.extMut().objMut().textWrap = object.ext().obj().textWrap;
+    box.extMut().objMut().zOrder = object.ext().obj().zOrder;
+    box.vertAlign = object.vertAlign;
+    box.extMut().objMut().baseLine = object.ext().obj().baseLine;
+    object.x = 0;
+    object.y = 0;
+    object.treatAsChar = false;
+    box.children.push_back(std::move(object));
+    return box;
+}
 
 // 위·아래 캡션 너비는 개체 너비다. 여백 포함이면 좌우 바깥 여백을 더하고 그만큼 왼쪽으로 당긴다.
 // 왼쪽·오른쪽은 캡션에 적힌 너비다. 간격은 맞닿는 쪽에만 둔다. 음수면 그만큼 겹친다.
 void attachCaption(Node& object, const Control& control, const Document& doc, int depth, std::int32_t defaultTab,
-                   bool useStoredLineHeight) {
+                   bool useStoredLineHeight, bool deferSpans) {
     if (!control.caption || control.caption->content.paragraphs.empty() || depth >= kMaxDepth) return;
     const Caption& cap = *control.caption;
     const bool horizontal = cap.side == "TOP" || cap.side == "BOTTOM";
@@ -665,6 +753,7 @@ void attachCaption(Node& object, const Control& control, const Document& doc, in
     inner.depth = depth + 1;
     inner.defaultTab = defaultTab;
     inner.useStoredLineHeight = useStoredLineHeight;
+    inner.deferSpans = deferSpans;
     inner.story = takeStory(&cap.content.paragraphs);
     Node laid = layoutFrame(inner);
     const std::int32_t used = std::max<std::int32_t>(1, columnContentBottom(laid, true));
@@ -694,10 +783,10 @@ void attachCaption(Node& object, const Control& control, const Document& doc, in
     laid.width = width;
     laid.height = used;
     laid.fileAudit = true;
-    laid.fileHorzRel = cap.side;
-    laid.fileX = static_cast<std::int32_t>(cap.gap);
-    laid.fileWidth = width;
-    laid.fileHeight = used;
+    laid.extMut().objMut().fileHorzRel = cap.side;
+    laid.extMut().objMut().fileX = static_cast<std::int32_t>(cap.gap);
+    laid.extMut().objMut().fileWidth = width;
+    laid.extMut().objMut().fileHeight = used;
     object.children.push_back(std::move(laid));
     // 위 캡션은 적힌 위치의 기준이 캡션 윗면이다. 개체는 캡션 높이만큼 아래로 내려간다.
     // 왼쪽 캡션은 캡션 왼쪽 끝이 그 자리다. 개체는 캡션 너비만큼 오른쪽으로 간다.
@@ -707,7 +796,7 @@ void attachCaption(Node& object, const Control& control, const Document& doc, in
 }
 
 void fillInside(Node& object, const Control& control, const Document& doc, int depth,
-                std::int32_t defaultTab, bool useStoredLineHeight) {
+                std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans) {
     if (depth >= kMaxDepth) return;
     if (control.table) {
         const Table& table = *control.table;
@@ -858,6 +947,7 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             std::int32_t padB = 0;
             std::int32_t width = 0;
             std::int32_t used = 0;
+            std::int32_t rowNeed = 0;  // 줄 높이에 내는 글 높이. 가로 칸은 used, 세로쓰기 칸은 첫 글자 크기
         };
         std::vector<Draft> drafts;
         for (const auto& cell : table.cells) {
@@ -879,10 +969,24 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             inner.depth = depth + 1;
             inner.defaultTab = defaultTab;
             inner.useStoredLineHeight = useStoredLineHeight;
+            inner.deferSpans = deferSpans;
             inner.story = takeStory(&cell.content.paragraphs);
+            // 세로쓰기 칸은 줄 길이가 칸 높이라 줄 높이가 정해진 뒤에 짠다(아래). 줄 높이에는 첫 글자 크기와
+            // 위·아래 안 여백만 낸다(칸에 글자 방향이 있으면 첫 글자의 글자 모양 크기).
+            if (cell.content.textDirection != 0) {
+                const auto& paras = cell.content.paragraphs;
+                const CharShape* first = nullptr;
+                if (!paras.empty() && !paras.front().runs.empty()) {
+                    first = findCharShape(doc, paras.front().runs.front().charShapeId);
+                }
+                draft.rowNeed = first ? first->height : kEm;
+                drafts.push_back(std::move(draft));
+                continue;
+            }
             draft.content = layoutFrame(inner);
             // 적힌 높이는 최소다. 안의 글과 그림이 더 크면 그 높이까지 칸을 늘린다.
             draft.used = rowContentBottom(draft.content);
+            draft.rowNeed = draft.used;
             drafts.push_back(std::move(draft));
         }
         std::vector<const Draft*> spanDrafts;
@@ -892,7 +996,7 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
                 spanDrafts.push_back(&draft);
                 continue;
             }
-            cover(rowH, draft.cell->row, 1, draft.padT + draft.padB + draft.used);
+            cover(rowH, draft.cell->row, 1, draft.padT + draft.padB + draft.rowNeed);
         }
         std::sort(spanDrafts.begin(), spanDrafts.end(), [](const Draft* a, const Draft* b) {
             return a->cell->rowSpan < b->cell->rowSpan;
@@ -900,7 +1004,7 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
         for (const Draft* draft : spanDrafts) {
             const int rowSpan = std::max(1, static_cast<int>(draft->cell->rowSpan));
             const std::int32_t fileH = static_cast<std::int32_t>(draft->cell->height);
-            const std::int32_t contentH = draft->padT + draft->padB + draft->used;
+            const std::int32_t contentH = draft->padT + draft->padB + draft->rowNeed;
             cover(rowH, draft->cell->row, rowSpan, std::max(fileH, contentH));
         }
         std::int32_t tableW = 0;
@@ -929,28 +1033,48 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             else if (cell.vertAlign == "BOTTOM" && draft.used < innerH) contentY = draft.padT + (innerH - draft.used);
             draft.content.x = draft.padL;
             draft.content.y = contentY;
+            if (cell.content.textDirection != 0) {
+                // 세로쓰기 칸. 줄 길이는 칸 안 높이(0.2인치보다 짧지 않다), 줄은 칸 오른쪽 안쪽에서 왼쪽으로 쌓는다.
+                // 넘치는 줄은 칸에서 잘린다(한글 2024, tmp/vert-obj/h-cell-vert).
+                Frame inner;
+                inner.doc = &doc;
+                inner.paragraphs = &cell.content.paragraphs;
+                inner.pageDef.width = static_cast<std::uint32_t>(std::max<std::int32_t>(kMinParagraphWidth, innerH));
+                inner.pageDef.height =
+                    static_cast<std::uint32_t>(std::max<std::int32_t>(200, draft.width - draft.padL - draft.padR));
+                inner.depth = depth + 1;
+                inner.defaultTab = defaultTab;
+                inner.useStoredLineHeight = useStoredLineHeight;
+                inner.textDirection = cell.content.textDirection;
+                inner.story = takeStory(&cell.content.paragraphs);
+                draft.content = layoutFrame(inner);
+                draft.content.turned = cell.content.textDirection;
+                draft.content.turnSpan = draft.width;
+                draft.content.x = draft.padT;
+                draft.content.y = draft.padR;
+            }
             Node cellNode;
             cellNode.kind = NodeKind::Cell;
             cellNode.x = x;
             cellNode.y = y;
             cellNode.width = draft.width;
             cellNode.height = height;
-            cellNode.row = static_cast<int>(cell.row);
-            cellNode.col = static_cast<int>(cell.col);
-            cellNode.rowSpan = rowSpan;
-            cellNode.colSpan = colSpan;
+            cellNode.extMut().row = static_cast<int>(cell.row);
+            cellNode.extMut().col = static_cast<int>(cell.col);
+            cellNode.extMut().rowSpan = rowSpan;
+            cellNode.extMut().colSpan = colSpan;
             if (rowSpan > 1) {
                 std::int32_t accH = 0;
                 for (int i = 0; i + 1 < rowSpan; ++i) {
                     accH += rowH[cell.row + static_cast<std::size_t>(i)] + spacing;
-                    if (accH > 0 && accH < height) cellNode.spanRowSplits.push_back(accH);
+                    if (accH > 0 && accH < height) cellNode.extMut().objMut().spanRowSplits.push_back(accH);
                 }
             }
             if (colSpan > 1 && cell.col + static_cast<std::size_t>(colSpan) <= colW.size()) {
                 std::int32_t accW = 0;
                 for (int i = 0; i + 1 < colSpan; ++i) {
                     accW += colW[cell.col + static_cast<std::size_t>(i)] + spacing;
-                    if (accW > 0 && accW < draft.width) cellNode.spanColSplits.push_back(accW);
+                    if (accW > 0 && accW < draft.width) cellNode.extMut().objMut().spanColSplits.push_back(accW);
                 }
             }
             cellNode.vertAlign = cell.vertAlign.empty() ? "TOP" : cell.vertAlign;
@@ -959,13 +1083,13 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             cellNode.marginTop = draft.padT;
             cellNode.marginBottom = draft.padB;
             cellNode.fileAudit = true;
-            cellNode.fileWidth = static_cast<std::int32_t>(cell.width);
-            cellNode.fileHeight = static_cast<std::int32_t>(cell.height);
-            cellNode.filePadLeft = cell.marginLeft;
-            cellNode.filePadRight = cell.marginRight;
-            cellNode.filePadTop = cell.marginTop;
-            cellNode.filePadBottom = cell.marginBottom;
-            cellNode.fileOwnMargin = cell.hasMargin ? 1 : 0;
+            cellNode.extMut().objMut().fileWidth = static_cast<std::int32_t>(cell.width);
+            cellNode.extMut().objMut().fileHeight = static_cast<std::int32_t>(cell.height);
+            cellNode.extMut().objMut().filePadLeft = cell.marginLeft;
+            cellNode.extMut().objMut().filePadRight = cell.marginRight;
+            cellNode.extMut().objMut().filePadTop = cell.marginTop;
+            cellNode.extMut().objMut().filePadBottom = cell.marginBottom;
+            cellNode.extMut().objMut().fileOwnMargin = cell.hasMargin ? 1 : 0;
             applyBorderFill(cellNode, doc, cell.borderFillId);
             cellNode.children.push_back(std::move(draft.content));
             object.children.push_back(std::move(cellNode));
@@ -979,7 +1103,7 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
         if (!child.placement) continue;
         const Placement& place = *child.placement;
         object.children.push_back(makeObject(child, place.groupX - originX, place.groupY - originY, doc, depth + 1,
-                                             defaultTab, useStoredLineHeight));
+                                             defaultTab, useStoredLineHeight, deferSpans));
     }
     if (control.subLists.empty()) return;
     // 줄 폭은 저장된 글상자 폭에서 잡는다. 배율이 있으면 지금 크기보다 1 클 수 있다. 37109 상자에 37110이다.
@@ -992,6 +1116,27 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
     // 적힌 높이는 최소다. 표 칸과 같이, 안쪽 줄 높이를 더한 값이 더 크면 글상자도 그만큼 늘어난다.
     std::int32_t grown = object.height;
     for (const auto& list : control.subLists) {
+        if (list.textDirection != 0) {
+            // 세로쓰기 글상자. 줄 길이는 안 높이, 줄은 안쪽 오른쪽에서 왼쪽으로 쌓는다. 상자는 늘리지 않는다.
+            Frame inner;
+            inner.doc = &doc;
+            inner.paragraphs = &list.paragraphs;
+            inner.pageDef.width = static_cast<std::uint32_t>(innerH);
+            inner.pageDef.height = static_cast<std::uint32_t>(innerW);
+            inner.depth = depth + 1;
+            inner.defaultTab = defaultTab;
+            inner.useStoredLineHeight = useStoredLineHeight;
+            inner.textDirection = list.textDirection;
+            inner.story = takeStory(&list.paragraphs);
+            Node content = layoutFrame(inner);
+            content.turned = list.textDirection;
+            content.turnSpan = object.width;
+            content.x = control.boxPadTop;
+            content.y = control.boxPadRight;
+            content.vertAlign = "TOP";
+            object.children.push_back(std::move(content));
+            continue;
+        }
         Frame inner;
         inner.doc = &doc;
         inner.paragraphs = &list.paragraphs;
@@ -1000,6 +1145,7 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
         inner.depth = depth + 1;
         inner.defaultTab = defaultTab;
         inner.useStoredLineHeight = useStoredLineHeight;
+        inner.deferSpans = deferSpans;
         inner.story = takeStory(&list.paragraphs);
         Node content = layoutFrame(inner);
         const std::int32_t used = columnContentBottom(content);
@@ -1019,8 +1165,17 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
     if (grown > object.height) object.height = grown;
 }
 
+// 아래 캡션이 개체 밑으로 차지하는 높이. 캡션 글 높이(마지막 줄 간격 뺌)와 간격이다. 글은 그 아래로 비켜 가고,
+// 쪽에서 나누는 표도 이만큼 남긴다(한글 2024 d-cap-small: 표 7200 + 850 + 1000, d-cap-*).
+std::int32_t captionBelow(const Node& object) {
+    for (const Node& child : object.children) {
+        if (child.role == "caption" && child.ext().obj().fileHorzRel == "BOTTOM") return columnContentBottom(child) + child.ext().obj().fileX;
+    }
+    return 0;
+}
+
 Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Document& doc, int depth,
-                std::int32_t defaultTab, bool useStoredLineHeight) {
+                std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans) {
     struct ObjTimer {
         const Control& control;
         int depth;
@@ -1048,72 +1203,72 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
     node.width = static_cast<std::int32_t>(control.placement->width);
     node.height = static_cast<std::int32_t>(control.placement->height);
     node.fileAudit = true;
-    node.fileWidth = node.width;
-    node.fileHeight = node.height;
-    node.fileX = control.placement->horzOffset;
-    node.fileY = control.placement->vertOffset;
-    node.fileGroupX = control.placement->groupX;
-    node.fileGroupY = control.placement->groupY;
-    node.fileMatrixX = control.placement->matrixX;
-    node.fileMatrixY = control.placement->matrixY;
-    node.fileScaleX = control.placement->scaleX;
-    node.fileScaleY = control.placement->scaleY;
-    node.filePadLeft = control.boxPadLeft;
-    node.filePadRight = control.boxPadRight;
-    node.filePadTop = control.boxPadTop;
-    node.filePadBottom = control.boxPadBottom;
-    node.fileHorzRel = control.placement->horzRelTo;
-    node.fileVertRel = control.placement->vertRelTo;
-    node.fileHorzAlign = control.placement->horzAlign;
-    node.shapeType = control.shapeType;
+    node.extMut().objMut().fileWidth = node.width;
+    node.extMut().objMut().fileHeight = node.height;
+    node.extMut().objMut().fileX = control.placement->horzOffset;
+    node.extMut().objMut().fileY = control.placement->vertOffset;
+    node.extMut().objMut().fileGroupX = control.placement->groupX;
+    node.extMut().objMut().fileGroupY = control.placement->groupY;
+    node.extMut().objMut().fileMatrixX = control.placement->matrixX;
+    node.extMut().objMut().fileMatrixY = control.placement->matrixY;
+    node.extMut().objMut().fileScaleX = control.placement->scaleX;
+    node.extMut().objMut().fileScaleY = control.placement->scaleY;
+    node.extMut().objMut().filePadLeft = control.boxPadLeft;
+    node.extMut().objMut().filePadRight = control.boxPadRight;
+    node.extMut().objMut().filePadTop = control.boxPadTop;
+    node.extMut().objMut().filePadBottom = control.boxPadBottom;
+    node.extMut().objMut().fileHorzRel = control.placement->horzRelTo;
+    node.extMut().objMut().fileVertRel = control.placement->vertRelTo;
+    node.extMut().objMut().fileHorzAlign = control.placement->horzAlign;
+    node.extMut().objMut().shapeType = control.shapeType;
     if (control.table) {
-        node.fileRows = control.table->rowCount;
-        node.fileCols = control.table->colCount;
+        node.extMut().objMut().fileRows = control.table->rowCount;
+        node.extMut().objMut().fileCols = control.table->colCount;
     }
     node.treatAsChar = control.placement->treatAsChar;
     node.vertAlign = control.placement->vertAlign;
-    node.baseLine = control.baseLine;
+    node.extMut().objMut().baseLine = control.baseLine;
     node.flipHorizontal = control.placement->flipHorizontal;
     node.flipVertical = control.placement->flipVertical;
     node.marginLeft = control.placement->marginLeft;
     node.marginRight = control.placement->marginRight;
     node.marginTop = control.placement->marginTop;
     node.marginBottom = control.placement->marginBottom;
-    node.binItemId = control.binItemId;
-    node.picture = control.picture;
-    node.zOrder = control.placement->zOrder;
-    node.textWrap = control.placement->textWrap;
-    node.points = control.points;
-    node.cornerRatio = control.cornerRatio;
+    node.extMut().objMut().binItemId = control.binItemId;
+    node.extMut().objMut().picture = control.picture;
+    node.extMut().objMut().zOrder = control.placement->zOrder;
+    node.extMut().objMut().textWrap = control.placement->textWrap;
+    node.extMut().objMut().points = control.points;
+    node.extMut().objMut().cornerRatio = control.cornerRatio;
     if (control.kind == ControlKind::Picture) node.role = "picture";
     else if (control.kind == ControlKind::Table) node.role = "table";
     else if (control.kind == ControlKind::Container) node.role = "container";
     else if (control.kind == ControlKind::Equation) {
         node.role = "equation";
-        node.script = control.script;
-        node.fileEqBase = control.fileBaseLine >= 0 ? control.fileBaseLine : control.baseLine;
+        node.extMut().objMut().script = control.script;
+        node.extMut().objMut().fileEqBase = control.fileBaseLine >= 0 ? control.fileBaseLine : control.baseLine;
         // 줄에 앉히는 상자는 파일 너비·높이다. 측정값은 요소 비교에만 남긴다.
         const EquationSize measured = control.equationFont.empty()
                                           ? measureHangulEquation(control.script, control.baseUnit)
                                           : measureHangulEquation(control.script, control.baseUnit, control.equationFont);
-        node.eqWidth = measured.width;
-        node.eqHeight = measured.height;
-        node.eqBase = measured.baseLine;
-        attachCaption(node, control, doc, depth, defaultTab, useStoredLineHeight);
+        node.extMut().objMut().eqWidth = measured.width;
+        node.extMut().objMut().eqHeight = measured.height;
+        node.extMut().objMut().eqBase = measured.baseLine;
+        attachCaption(node, control, doc, depth, defaultTab, useStoredLineHeight, deferSpans);
         return node;
     } else node.role = "shape";
     if (control.kind == ControlKind::Table && control.table) {
         // 표 테두리는 칸 테두리와 따로다. 한글은 셀 간격을 켜야 이 바깥 프레임을 그린다.
-        node.cellSpacing = static_cast<std::int32_t>(control.table->cellSpacing);
+        node.extMut().cellSpacing = static_cast<std::int32_t>(control.table->cellSpacing);
         if (control.table->cellSpacing > 0) applyBorderFill(node, doc, control.table->borderFillId);
         if (const auto* fill = findBorderFill(doc, control.table->borderFillId)) {
-            node.breakCellSeparateLine = fill->breakCellSeparateLine;
+            node.extMut().breakCellSeparateLine = fill->breakCellSeparateLine;
         }
     } else {
         applyStroke(node, control);
     }
-    fillInside(node, control, doc, depth, defaultTab, useStoredLineHeight);
-    attachCaption(node, control, doc, depth, defaultTab, useStoredLineHeight);
+    fillInside(node, control, doc, depth, defaultTab, useStoredLineHeight, deferSpans);
+    attachCaption(node, control, doc, depth, defaultTab, useStoredLineHeight, deferSpans);
     return node;
 }
 
@@ -1148,7 +1303,28 @@ struct TableCarry {
     Node table;
     std::int32_t ox = 0;
     std::int32_t oy = 0;
+    // 나누지 못해 통째로 다음 쪽(단)으로 간 표. 앞 쪽의 글은 그대로 이어 채우고, 표는 다음 쪽 맨 위에 놓는다.
+    bool moved = false;
 };
+
+// 잘린 행의 글 없는 아래 조각을 다음 쪽에 남기는 가장 작은 높이. 1mm + 1000.
+constexpr std::int32_t kSplitRowKeep = 283 + 1000;
+
+// 표를 쪽에서 나눌 수 있는가(세로쓰기 구역은 아예 나누지 않는다).
+// 나누지 않음, 세로 정렬이 위가 아님, 왼쪽·오른쪽 캡션, 세로쓰기 칸이 하나라도 있으면 못 나눈다.
+bool tableSplits(const Control& ctrl, int textDirection) {
+    if (!ctrl.table || textDirection != 0) return false;
+    if (ctrl.table->pageBreak == "NONE") return false;
+    if (ctrl.placement && !ctrl.placement->vertAlign.empty() && ctrl.placement->vertAlign != "TOP") return false;
+    if (ctrl.caption && (ctrl.caption->side == "LEFT" || ctrl.caption->side == "RIGHT")) return false;
+    for (const TableCell& cell : ctrl.table->cells) {
+        if (cell.content.textDirection != 0) return false;
+    }
+    return true;
+}
+
+// 글이 끝났는데 다음 쪽으로 보낸 표가 남았다. 다음 쪽은 마지막 문단에서 그 표만 놓는다.
+constexpr std::size_t kCarryPastEnd = static_cast<std::size_t>(-1);
 
 struct ColumnResume {
     int paragraph = 0;
@@ -1181,7 +1357,7 @@ int paragraphEm(const Document& doc, const Paragraph& para) {
 // 그림과 글자 인라인의 lineseg textheight가 그 값이다. 줄간격 추가분은 넣지 않는다.
 std::int32_t lineCharBox(const Node& line) {
     std::int32_t bottom =
-        line.textHeight > 0 ? line.textHeight : (line.fontSize > 0 ? line.fontSize : kEm);
+        line.lineData().textHeight > 0 ? line.lineData().textHeight : (line.fontSize > 0 ? line.fontSize : kEm);
     for (const auto& child : line.children) {
         if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
         const std::int32_t outerBottom = inlineObjectBottom(child);
@@ -1379,7 +1555,6 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
     if (mode == "CELL") {
         std::int32_t candidateY = availH;
         bool canSplitAtAvail = true;
-        bool anyMultiLineSpanning = false;
         bool anySpanningAtAvail = false;
         for (const Node* c : cells) {
             if (c->y < candidateY && c->y + c->height > candidateY) {
@@ -1400,10 +1575,7 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
                         probeTop.children.push_back(std::move(tb));
                         probeBot.children.push_back(std::move(bb));
                         const int topL = countBodyLines(probeTop);
-                        const int botL = countBodyLines(probeBot);
-                        if (topL > 0 && botL > 0 && c->y >= rowCutY) {
-                            anyMultiLineSpanning = true;
-                        } else if (topL == 0 && c->y >= rowCutY) {
+                        if (topL == 0 && c->y >= rowCutY) {
                             canSplitAtAvail = false;
                             break;
                         }
@@ -1414,8 +1586,8 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
                 }
             }
         }
-        if (anySpanningAtAvail && canSplitAtAvail && (anyMultiLineSpanning || rowCutY == 0) &&
-            candidateY > rowCutY) {
+        // 걸친 행의 글이 위 조각에 다 들어가도 그 자리에서 자른다(한글 2024, h-tbl-r*).
+        if (anySpanningAtAvail && canSplitAtAvail && candidateY > rowCutY) {
             splitY = candidateY;
             cellModeSplit = true;
         } else if (rowCutY > 0 && rowCutY < tableNode.height) {
@@ -1436,14 +1608,14 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
     if (headerRowCount > 0) {
         std::int32_t headerBottomY = 0;
         for (const Node* c : cells) {
-            if (c->row >= 0 && c->row < headerRowCount) {
+            if (c->ext().row >= 0 && c->ext().row < headerRowCount) {
                 headerBottomY = std::max(headerBottomY, c->y + c->height);
             }
         }
         // 제목 줄 영역 안에서 표가 잘리면 제목 줄만 남게 되므로 분할하지 않고 통째로 다음 단/쪽으로 넘긴다.
         if (headerBottomY > 0 && splitY <= headerBottomY) return false;
         for (const Node* c : cells) {
-            if (c->row >= 0 && c->row < headerRowCount && c->y + c->height <= splitY) {
+            if (c->ext().row >= 0 && c->ext().row < headerRowCount && c->y + c->height <= splitY) {
                 headerCells.push_back(*c);
                 headerHeight = std::max(headerHeight, c->y + c->height);
             }
@@ -1455,7 +1627,7 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
     outTop.children.clear();
     outBottom.children.clear();
 
-    const std::int32_t spacing = tableNode.cellSpacing;
+    const std::int32_t spacing = tableNode.ext().cellSpacing;
     std::int32_t topTableH = splitY;
     std::int32_t botExtraShift = 0;
 
@@ -1463,7 +1635,10 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
     struct SplitPiece {
         Node cell;
         std::int32_t origY = 0;
+        bool emptyTail = false;  // 잘린 행의 아래 조각인데 글이 없고 빈 줄 하나도 못 담는다
     };
+    std::size_t cutPieces = 0;
+    std::size_t emptyTails = 0;
     std::vector<Node> topCells;
     std::vector<SplitPiece> botPieces;
 
@@ -1487,11 +1662,11 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
         botPart.height = (c->y + c->height) - splitY;
 
         // spanRowSplits 분할
-        topPart.spanRowSplits.clear();
-        botPart.spanRowSplits.clear();
-        for (std::int32_t sr : c->spanRowSplits) {
-            if (c->y + sr < splitY) topPart.spanRowSplits.push_back(sr);
-            else if (c->y + sr > splitY) botPart.spanRowSplits.push_back((c->y + sr) - splitY);
+        topPart.extMut().objMut().spanRowSplits.clear();
+        botPart.extMut().objMut().spanRowSplits.clear();
+        for (std::int32_t sr : c->ext().obj().spanRowSplits) {
+            if (c->y + sr < splitY) topPart.extMut().objMut().spanRowSplits.push_back(sr);
+            else if (c->y + sr > splitY) botPart.extMut().objMut().spanRowSplits.push_back((c->y + sr) - splitY);
         }
 
         // 셀 내부 Body 줄 분할
@@ -1519,14 +1694,17 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
             botPart.children[0] = std::move(bb);
         }
 
-        if (!tableNode.breakCellSeparateLine && !c->breakCellSeparateLine && c->rowSpan <= 1) {
-            topPart.borderBottom = BorderEdge{};
-            botPart.borderTop = BorderEdge{};
-        }
+        // 자른 자리에도 칸의 아래·위 선을 그린다(한글 2024 h-tbl-rows PDF: 1쪽 752.18, 2쪽 102.01 의 가로선).
+        // 글이 위 조각에 다 들어가면 남는 아래 조각은 1283 이상일 때만 다음 쪽에 남기고, 작으면 버린다
+        // (한글 2024 h-tbl-r*: 1305·2105 는 남고 1105 이하는 버린다).
+        const bool emptyTail = c->ext().rowSpan <= 1 && countBodyLines(botPart) == 0 && botPart.height < kSplitRowKeep;
+        ++cutPieces;
+        if (emptyTail) ++emptyTails;
         topCells.push_back(std::move(topPart));
         SplitPiece sp;
         sp.cell = std::move(botPart);
         sp.origY = splitY;
+        sp.emptyTail = emptyTail;
         botPieces.push_back(std::move(sp));
     }
 
@@ -1537,7 +1715,7 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
         outTop.children.push_back(std::move(tc));
     }
     outTop.height = topTableH;
-    outTop.splitTable = true;
+    outTop.extMut().objMut().splitTable = true;
 
     // headerHeight 가 splitY 이상이면(헤더 자체가 쪼개진 경우) 헤더 반복 생략
     if (headerHeight >= splitY) {
@@ -1563,9 +1741,21 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
         }
     }
 
+    // 잘린 행의 아래 조각이 모두 빈 꼬리면 그 행은 위 쪽에서 끝난다. 다음 행부터 쪽 맨 위에 붙인다.
+    const bool dropTails = cutPieces > 0 && emptyTails == cutPieces;
+    if (dropTails) {
+        botPieces.erase(std::remove_if(botPieces.begin(), botPieces.end(),
+                                       [](const SplitPiece& sp) { return sp.emptyTail; }),
+                        botPieces.end());
+        botExtraShift = 0;
+    }
+    // 남는 행이 없으면 표는 이 쪽에서 줄인 행으로 끝난다. 아래 조각은 비워 두고 부르는 쪽은 넘기지 않는다.
+    const bool tableEnds = dropTails && botPieces.empty();
+    if (tableEnds) outBottom.children.clear();
     for (auto& sp : botPieces) {
         Node& bc = sp.cell;
         std::int32_t newY = (bc.y - splitY) + headerHeight + spacing;
+        if (dropTails) newY -= spanEnd - splitY;
         if (botExtraShift > 0) {
             if (sp.origY >= spanEnd) {
                 newY += botExtraShift;
@@ -1578,16 +1768,21 @@ bool splitTableNode(const Node& tableNode, const Table& tableModel, std::int32_t
         outBottom.children.push_back(std::move(bc));
     }
     outBottom.height = botTableH;
-    outBottom.splitTable = true;
+    outBottom.extMut().objMut().splitTable = true;
+    outBottom.extMut().objMut().splitTail = true;
 
     // 캡션 처리: 위 캡션은 outTop에, 아래 캡션은 outBottom에 배치
     for (const Node* ex : extras) {
         if (ex->role == "caption") {
             if (ex->y < 0) {
                 outTop.children.push_back(*ex);
+            } else if (tableEnds) {
+                Node cap = *ex;
+                cap.y = outTop.height + cap.ext().obj().fileX;
+                outTop.children.push_back(std::move(cap));
             } else {
                 Node cap = *ex;
-                cap.y = outBottom.height + cap.fileX;
+                cap.y = outBottom.height + cap.ext().obj().fileX;
                 outBottom.children.push_back(std::move(cap));
             }
         } else {
@@ -1689,13 +1884,13 @@ const Numbering* numberingFor(const Document& doc, const std::string& type, std:
 }
 
 void copyHeadPlace(Node& paragraph, const ParaHead& head) {
-    paragraph.head.autoIndent = head.autoIndent;
-    paragraph.head.useInstWidth = head.useInstWidth;
-    paragraph.head.widthAdjust = head.widthAdjust;
-    paragraph.head.textOffset = head.textOffset;
-    paragraph.head.offsetType = head.textOffsetType.empty() ? "PERCENT" : head.textOffsetType;
-    paragraph.head.align = head.align.empty() ? "LEFT" : head.align;
-    paragraph.head.charShapeId = head.charShapeId;
+    paragraph.extMut().head.autoIndent = head.autoIndent;
+    paragraph.extMut().head.useInstWidth = head.useInstWidth;
+    paragraph.extMut().head.widthAdjust = head.widthAdjust;
+    paragraph.extMut().head.textOffset = head.textOffset;
+    paragraph.extMut().head.offsetType = head.textOffsetType.empty() ? "PERCENT" : head.textOffsetType;
+    paragraph.extMut().head.align = head.align.empty() ? "LEFT" : head.align;
+    paragraph.extMut().head.charShapeId = head.charShapeId;
 }
 
 std::string romanNumeral(int value, bool lower) {
@@ -1928,7 +2123,7 @@ std::string expandHeading(const std::string& format, const Numbering* numbering,
 void applyHeading(Node& paragraph, const Paragraph& para, const Document& doc, HeadingState& state, bool counted) {
     const ParaShape* shape = findParaShape(doc, para.paraShapeId);
     if (!shape || shape->headingType.empty() || shape->headingType == "NONE") return;
-    paragraph.headingType = shape->headingType;
+    paragraph.extMut().headingType = shape->headingType;
     paragraph.headingLevel = static_cast<int>(shape->headingLevel);
     if (shape->headingType == "BULLET") {
         const Bullet* bullet = nullptr;
@@ -1938,18 +2133,25 @@ void applyHeading(Node& paragraph, const Paragraph& para, const Document& doc, H
                 break;
             }
         }
+        // 정의 없이 0번을 가리키면 한글은 ● 를 붙인다(한글 2024 글머리표 문단, tmp/parakind/kind3-lv0).
+        static const Bullet builtinBullet = [] {
+            Bullet out;
+            out.text = "\u25CF";
+            return out;
+        }();
+        if (!bullet && shape->headingIdRef == 0) bullet = &builtinBullet;
         if (!bullet) return;
-        paragraph.headingText = shape->checked && !bullet->checkedText.empty() ? bullet->checkedText : bullet->text;
+        paragraph.extMut().headingText = shape->checked && !bullet->checkedText.empty() ? bullet->checkedText : bullet->text;
         copyHeadPlace(paragraph, bullet->head);
         // 칸 너비는 체크 여부와 상관없이 기록의 글머리 글자로 언어를 본다. 둘째 인자는 0이다.
         std::size_t index = 0;
         char32_t mark = 0;
-        paragraph.head.halfSlot = nextCodePoint(bullet->text, index, mark) && layout::hancomCharLang(mark, false) == Lang::Latin;
-        paragraph.head.imageId = bullet->imageId;
-        paragraph.head.bright = bullet->bright;
-        paragraph.head.contrast = bullet->contrast;
-        paragraph.head.effect = bullet->effect;
-        paragraph.head.ready = !paragraph.headingText.empty() || !bullet->imageId.empty();
+        paragraph.extMut().head.halfSlot = nextCodePoint(bullet->text, index, mark) && layout::hancomCharLang(mark, false) == Lang::Latin;
+        paragraph.extMut().head.imageId = bullet->imageId;
+        paragraph.extMut().head.bright = bullet->bright;
+        paragraph.extMut().head.contrast = bullet->contrast;
+        paragraph.extMut().head.effect = bullet->effect;
+        paragraph.extMut().head.ready = !paragraph.ext().headingText.empty() || !bullet->imageId.empty();
         return;
     }
     if (shape->headingType != "OUTLINE" && shape->headingType != "NUMBER") return;
@@ -1965,12 +2167,12 @@ void applyHeading(Node& paragraph, const Paragraph& para, const Document& doc, H
         if (values[static_cast<std::size_t>(levelIndex)] == 0) values[static_cast<std::size_t>(levelIndex)] = start;
         else values[static_cast<std::size_t>(levelIndex)] += 1;
     }
-    if (head) paragraph.headingFormat = head->format;
+    if (head) paragraph.extMut().headingFormat = head->format;
     if (head && !head->format.empty()) {
-        paragraph.headingText = expandHeading(head->format, numbering, values, levelIndex);
+        paragraph.extMut().headingText = expandHeading(head->format, numbering, values, levelIndex);
     }
     if (head) copyHeadPlace(paragraph, *head);
-    paragraph.head.ready = !paragraph.headingText.empty();
+    paragraph.extMut().head.ready = !paragraph.ext().headingText.empty();
 }
 
 SpacingKind spacingKindOf(const ParaShape* para) {
@@ -2022,19 +2224,18 @@ int pitchFor(SpacingKind kind, int value, int em) {
 // 위·가운데는 테두리를 글자 상자의 그 자리에 맞추고, 위 여백은 테두리 위에 둔다.
 // 글자가 없는 줄은 개체를 줄 맨 위에 둔다.
 std::int32_t characterBaseline(const Node& line, std::int32_t textBox) {
+    // 문단 번호는 본문 글자 상자를 키우지 않는다. 줄 글자 표에는 들지 않는다.
     std::int32_t glyphBox = 0;
-    for (const Node& child : line.children) {
-        // 문단 번호는 본문 글자 상자를 키우지 않는다.
-        if (child.headingMark) continue;
-        if (child.kind != NodeKind::Span || child.text.empty() || child.fontSize <= 0) continue;
-        glyphBox = std::max(glyphBox, child.fontSize);
+    for (const LineRun& run : lineGlyphs(line).runs) {
+        if (run.kind == RunKind::Object || run.textEnd == run.textBegin || run.style->fontSize <= 0) continue;
+        glyphBox = std::max(glyphBox, run.style->fontSize);
     }
-    if (glyphBox > 0 && line.matchFontBaseline) {
-        const std::int32_t fontBase = spanFontBox(line.children).baseline;
+    if (glyphBox > 0 && line.lineData().matchFontBaseline) {
+        const std::int32_t fontBase = lineFontBox(line).baseline;
         if (fontBase >= 0) return fontBase;
     }
     if (glyphBox > 0) return layout::glyphBaseline(glyphBox);
-    if (line.lineBaseline >= 0) return line.lineBaseline;
+    if (line.lineData().lineBaseline >= 0) return line.lineData().lineBaseline;
     return layout::glyphBaseline(textBox);
 }
 
@@ -2044,24 +2245,23 @@ void placeInlineObjects(Node& line, SpacingKind kind, int spacingValue, bool kee
     for (const Node& child : line.children) {
         if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
         hasObject = true;
-        if (child.baseLine >= 0) hasEquation = true;
+        if (child.ext().obj().baseLine >= 0) hasEquation = true;
     }
     // 글자도 조판 부호도 없이 개체만 있는 줄은 글자 상자가 0이다. 개체 높이가 곧 줄 높이다.
     const std::int32_t textBox =
-        line.textHeight > 0 ? line.textHeight : (hasObject ? 0 : (line.fontSize > 0 ? line.fontSize : 1000));
+        line.lineData().textHeight > 0 ? line.lineData().textHeight : (hasObject ? 0 : (line.fontSize > 0 ? line.fontSize : 1000));
     // 수식이 없으면 글꼴 어센더나 글자 상자 85%를 그대로 둔다.
     // 수식이 있으면 글자 기준선과 수식·그림 기준선 중 큰 값이 줄 기준선이다.
     const std::int32_t charBaseline =
         hasEquation ? characterBaseline(line, textBox)
-                    : (line.lineBaseline >= 0 ? line.lineBaseline : layout::glyphBaseline(textBox));
+                    : (line.lineData().lineBaseline >= 0 ? line.lineData().lineBaseline : layout::glyphBaseline(textBox));
     const std::int32_t baseline = hasEquation ? measuredLineBaseline(line, charBaseline) : charBaseline;
-    if (hasEquation) line.lineBaseline = baseline;
+    if (hasEquation) line.editContent().lineBaseline = baseline;
     const std::string mode = line.vertAlign.empty() ? "BASELINE" : line.vertAlign;
     // 글 칸을 나중에 채우는 줄도 글자가 있다. 그때 개체를 줄 맨 위에 두면 수식이 기준선에서 뜬다.
     bool hasGlyph = line.spansLater;
-    for (const Node& child : line.children) {
-        if (child.headingMark) continue;
-        if (child.kind == NodeKind::Span && !child.text.empty()) hasGlyph = true;
+    for (const LineRun& run : lineGlyphs(line).runs) {
+        if (run.kind != RunKind::Object && run.textEnd > run.textBegin) hasGlyph = true;
     }
     if (hasGlyph) {
         for (Node& child : line.children) {
@@ -2074,7 +2274,7 @@ void placeInlineObjects(Node& line, SpacingKind kind, int spacingValue, bool kee
                 child.y = (textBox - child.height) / 2 - child.marginTop;
             } else if (mode == "BOTTOM") {
                 child.y = textBox - outer;
-            } else if (child.baseLine >= 0) {
+            } else if (child.ext().obj().baseLine >= 0) {
                 child.y = baseline - equationBaselinePoint(child);
             } else {
                 child.y = baseline - inlineObjectBaseline(child);
@@ -2094,7 +2294,7 @@ void placeInlineObjects(Node& line, SpacingKind kind, int spacingValue, bool kee
         for (Node& child : line.children) {
             if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
             for (const Node& cap : child.children) {
-                if (cap.role != "caption" || cap.fileHorzRel != "TOP") continue;
+                if (cap.role != "caption" || cap.ext().obj().fileHorzRel != "TOP") continue;
                 child.y -= cap.y;
                 break;
             }
@@ -2135,7 +2335,7 @@ void placeInlineObjects(Node& line, SpacingKind kind, int spacingValue, bool kee
         // 추가분은 글자 크기가 아니라 글자 상자에 비율을 곱한 값이다.
         // 글자처럼 넣은 개체의 글자 모양은 글자 상자에 들지 않지만 이 비율의 바탕에는 든다.
         const int percent = spacingValue > 0 ? spacingValue : (spacingValue == 0 ? 0 : 160);
-        extra = percentSpacingExtra(std::max(line.spacingBox, textBox), percent);
+        extra = percentSpacingExtra(std::max(line.lineData().spacingBox, textBox), percent);
     }
     line.height = std::max(0, bottom + extra);
 }
@@ -2144,8 +2344,8 @@ void placeInlineObjects(Node& line, SpacingKind kind, int spacingValue, bool kee
 // vertSize 는 다음 줄 앞 글자까지 커질 수 있다. 그 값은 진행에 넣지 않는다.
 // 줄의 textheight. 저장 줄과 견줄 때는 측정 상자, 아니면 글자 상자와 글자처럼 취한 개체 중 큰 값이다.
 std::int32_t lineTextBox(const Node& line) {
-    if (line.auditLine && line.measuredSeg.textHeight > 0) return line.measuredSeg.textHeight;
-    const std::int32_t charBox = line.textHeight > 0 ? line.textHeight : line.fontSize;
+    if (line.lineData().auditLine && line.lineData().measuredSeg.textHeight > 0) return line.lineData().measuredSeg.textHeight;
+    const std::int32_t charBox = line.lineData().textHeight > 0 ? line.lineData().textHeight : line.fontSize;
     return measuredTextBox(line, charBox);
 }
 
@@ -2276,30 +2476,30 @@ struct HeadMetrics {
 HeadMetrics headMetrics(const Node& paragraph, const Document& doc, const Paragraph& para,
                         std::vector<std::int32_t>* advances) {
     HeadMetrics out;
-    if (!paragraph.head.ready) return out;
-    const bool picture = !paragraph.head.imageId.empty();
+    if (!paragraph.ext().head.ready) return out;
+    const bool picture = !paragraph.ext().head.imageId.empty();
     // 머리 글자 모양이 없으면 문단 끝 글자(길이 - 1)의 모양이다. 있어도 크기가 0이면 크기만 그 모양에서 받는다.
     const CharShape* ending = nullptr;
     for (auto run = para.runs.rbegin(); run != para.runs.rend() && !ending; ++run) {
         ending = findCharShape(doc, run->charShapeId);
     }
     const CharShape* shaped = nullptr;
-    if (paragraph.head.charShapeId != 0xFFFFFFFFu) shaped = findCharShape(doc, paragraph.head.charShapeId);
+    if (paragraph.ext().head.charShapeId != 0xFFFFFFFFu) shaped = findCharShape(doc, paragraph.ext().head.charShapeId);
     if (!shaped) shaped = ending;
     if (shaped) out.face = *shaped;
     else out.face.height = 1000;
     if (out.face.height == 0 && ending) out.face.height = ending->height;
     out.em = headingEm(out.face);
     const std::int32_t measured =
-        picture ? out.em : measureHeading(doc, paragraph.headingText, out.face, advances);
+        picture ? out.em : measureHeading(doc, paragraph.ext().headingText, out.face, advances);
     out.content = picture ? out.em : measured;
-    out.slot = paragraph.head.useInstWidth ? measured : paragraph.head.halfSlot ? out.em / 2 : out.em;
+    out.slot = paragraph.ext().head.useInstWidth ? measured : paragraph.ext().head.halfSlot ? out.em / 2 : out.em;
     if (out.slot <= 0) out.slot = out.em;
-    out.slot += paragraph.head.widthAdjust;
+    out.slot += paragraph.ext().head.widthAdjust;
     if (out.slot < 0) out.slot = 0;
-    std::int32_t gap = paragraph.head.textOffset;
-    if (paragraph.head.offsetType != "HWPUNIT") {
-        const long long num = static_cast<long long>(out.em) * paragraph.head.textOffset;
+    std::int32_t gap = paragraph.ext().head.textOffset;
+    if (paragraph.ext().head.offsetType != "HWPUNIT") {
+        const long long num = static_cast<long long>(out.em) * paragraph.ext().head.textOffset;
         gap = static_cast<std::int32_t>(num >= 0 ? (num + 50) / 100 : (num - 50) / 100);
     }
     out.hang = out.slot + gap;
@@ -2309,16 +2509,23 @@ HeadMetrics headMetrics(const Node& paragraph, const Document& doc, const Paragr
 // 문단 번호·개요·글머리표는 줄 상자를 줄이지 않고, 그리는 글자만 칸만큼 민다.
 // 한글은 머리 종류를 가리지 않고 머리 칸 + 간격만큼 본문 펜을 민다.
 std::int32_t numberingPush(const Node& paragraph, const Document& doc, const Paragraph& para) {
-    if (!paragraph.head.ready || !paragraph.head.autoIndent) return 0;
-    if (paragraph.headingType != "NUMBER" && paragraph.headingType != "OUTLINE" && paragraph.headingType != "BULLET") return 0;
+    if (!paragraph.ext().head.ready || !paragraph.ext().head.autoIndent) return 0;
+    if (paragraph.ext().headingType != "NUMBER" && paragraph.ext().headingType != "OUTLINE" && paragraph.ext().headingType != "BULLET") return 0;
     return headMetrics(paragraph, doc, para, nullptr).hang;
 }
 
 // 머리는 칸만큼 본문보다 앞에 둔다. 본문은 그 칸을 줄 들여쓰기로 삼아 함께 민다.
+// 줄 자식 앞에 머리를 끼우면 글자 표의 개체 자리도 그만큼 민다.
+void shiftObjectSlots(Node& line, int by) {
+    for (LineRun& run : line.glyphsMut().runs) {
+        if (run.kind == RunKind::Object) run.slot = static_cast<std::uint16_t>(run.slot + by);
+    }
+}
+
 void attachHeading(Node& line, const Node& paragraph, const Document& doc, const Paragraph& para, bool shrink) {
-    if (!paragraph.head.ready) return;
-    const bool picture = !paragraph.head.imageId.empty();
-    if (!picture && paragraph.headingText.empty()) return;
+    if (!paragraph.ext().head.ready) return;
+    const bool picture = !paragraph.ext().head.imageId.empty();
+    if (!picture && paragraph.ext().headingText.empty()) return;
 
     std::vector<std::int32_t> advances;
     const HeadMetrics box = headMetrics(paragraph, doc, para, picture ? nullptr : &advances);
@@ -2326,58 +2533,57 @@ void attachHeading(Node& line, const Node& paragraph, const Document& doc, const
     // 칸이 문자열보다 넓을 때만 남는 폭을 정렬로 나눈다.
     const std::int32_t spare = std::max<std::int32_t>(0, box.slot - box.content);
     std::int32_t pad = 0;
-    if (paragraph.head.align == "CENTER") pad = spare / 2;
-    else if (paragraph.head.align == "RIGHT") pad = spare;
-    const std::int32_t at = (paragraph.head.autoIndent ? -box.hang : 0) + pad;
+    if (paragraph.ext().head.align == "CENTER") pad = spare / 2;
+    else if (paragraph.ext().head.align == "RIGHT") pad = spare;
+    const std::int32_t at = (paragraph.ext().head.autoIndent ? -box.hang : 0) + pad;
 
     if (picture) {
         Node obj;
         obj.kind = NodeKind::Object;
         obj.headingMark = true;
         obj.role = "picture";
-        obj.binItemId = paragraph.head.imageId;
-        obj.picture.bright = paragraph.head.bright;
-        obj.picture.contrast = paragraph.head.contrast;
-        obj.picture.effect = paragraph.head.effect;
+        obj.extMut().objMut().binItemId = paragraph.ext().head.imageId;
+        obj.extMut().objMut().picture.bright = paragraph.ext().head.bright;
+        obj.extMut().objMut().picture.contrast = paragraph.ext().head.contrast;
+        obj.extMut().objMut().picture.effect = paragraph.ext().head.effect;
         obj.width = box.em;
         obj.height = box.em;
         obj.x = at;
-        const int textBox = line.textHeight > 0 ? line.textHeight : box.em;
-        const int baseline = line.lineBaseline >= 0 ? line.lineBaseline : layout::glyphBaseline(textBox);
+        const int textBox = line.lineData().textHeight > 0 ? line.lineData().textHeight : box.em;
+        const int baseline = line.lineData().lineBaseline >= 0 ? line.lineData().lineBaseline : layout::glyphBaseline(textBox);
         obj.y = line.marginTop + baseline - layout::glyphBaseline(box.em);
         line.children.insert(line.children.begin(), std::move(obj));
+        shiftObjectSlots(line, 1);
     } else {
-        Node span;
-        span.kind = NodeKind::Span;
-        span.headingMark = true;
-        span.text = paragraph.headingText;
-        span.fontSize = box.em;
-        span.charShapeId = paragraph.head.charShapeId;
-        span.advances = std::move(advances);
-        span.width = box.content;
-        span.x = at;
-        span.color = colorHex(face.textColor);
-        if (span.color.empty()) span.color = "#000000";
-        span.bold = face.bold;
-        span.italic = face.italic;
-        span.superscript = face.superscript;
-        span.subscript = face.subscript;
+        auto head = std::make_shared<HeadingRun>();
+        head->text = paragraph.ext().headingText;
+        head->fontSize = box.em;
+        head->charShapeId = paragraph.ext().head.charShapeId;
+        head->advances = std::move(advances);
+        head->width = box.content;
+        head->x = at;
+        head->color = colorHex(face.textColor);
+        if (head->color.empty()) head->color = "#000000";
+        head->bold = face.bold;
+        head->italic = face.italic;
+        head->superscript = face.superscript;
+        head->subscript = face.subscript;
         char32_t first = 0;
         std::size_t index = 0;
-        if (!nextCodePoint(span.text, index, first)) first = U'가';
+        if (!nextCodePoint(head->text, index, first)) first = U'가';
         const GlyphFace chosen = glyphFaceIn(doc, face, layout::hancomCharLang(first, true), first, true, true);
-        span.font = chosen.font;
-        span.ratio = chosen.ratio > 0 ? chosen.ratio : 100;
-        span.relSize = chosen.relSize > 0 ? chosen.relSize : 100;
-        line.children.insert(line.children.begin(), std::move(span));
+        head->font = chosen.font;
+        head->ratio = static_cast<std::int16_t>(chosen.ratio > 0 ? chosen.ratio : 100);
+        head->relSize = static_cast<std::int16_t>(chosen.relSize > 0 ? chosen.relSize : 100);
+        line.glyphsMut().heading = std::move(head);
     }
 
-    if (!paragraph.head.autoIndent && box.hang > 0) {
+    if (!paragraph.ext().head.autoIndent && box.hang > 0) {
         line.x += box.hang;
-        if (line.measuredSeg.horzSize > 0) line.measuredSeg.horzPos += box.hang;
+        if (line.lineData().measuredSeg.horzSize > 0) line.editContent().measuredSeg.horzPos += box.hang;
         if (shrink) {
             line.width = std::max<std::int32_t>(0, line.width - box.hang);
-            if (line.measuredSeg.horzSize > box.hang) line.measuredSeg.horzSize -= box.hang;
+            if (line.lineData().measuredSeg.horzSize > box.hang) line.editContent().measuredSeg.horzSize -= box.hang;
         }
     }
 }
@@ -2392,6 +2598,38 @@ const CharShape& fallbackCharShape() {
     return shape;
 }
 
+
+int itemOrdinal(const Paragraph& para, const Control* control) {
+    int index = 0;
+    for (const auto& run : para.runs) {
+        for (const auto& item : run.items) {
+            if (&item.control == control) return index;
+            ++index;
+        }
+    }
+    return -1;
+}
+
+// 띄운 개체가 붙은 원자 번호. 그 앞에 있는 원자 수다(buildAtoms 와 같은 셈).
+std::size_t anchorAtom(const Paragraph& para, const Control* target) {
+    std::size_t count = 0;
+    for (const auto& run : para.runs) {
+        for (const auto& item : run.items) {
+            if (item.type == InlineItem::Type::Text) {
+                std::size_t index = 0;
+                char32_t cp = 0;
+                while (nextCodePoint(item.text, index, cp)) ++count;
+            } else if (&item.control == target) {
+                return count;
+            } else if (visualObject(item.control) && item.control.placement && item.control.placement->treatAsChar) {
+                ++count;
+            } else if (item.type == InlineItem::Type::Control && occupiesBodyLine(item.control)) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
 
 std::vector<Atom> buildAtoms(const Document& doc, const Paragraph& para, const ParaShape* paraShape,
                              const AtomOptions& options) {
@@ -2418,8 +2656,11 @@ std::vector<Atom> buildAtoms(const Document& doc, const Paragraph& para, const P
                     Atom atom;
                     atom.cp = cp;
                     atom.pos = pos;
+                    atom.synthetic = item.synthetic;
                     // lineseg textpos 는 탭을 8칸으로 센다. 한 글자로 세면 줄바꿈 뒤 글자가 같은 줄에 남는다.
-                    if (useLines && cp == '\t') pos += 8;
+                    // 끼운 번호 글자는 칸을 쓰지 않는다. 바꾼 컨트롤의 칸은 글자를 다 넣은 뒤 센다.
+                    if (item.synthetic) {
+                    } else if (useLines && cp == '\t') pos += 8;
                     else if (useLines && cp > 0xFFFF) pos += 2;
                     else pos += 1;
                     atom.fontSize = fontSize;
@@ -2455,6 +2696,7 @@ std::vector<Atom> buildAtoms(const Document& doc, const Paragraph& para, const P
                     breaks.classify(atom, atoms);
                     atoms.push_back(atom);
                 }
+                if (useLines) pos += item.replacedUnits;
             } else if (visualObject(item.control) && item.control.placement &&
                        item.control.placement->treatAsChar) {
                 Atom atom;
@@ -2508,6 +2750,22 @@ std::vector<Atom> buildAtoms(const Document& doc, const Paragraph& para, const P
         const CharShape* shape = findCharShape(doc, para.runs.back().charShapeId);
         options.unseen->push_back({pos, shape && shape->height > 0 ? shape->height : kEm});
     }
+    // 한글과 영어·숫자 자동 간격은 앞 글자 뒤에 둔다. 이미 잰 폭에는 지금 더하고, 나중에 재는 폭은 잴 때 더한다.
+    // 줄 끝에서는 trail 로 빠지므로 줄을 나누는 폭에는 들지 않는다.
+    if (const int flags = autoSpacingFlags(paraShape)) {
+        const auto textAtom = [](const Atom& atom) {
+            return !atom.control && !atom.space && !atom.tab && !atom.hard && !atom.occupiesLine;
+        };
+        for (std::size_t i = 1; i < atoms.size(); ++i) {
+            Atom& left = atoms[i - 1];
+            if (!textAtom(left) || !textAtom(atoms[i])) continue;
+            left.autoGap = autoSpacingGap(left.cp, atoms[i].cp, flags, left.fontSize > 0 ? left.fontSize : kEm);
+            if (left.autoGap > 0 && !options.lazyMetrics && !useLines && !options.deferText) {
+                left.width += left.autoGap;
+                left.trail += left.autoGap;
+            }
+        }
+    }
     return atoms;
 }
 
@@ -2543,11 +2801,21 @@ void measureLazyAtom(const Document& doc, Atom& atom) {
     atom.relSize = drawn.relSize;
     atom.spacing = atom.ignoreSpacing ? 0 : drawn.spacing;
     if (!atom.tab) {
-        atom.width = glyphWidth(doc, atom.cp, *measure);
+        atom.width = glyphWidth(doc, atom.cp, *measure) + atom.autoGap;
         const Lang trailLang = isHangul(atom.cp) ? Lang::Hangul : Lang::Latin;
-        atom.trail = layout::glyphTrail(atom.cp, *measure, trailLang, &doc);
+        atom.trail = layout::glyphTrail(atom.cp, *measure, trailLang, &doc) + atom.autoGap;
     }
     atom.metricsReady = true;
+}
+
+// 개체·표가 없는 문단. 쪽 끝에서 문단째 다음 쪽으로 넘겨도 이미 놓은 개체가 남지 않는다.
+bool plainParagraph(const Paragraph& para) {
+    for (const auto& run : para.runs) {
+        for (const auto& item : run.items) {
+            if (item.type == InlineItem::Type::Control && item.control.placement) return false;
+        }
+    }
+    return true;
 }
 
 ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle>& obstacles,
@@ -2558,11 +2826,28 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
     const Document& doc = *frame.doc;
     std::int32_t y = 0;
     ColumnResume resume;
+    // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 흘린다(turnedPlacement, uprightObject).
+    std::map<const Control*, Placement> turnedPlacements;
+    auto placeOf = [&](const Control& control) -> const Placement& {
+        if (frame.textDirection == 0) return *control.placement;
+        auto found = turnedPlacements.find(&control);
+        if (found == turnedPlacements.end()) {
+            found = turnedPlacements.emplace(&control, turnedPlacement(*control.placement)).first;
+        }
+        return found->second;
+    };
+    auto flowObject = [&](Node object) {
+        if (frame.textDirection == 0 || object.upright) return object;
+        return uprightObject(std::move(object));
+    };
 
     for (int pi = startParagraph; pi < static_cast<int>(paragraphs.size()); ++pi) {
         const std::size_t atomBegin = pi == startParagraph ? startAtom : 0;
         const bool hasCarry = pi == startParagraph && !initialCarry.empty();
-        const bool fresh = atomBegin == 0 && !hasCarry;
+        const bool splitCarry = hasCarry && std::any_of(initialCarry.begin(), initialCarry.end(),
+                                                        [](const TableCarry& c) { return !c.moved; });
+        const bool pastEnd = pi == startParagraph && startAtom == kCarryPastEnd;
+        const bool fresh = atomBegin == 0 && !splitCarry && !pastEnd;
         const Paragraph& para = paragraphs[static_cast<std::size_t>(pi)];
         const bool hasContent = y > 0 || !column.children.empty();
         // 다단 나누기 앞까지만 이 단에 넣는다. 다음 구역은 아래쪽에 새 단으로 시작한다.
@@ -2589,15 +2874,34 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         Node paragraph;
         paragraph.kind = NodeKind::Paragraph;
         paragraph.paragraph = pi;
+        paragraph.paragraphId = para.id;
         paragraph.section = frame.sectionIndex;
         paragraph.x = 0;
         paragraph.y = y;
         // 쪽을 넘어 이어지는 글도 머리 자리만큼 본문을 민다. 번호는 앞 쪽에서 이미 셌다.
-        if ((fresh || atomBegin > 0) && commit && frame.headings) {
+        if ((fresh || atomBegin > 0) && !pastEnd && commit && frame.headings) {
             applyHeading(paragraph, para, doc, *frame.headings, !fresh);
         }
         std::int32_t localY = 0;
         const ParaShape* paraShape = findParaShape(doc, para.paraShapeId);
+        // 줄 격자: 줄 윗변을 단 위에서 격자 간격의 배수로 내리고, 줄 피치를 칸 수로 올린 뒤 그 칸 가운데에 글자를 둔다.
+        // 문단 간격은 먼저 더하고 내린다. 한글 2024 PDF 로 잰 값이다(tools/hwp_page_probe.py).
+        auto gridLine = [&](Node& line) {
+            if (frame.lineGrid <= 0 || !paraShape || !paraShape->snapToGrid) return;
+            const std::int32_t grid = frame.lineGrid;
+            const std::int32_t top = std::max<std::int32_t>(0, y + localY);
+            const std::int32_t snapped = (top + grid - 1) / grid * grid;
+            localY += snapped - top;
+            line.y = localY;
+            const std::int32_t pitch = std::max<std::int32_t>(line.height, 1);
+            const std::int32_t box = (pitch + grid - 1) / grid * grid;
+            const std::int32_t lead = (box - pitch) / 2;
+            line.marginTop += lead;
+            for (Node& child : line.children) {
+                if (child.kind == NodeKind::Object && child.treatAsChar) child.y += lead;
+            }
+            line.height = box;
+        };
         // 여백은 저장된 HWPUNIT 그대로 뺀다. mm 소수점은 이미 버려져 있고, 4배수로 맞추지 않는다.
         const ParagraphSpan span = paragraphSpan(column.width, paraShape);
         const std::int32_t marginLeft = span.marginLeft;
@@ -2606,7 +2910,8 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         paragraph.width = contentWidth;
 
         auto placeParaObject = [&](const Control& ctrl, Node obj, std::int32_t ox, std::int32_t oy) -> bool {
-            const Placement& placement = *ctrl.placement;
+            const Placement& placement = placeOf(ctrl);
+            obj = flowObject(std::move(obj));
             const std::int32_t captionShift = std::max<std::int32_t>(0, obj.x - ox);
             const std::int32_t captionDrop = std::max<std::int32_t>(0, obj.y - oy);
             if (!placement.treatAsChar && placement.vertRelTo == "PARA" && placement.flowWithText) {
@@ -2620,7 +2925,8 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                     const std::int32_t curLeft = marginLeft + ox - placement.marginLeft;
                     const std::int32_t curRight = curLeft + static_cast<std::int32_t>(placement.width) +
                                                   placement.marginLeft + placement.marginRight + captionShift;
-                    const std::int32_t outerH = obj.height + captionDrop + placement.marginTop + placement.marginBottom;
+                    const std::int32_t outerH =
+                        obj.height + captionDrop + captionBelow(obj) + placement.marginTop + placement.marginBottom;
                     for (std::size_t guard = 0; guard <= obstacles.size(); ++guard) {
                         bool moved = false;
                         for (const auto& obs : obstacles) {
@@ -2642,31 +2948,66 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                 }
             }
             if (stopAtBottom && ctrl.kind == ControlKind::Table && ctrl.table) {
-                const std::string pb = ctrl.table->pageBreak.empty() ? "CELL" : ctrl.table->pageBreak;
-                const std::int32_t availH = column.height - (y + obj.y);
-                if (pb == "NONE") {
-                    if (obj.height > availH && (hasContent || pageHasContent)) {
-                        return false;
-                    }
+                const bool splits = tableSplits(ctrl, frame.textDirection);
+                std::int32_t availH = column.height - (y + obj.y);
+                // 나누는 표의 첫 조각은 단 높이 − 1 − 기준 줄과 세로 위치 − 바깥 위·아래 여백 − 100(여백 조정 안 함이면 1)
+                // − 칸 간격 둘에서 끝난다.
+                if (splits) {
+                    availH -= 1 + placement.marginBottom + (ctrl.table->noAdjust ? 1 : 100) +
+                              2 * static_cast<std::int32_t>(ctrl.table->cellSpacing);
+                    availH -= captionBelow(obj);
+                }
+                // 나누지 못하는 표가 남은 자리에 안 들어가면 표만 다음 쪽 맨 위로 간다. 기준 문단의 줄과 뒤 글은
+                // 이 쪽에 남아 이어 채운다(한글 2024, h-tbl-late-none·v-tbl-cols).
+                auto moveToNext = [&]() {
+                    TableCarry carry;
+                    carry.control = &ctrl;
+                    carry.table = std::move(obj);
+                    carry.table.y = 0;
+                    carry.ox = ox;
+                    carry.moved = true;
+                    resume.carryTables.push_back(std::move(carry));
+                    return true;
+                };
+                if (!splits) {
+                    if (obj.height > availH && (hasContent || pageHasContent)) return moveToNext();
                 } else if (obj.height > availH) {
                     Node topPart, botPart;
                     if (splitTableNode(obj, *ctrl.table, availH, topPart, botPart)) {
                         obj = std::move(topPart);
-                        TableCarry carry;
-                        carry.control = &ctrl;
-                        carry.table = std::move(botPart);
-                        carry.table.x = ox;
-                        carry.table.y = 0;
-                        carry.ox = ox;
-                        carry.oy = 0;
-                        resume.carryTables.push_back(std::move(carry));
+                        const bool tail = std::any_of(botPart.children.begin(), botPart.children.end(),
+                                                      [](const Node& n) { return n.kind == NodeKind::Cell; });
+                        if (tail) {
+                            TableCarry carry;
+                            carry.control = &ctrl;
+                            carry.table = std::move(botPart);
+                            carry.table.x = ox;
+                            carry.table.y = 0;
+                            carry.ox = ox;
+                            carry.oy = 0;
+                            resume.carryTables.push_back(std::move(carry));
+                        }
                     } else if (hasContent || pageHasContent) {
-                        return false;
+                        return moveToNext();
                     }
                 }
             }
-            const std::int32_t objH = obj.height;
+            const std::int32_t objH = obj.height + captionBelow(obj);
             const std::int32_t objY = obj.y;
+            // 다른 문단에서 넘어온 표 조각은 이 문단 항목이 아니라 옮길 수 없다(anchorItem -1).
+            const int ordinal = itemOrdinal(para, &ctrl);
+            if (!placement.treatAsChar && ordinal >= 0) {
+                obj.extMut().objMut().anchorStory = frame.story;
+                obj.extMut().objMut().anchorParagraph = pi;
+                obj.extMut().objMut().anchorItem = ordinal;
+                for (Node& inner : obj.children) {
+                    if (obj.upright) {
+                        inner.extMut().objMut().anchorStory = frame.story;
+                        inner.extMut().objMut().anchorParagraph = pi;
+                        inner.extMut().objMut().anchorItem = ordinal;
+                    }
+                }
+            }
             paragraph.children.push_back(std::move(obj));
             Obstacle obstacle;
             obstacle.x = marginLeft + ox - placement.marginLeft;
@@ -2689,45 +3030,70 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                 placeParaObject(*c.control, std::move(c.table), c.ox, c.oy);
             }
         }
+        if (pastEnd) {
+            if (frame.story > 0) stampStory(paragraph, frame.story);
+            column.children.push_back(std::move(paragraph));
+            continue;
+        }
 
+        // 문단 기준 세로 거리는 개체 글자가 든 줄의 위에서 잰다(한글 2024
+        // d-wrap-*: 다섯째 줄에 붙은 그림은 그 줄 위 + 세로 거리). 첫 원자에 붙은 개체는 줄을 짜기 전에 놓고,
+        // 그 뒤에 붙은 개체는 그 줄을 짠 뒤에 놓는다. 쪽을 넘어 이어지는 문단도 이 쪽 줄에 붙은 개체를 놓는다.
+        struct Anchored {
+            const Control* control = nullptr;
+            std::size_t atom = 0;
+        };
+        std::vector<Anchored> anchored;
+        auto placeFloat = [&](const Control& control, std::int32_t lineTop) -> bool {
+            const Placement& placement = placeOf(control);
+            // 좌표는 문단 내용 기준이다. 여백은 문단 상자 밖에 둔다.
+            // 문단 기준은 문단 내용이다. 종이 기준 가로는 종이 왼쪽이 원점이라 본문 여백만큼 되돌린다.
+            std::int32_t ox = 0;
+            if (placement.horzRelTo == "PAPER" && frame.page && body) {
+                const std::int32_t paperX =
+                    aligned(placement.horzAlign, 0, paper.width, static_cast<std::int32_t>(placement.width),
+                            placement.horzOffset);
+                ox = paperX - body->x - column.x - marginLeft;
+            } else {
+                const bool paraX = placement.horzRelTo == "PARA";
+                ox = aligned(placement.horzAlign, 0, paraX ? contentWidth : column.width,
+                             static_cast<std::int32_t>(placement.width), placement.horzOffset);
+                if (!paraX) ox -= marginLeft;
+                ox = insetX(placement, ox);
+            }
+            std::int32_t oy = 0;
+            if (placement.vertRelTo == "PAPER" && frame.page && body) {
+                const std::int32_t paperY =
+                    aligned(placement.vertAlign, 0, paper.height, static_cast<std::int32_t>(placement.height),
+                            placement.vertOffset);
+                oy = paperY - body->y - column.y - y;
+            } else {
+                const bool paraY = placement.vertRelTo == "PARA";
+                oy = aligned(placement.vertAlign, 0, paraY ? 0 : column.height,
+                             static_cast<std::int32_t>(placement.height), placement.vertOffset);
+                if (!paraY) oy -= y;
+                else oy += lineTop;
+                oy = insetY(placement, oy);
+            }
+            Node built = makeObject(control, ox, oy, doc, frame.depth, frame.defaultTab, frame.useStoredLineHeight,
+                                    frame.deferSpans);
+            return placeParaObject(control, std::move(built), ox, oy);
+        };
         for (const auto& run : para.runs) {
             for (const auto& item : run.items) {
                 if (!visualObject(item.control) || !item.control.placement || item.control.placement->treatAsChar) {
                     continue;
                 }
-                const Placement& placement = *item.control.placement;
+                const Placement& placement = placeOf(item.control);
+                if (placement.vertRelTo == "PARA") {
+                    const std::size_t atom = anchorAtom(para, &item.control);
+                    if (!fresh || atom > 0) {
+                        if (fresh || atom >= atomBegin) anchored.push_back({&item.control, atom});
+                        continue;
+                    }
+                }
                 if (fresh && (placement.vertRelTo == "PARA" || placement.horzRelTo == "PARA")) {
-                    // 좌표는 문단 내용 기준이다. 여백은 문단 상자 밖에 둔다.
-                    // 문단 기준은 문단 내용이다. 종이 기준 가로는 종이 왼쪽이 원점이라 본문 여백만큼 되돌린다.
-                    std::int32_t ox = 0;
-                    if (placement.horzRelTo == "PAPER" && frame.page && body) {
-                        const std::int32_t paperX =
-                            aligned(placement.horzAlign, 0, paper.width, static_cast<std::int32_t>(placement.width),
-                                    placement.horzOffset);
-                        ox = paperX - body->x - column.x - marginLeft;
-                    } else {
-                        const bool paraX = placement.horzRelTo == "PARA";
-                        ox = aligned(placement.horzAlign, 0, paraX ? contentWidth : column.width,
-                                     static_cast<std::int32_t>(placement.width), placement.horzOffset);
-                        if (!paraX) ox -= marginLeft;
-                        ox = insetX(placement, ox);
-                    }
-                    std::int32_t oy = 0;
-                    if (placement.vertRelTo == "PAPER" && frame.page && body) {
-                        const std::int32_t paperY =
-                            aligned(placement.vertAlign, 0, paper.height, static_cast<std::int32_t>(placement.height),
-                                    placement.vertOffset);
-                        oy = paperY - body->y - column.y - y;
-                    } else {
-                        const bool paraY = placement.vertRelTo == "PARA";
-                        oy = aligned(placement.vertAlign, 0, paraY ? 0 : column.height,
-                                     static_cast<std::int32_t>(placement.height), placement.vertOffset);
-                        if (!paraY) oy -= y;
-                        oy = insetY(placement, oy);
-                    }
-                    Node built = makeObject(item.control, ox, oy, doc, frame.depth, frame.defaultTab,
-                                            frame.useStoredLineHeight);
-                    if (!placeParaObject(item.control, std::move(built), ox, oy)) {
+                    if (!placeFloat(item.control, 0)) {
                         resume.paragraph = pi;
                         resume.atom = 0;
                         resume.done = false;
@@ -2754,6 +3120,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         paragraph.spacingNext = spacingNext;
         if (spacingPrev > 0) localY += spacingPrev;
         bool firstLine = atomBegin == 0;
+        // 개체를 비켜 한 줄 높이에 여러 칸으로 나뉜 줄. 다음에 채울 칸 번호와 그 줄들의 가장 큰 높이다.
+        std::size_t rowGap = 0;
+        std::int32_t rowHeight = 0;
+        bool storedRow = false;  // 저장된 줄이 앞 lineseg 와 같은 높이에 이어진다
         // 들여쓰기·내어쓰기는 lineseg 가로에 없다. 줄 위치는 빼고, 글자만 가로로 민다.
         const bool storedLines = frame.useStoredLineHeight && !para.lineSegs.empty();
         auto glyphShift = [&]() {
@@ -2786,7 +3156,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         const std::int32_t defaultPitch = pitchOf(emptyEm > 0 ? emptyEm : kEm);
         // 저장된 줄이 있으면 글자 폭으로 다시 끊지 않는다. 위치는 lineseg 와 같은 WCHAR 칸이다.
         const bool useLines = frame.useStoredLineHeight && !para.lineSegs.empty();
-        const bool deferText = useLines && frame.deferSpans && frame.sectionIndex >= 0;
+        // 글자 묶음은 그 쪽을 그릴 때 채운다. 본문뿐 아니라 그 안의 표 칸·글상자·캡션도 lineSeg 가 있으면 미룬다.
+        // 칸 높이는 lineSeg 높이 합으로 정해지니 글자를 재지 않아도 된다. 머리말·각주처럼 문단 사본으로 짜는 틀은
+        // deferSpans 를 켜지 않는다.
+        const bool deferText = useLines && frame.deferSpans;
         struct ReflowTimer {
             bool on = false;
             std::chrono::steady_clock::time_point started{};
@@ -2808,6 +3181,30 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         std::vector<UnseenMark> unseen;
         atomOptions.unseen = &unseen;
         std::vector<Atom> atoms = buildAtoms(doc, para, paraShape, atomOptions);
+        // 글자 격자: 줄을 나눌 때 글자 폭을 칸에 맞춘다. 저장된 줄은 한글이 나눈 그대로 두고 그릴 때만 칸에 맞춘다.
+        if (frame.charGrid > 0 && !useLines) {
+            std::vector<char32_t> cps(atoms.size(), 0);
+            std::vector<std::int32_t> widths(atoms.size(), 0);
+            for (std::size_t i = 0; i < atoms.size(); ++i) {
+                const Atom& atom = atoms[i];
+                widths[i] = atom.width;
+                if (!atom.control && !atom.tab && !atom.hard && !atom.occupiesLine) cps[i] = atom.cp;
+            }
+            const std::vector<GridCell> cells = charGridCells(cps, widths, frame.charGrid, frame.wongoji);
+            for (std::size_t i = 0; i < atoms.size(); ++i) {
+                if (cps[i] == 0) continue;
+                atoms[i].natural = std::max<std::int32_t>(1, atoms[i].width);
+                atoms[i].width = cells[i].width;
+                atoms[i].trail = 0;
+                // 칸에 맞춘 글은 어절을 묶지 않고 글자마다 끊는다. 원고지 정서법이면 줄 머리에 못 오는 문장 부호를
+                // 앞 글자에 붙여 꽉 찬 줄 끝에 넘쳐 남긴다(마지막 칸에 함께 적기). 그냥 격자는 다음 줄 앞에 둔다.
+                if (!frame.wongoji || !lineHeadForbidden(atoms[i].cp)) atoms[i].breakBefore = true;
+            }
+        }
+        // 세로쓰기: 세우는 글자는 1em 을 쓰고, 눕히는 글자(영문 눕힘의 영문·괄호 따위)와 빈칸은 가로 폭이다. 모두 4의 배수로 내린다.
+        if (frame.textDirection != 0 && !useLines) {
+            for (Atom& atom : atoms) verticalAtom(doc, atom, frame.textDirection);
+        }
         const std::vector<std::int32_t> tallest = tallestAfter(atoms);
 
         // 탭 위치는 본문 왼쪽 끝 기준이다. 0보다 작으면 본문 시작, 본문 폭보다 크면 본문 오른쪽 끝이다.
@@ -2815,8 +3212,13 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         // 흐름 조판은 원자를 만들 때 이미 쟀고, 저장된 줄은 폭을 재지 않는다.
         auto lineHost = makeLineHost([](Atom&) {},
                                      [&](const Atom& atom, std::int32_t pen) {
-                                         return makeObject(*atom.control, pen, 0, doc, frame.depth, frame.defaultTab,
-                                                           frame.useStoredLineHeight);
+                                         Node object = flowObject(makeObject(*atom.control, pen, 0, doc, frame.depth,
+                                                                             frame.defaultTab, frame.useStoredLineHeight,
+                                                                             frame.deferSpans));
+                                         object.extMut().objMut().anchorStory = frame.story;
+                                         object.extMut().objMut().anchorParagraph = pi;
+                                         object.extMut().objMut().anchorItem = itemOrdinal(para, atom.control);
+                                         return object;
                                      });
 
         // 문단 끝 줄바꿈의 빈 줄은 글자 위치가 원자 다음이다. 앞 쪽에서 넘긴 그 줄은 여기서 만든다.
@@ -2876,7 +3278,8 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             const std::int32_t lineLeft = lineLeftOf();
             std::vector<Obstacle> localObstacles = obstacles;
             for (auto& item : localObstacles) item.x -= marginLeft;
-            auto gaps = freeGaps(y + localY, linePitch, lineLeft, frameRight, localObstacles);
+            // 개체를 비켜 가는지는 글자 높이로 본다(아래 흐름 줄과 같다).
+            auto gaps = freeGaps(y + localY, lineEm, lineLeft, frameRight, localObstacles);
             Node line;
             line.kind = NodeKind::Line;
             line.paragraph = pi;
@@ -2886,19 +3289,20 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             if (useLines) line.marginLeft = marginLeft;
             line.align = paragraph.align;
             line.vertAlign = paragraph.vertAlign;
-            line.lastLine = true;
+            line.editContent().lastLine = true;
             line.width = gaps.empty() ? 0 : std::max<std::int32_t>(0, gaps[0].second - line.x);
             line.charShapeId = !para.runs.empty() ? para.runs.front().charShapeId : 0;
             line.fontSize = emptySize;
-            line.textHeight = lineEm;
+            line.editContent().textHeight = lineEm;
             line.height = linePitch;
             if (useLines && !para.lineSegs.empty()) {
-                line.storedSeg = para.lineSegs[0];
+                line.editContent().storedSeg = para.lineSegs[0];
             } else if (frame.useStoredLineHeight) {
-                line.storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.textHeight);
+                line.editContent().storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.editContent().textHeight);
             }
             line.start = 0;
             line.end = 0;
+            gridLine(line);
             if (firstLine) attachHeading(line, paragraph, doc, para, !useLines);
             paragraph.children.push_back(std::move(line));
             localY += paragraph.children.back().height;
@@ -2907,6 +3311,74 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
         std::size_t cursor = atomBegin;
         std::size_t guardCursor = cursor;
         int spins = 0;
+        // 이 단에 놓은 줄마다 첫 원자. 외톨이줄 보호가 마지막 줄을 다음 쪽으로 보낼 때 그 줄 앞에서 다시 시작한다.
+        std::vector<std::size_t> lineAtoms;
+        // from 부터 문단 끝까지가 한 줄에 드는지. 저장된 줄은 남은 lineseg 수로, 흐름 조판은 이미 잰 글자 폭으로 본다.
+        auto restIsOneLine = [&](std::size_t from) {
+            if (from >= atoms.size()) return false;
+            if (useLines) {
+                int rest = 0;
+                for (const LineSeg& seg : para.lineSegs) {
+                    if (static_cast<int>(seg.textPos) >= atoms[from].pos) ++rest;
+                }
+                return rest == 1;
+            }
+            std::int32_t width = 0;
+            for (std::size_t i = from; i < atoms.size(); ++i) width += atoms[i].width;
+            if (!atoms.empty()) width -= atoms.back().trail;
+            return width <= frameRight - (indent < 0 ? -indent : 0);
+        };
+        // 쪽 끝에서 다시 시작할 자리. 문단 보호·외톨이줄 보호·다음 문단과 함께(한글 2024, tmp/keep).
+        // breakAtom 은 다음 쪽으로 가는 첫 원자, lastLine 은 그 뒤가 한 줄뿐인지다.
+        // 문단째 넘기는 것은 이 단에서 시작했고 위에 글이 있는 문단만이다. 그래야 다음 쪽 맨 위에서 다시 넘기지 않는다.
+        struct KeepRestart {
+            int paragraph = 0;
+            std::size_t atom = 0;
+        };
+        auto keepAtBreak = [&](std::size_t breakAtom, bool lastLine) {
+            std::size_t placedLines = 0;
+            for (const Node& child : paragraph.children) {
+                if (child.kind == NodeKind::Line) ++placedLines;
+            }
+            const bool movable = atomBegin == 0 && y > 0 && plainParagraph(para);
+            bool wholeMove = false;
+            KeepRestart restart{pi, breakAtom};
+            if (paraShape && movable && placedLines > 0 &&
+                (paraShape->keepLines || (paraShape->widowOrphan && placedLines == 1))) {
+                wholeMove = true;
+            } else if (paraShape && paraShape->widowOrphan && lastLine && placedLines >= 2 &&
+                       lineAtoms.size() == placedLines && !paragraph.children.empty() &&
+                       paragraph.children.back().kind == NodeKind::Line) {
+                // 마지막 줄 하나만 다음 쪽에 가면 그 앞 줄도 같이 보낸다. 앞에 한 줄만 남으면 문단째 보낸다.
+                if (placedLines >= 3) {
+                    restart.atom = lineAtoms.back();
+                    localY = paragraph.children.back().y;
+                    paragraph.children.pop_back();
+                    lineAtoms.pop_back();
+                } else if (movable) {
+                    wholeMove = true;
+                }
+            }
+            if (wholeMove) {
+                paragraph.children.clear();
+                lineAtoms.clear();
+                localY = 0;
+                restart.atom = 0;
+            }
+            if (restart.atom == 0 && atomBegin == 0) {
+                // 이 문단이 이 쪽에 한 줄도 없으면 바로 앞의 "다음 문단과 함께" 문단들도 같이 넘긴다.
+                for (int prev = pi - 1; prev >= 0 && !column.children.empty(); --prev) {
+                    const Node& last = column.children.back();
+                    if (last.kind != NodeKind::Paragraph || last.paragraph != prev || last.y <= 0) break;
+                    const Paragraph& prevPara = paragraphs[static_cast<std::size_t>(prev)];
+                    const ParaShape* prevShape = findParaShape(doc, prevPara.paraShapeId);
+                    if (!prevShape || !prevShape->keepWithNext || !plainParagraph(prevPara)) break;
+                    column.children.pop_back();
+                    restart.paragraph = prev;
+                }
+            }
+            return restart;
+        };
         while (cursor < atoms.size()) {
             const std::size_t lineStartCursor = cursor;
             if (cursor != guardCursor) {
@@ -2921,7 +3393,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                     Node object;
                     if (atom.control) {
                         object = makeObject(*atom.control, 0, 0, doc, frame.depth, frame.defaultTab,
-                                            frame.useStoredLineHeight);
+                                            frame.useStoredLineHeight, frame.deferSpans);
+                        object.extMut().objMut().anchorStory = frame.story;
+                        object.extMut().objMut().anchorParagraph = pi;
+                        object.extMut().objMut().anchorItem = itemOrdinal(para, atom.control);
                     }
                     Node line = singleAtomLine(doc, atom, std::move(object));
                     line.paragraph = pi;
@@ -2932,7 +3407,7 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                     line.align = paragraph.align;
                     line.vertAlign = paragraph.vertAlign;
                     line.height = forcedPitch;
-                    line.textHeight = forced && forced->textHeight > 0 ? forced->textHeight : line.fontSize;
+                    line.editContent().textHeight = forced && forced->textHeight > 0 ? forced->textHeight : line.fontSize;
                     placeInlineObjects(line, kind, spacingValue);
                     localY += line.height;
                     if (firstLine) attachHeading(line, paragraph, doc, para, !useLines);
@@ -2956,14 +3431,15 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             // 쪽이 비어 있으면 글자처럼 취급한 개체가 쪽보다 커도 그 쪽에 남긴다.
             const bool pageStarted = y > 0 || !paragraph.children.empty() || pageHasContent;
             if (stopAtBottom && y + localY + lineEm >= column.height && pageStarted) {
+                const KeepRestart restart = keepAtBreak(cursor, restIsOneLine(cursor));
                 paragraph.height = std::max(localY, 0);
-                if (localY > 0) {
+                if (localY > 0 && !paragraph.children.empty()) {
                     if (frame.story > 0) stampStory(paragraph, frame.story);
                     column.children.push_back(std::move(paragraph));
                 }
-                resume.paragraph = pi;
-                resume.atom = cursor;
-                resume.textPos = cursor < atoms.size() ? atoms[cursor].pos : 0;
+                resume.paragraph = restart.paragraph;
+                resume.atom = restart.atom;
+                resume.textPos = restart.paragraph == pi && restart.atom < atoms.size() ? atoms[restart.atom].pos : 0;
                 resume.done = false;
                 // 평행 다단은 넘치면 옆 단으로 흐르지 않고 다음 쪽으로 간다.
                 if (pageOnOverflow) resume.breakPage = true;
@@ -3001,7 +3477,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             }
             std::vector<Obstacle> localObstacles = obstacles;
             for (auto& item : localObstacles) item.x -= marginLeft;
-            auto gaps = freeGaps(y + localY, pitch, lineLeft, frameRight, localObstacles);
+            // 개체를 비켜 가는지는 글자 높이로 본다. 줄 간격까지 넣으면 개체 바로 위 줄도 갈라진다(한글 2024).
+            auto gaps = freeGaps(y + localY, lineEm, lineLeft, frameRight, localObstacles);
+            // 같은 줄 높이에서 앞 칸을 채웠으면 그다음 칸부터다.
+            if (rowGap > 0) gaps.erase(gaps.begin(), gaps.begin() + static_cast<std::ptrdiff_t>(std::min(rowGap, gaps.size())));
             if (gaps.empty()) {
                 if (onlyOccupiesLine) {
                     gaps.push_back({lineLeft, lineLeft});
@@ -3022,6 +3501,18 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             spec.paraShape = paraShape;
             spec.tabs = &tabs;
             spec.gaps = std::move(gaps);
+            // 저장된 줄이 앞 줄과 같은 높이(vertpos)에 이어지면 한글이 적은 그 칸(horzpos)에서 시작한다.
+            if (useLines && cached && storedRow) {
+                const std::int32_t left = static_cast<std::int32_t>(cached->horzPos) - marginLeft;
+                spec.gaps.assign(1, {left, left + std::max<std::int32_t>(0, static_cast<std::int32_t>(cached->horzSize))});
+            }
+            spec.vertical = frame.textDirection != 0;
+            if (frame.charGrid > 0 && frame.wongoji && !useLines) {
+                // 원고지는 칸 폭의 배수까지만 쓴다. 꽉 찬 줄 끝에 마침표·빈칸을 넘쳐 남기는 기준도 이 끝이다.
+                for (auto& gap : spec.gaps) {
+                    gap.second = gap.first + std::max<std::int32_t>(0, gap.second - gap.first) / frame.charGrid * frame.charGrid;
+                }
+            }
             spec.storedBreaks = useLines;
             spec.deferText = deferText;
             spec.keepAdvances = !useLines;
@@ -3039,6 +3530,7 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             }
             LineFill fill;
             fill.line.kind = NodeKind::Line;
+            fill.line.editContent().autoSpacing = autoSpacingFlags(paraShape);
             fill.line.paragraph = pi;
             fill.line.y = localY;
             fill.line.vertAlign = paragraph.vertAlign;
@@ -3059,11 +3551,11 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                     if (!head) from = static_cast<int>(cached->textPos);
                     to = spec.lineLimit;
                 }
-                line.textHeight = std::max<std::int32_t>(line.textHeight, unseenSize(unseen, from, to));
+                line.editContent().textHeight = std::max<std::int32_t>(line.lineData().textHeight, unseenSize(unseen, from, to));
             }
             // 글꼴에 어울리는 줄 높이면 글자 상자가 글꼴 상자로 커진다.
             applyFontBaseline(line, paraShape);
-            const std::int32_t charBox = line.textHeight;
+            const std::int32_t charBox = line.lineData().textHeight;
             line.indent = glyphShift();
             if (useLines) line.marginLeft = marginLeft;
             line.align = paragraph.align;
@@ -3074,10 +3566,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                     const std::int32_t outer = child.height + child.marginTop + child.marginBottom;
                     if (outer > ownText) ownText = outer;
                 }
-                line.auditLine = true;
-                line.auditIndex = static_cast<std::int32_t>(cached - para.lineSegs.data());
-                line.auditText = ownText;
-                line.auditHorz = cached->horzPos;
+                line.editContent().auditLine = true;
+                line.editContent().auditIndex = static_cast<std::int32_t>(cached - para.lineSegs.data());
+                line.editContent().auditText = ownText;
+                line.editContent().auditHorz = cached->horzPos;
             }
             // 저장된 줄은 그 너비와 높이를 쓴다. 글자 advance 는 쪽을 쌓을 때 재지 않는다.
             // 줄바꿈은 칸 너비를 그대로 쓴다. 기록하는 horzsize 만 0.2인치보다 좁아지지 않는다.
@@ -3086,8 +3578,15 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                 (onlyOccupiesLine && gapWidth == 0) ? 0 : std::max(kMinParagraphWidth, gapWidth);
             if (useLines && cached && cached->horzSize > 0) line.width = cached->horzSize;
             else line.width = gapWidth;
+            if (frame.charGrid > 0) {
+                // 글자 격자 줄은 칸 폭의 배수만 쓴다. 남는 폭은 오른쪽에 비운다.
+                if (!(useLines && cached && cached->horzSize > 0)) line.width = line.width / frame.charGrid * frame.charGrid;
+                line.editContent().charGrid = frame.charGrid;
+                line.editContent().wongoji = frame.wongoji;
+            }
+            line.editContent().vertical = frame.textDirection;
             placeInlineObjects(line, kind, spacingValue);
-            if (line.auditLine) {
+            if (line.lineData().auditLine) {
                 std::int32_t contentBottom = line.marginTop + charBox;
                 for (const auto& child : line.children) {
                     if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
@@ -3095,70 +3594,129 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
                 }
                 const std::int32_t measuredBox = measuredTextBox(line, charBox);
                 // 기준선 맞춤으로 삐져나온 양은 줄 높이에 들지 않는다. 줄 피치까지 넘친 만큼만 비트맵을 늘린다.
-                line.auditRise = 0;
-                line.auditBelow = std::max(0, contentBottom - line.height);
-                line.auditPitch = line.height;
-                line.storedSeg = *cached;
-                line.measuredSeg.textPos = static_cast<std::uint32_t>(std::max(0, line.start));
-                line.measuredSeg.vertPos = y + line.y;
-                line.measuredSeg.vertSize = measuredBox;
-                line.measuredSeg.textHeight = measuredBox;
+                line.editContent().auditRise = 0;
+                line.editContent().auditBelow = std::max(0, contentBottom - line.height);
+                line.editContent().auditPitch = line.height;
+                line.editContent().storedSeg = *cached;
+                line.editContent().measuredSeg.textPos = static_cast<std::uint32_t>(std::max(0, line.start));
+                line.editContent().measuredSeg.vertPos = y + line.y;
+                line.editContent().measuredSeg.vertSize = measuredBox;
+                line.editContent().measuredSeg.textHeight = measuredBox;
                 // 글자·그림 85%·수식 높이×백분율 중 큰 값이 이미 줄 기준선이다.
-                const std::int32_t glyphBaseline = line.lineBaseline >= 0 ? line.lineBaseline
+                const std::int32_t glyphBaseline = line.lineData().lineBaseline >= 0 ? line.lineData().lineBaseline
                                                                           : layout::glyphBaseline(charBox);
-                line.measuredSeg.baseline = lineSegBaseline(line, measuredBox, glyphBaseline);
-                line.measuredSeg.spacing = line.height - measuredBox;
-                line.measuredSeg.horzPos = line.x + line.marginLeft;
-                line.measuredSeg.horzSize = measuredWidth;
+                line.editContent().measuredSeg.baseline = lineSegBaseline(line, measuredBox, glyphBaseline);
+                line.editContent().measuredSeg.spacing = line.height - measuredBox;
+                line.editContent().measuredSeg.horzPos = line.x + line.marginLeft;
+                line.editContent().measuredSeg.horzSize = measuredWidth;
                 std::uint32_t flags = measuredLineFlags(firstLine, indent);
-                if (paragraph.head.ready) {
+                if (paragraph.ext().head.ready) {
                     if (firstLine) flags |= 1u << 21;
-                    else if (paragraph.head.autoIndent) flags |= 1u << 20;
+                    else if (paragraph.ext().head.autoIndent) flags |= 1u << 20;
                 }
-                line.measuredSeg.flags = flags;
+                line.editContent().measuredSeg.flags = flags;
             } else if (frame.useStoredLineHeight) {
-                line.storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.textHeight);
+                line.editContent().storedSeg.spacing = std::max<std::int32_t>(0, line.height - line.marginTop - line.editContent().textHeight);
             }
             std::int32_t inlineObjBox = 0;
             for (const Node& child : line.children) {
                 if (child.kind != NodeKind::Object || !child.treatAsChar) continue;
                 inlineObjBox = std::max(inlineObjBox, child.y + child.marginTop + child.height + child.marginBottom);
             }
-            if (sized && sized->textHeight > 0 && sized->textHeight != line.textHeight && inlineObjBox <= 0) {
-                line.textHeight = sized->textHeight;
+            if (sized && sized->textHeight > 0 && sized->textHeight != line.lineData().textHeight && inlineObjBox <= 0) {
+                line.editContent().textHeight = sized->textHeight;
                 placeInlineObjects(line, kind, spacingValue);
             }
             // 저장된 줄은 개체가 있어도 그 줄 높이를 쓴다. 우리 계산은 lineseg 검사에만 남긴다.
             // 개체 크기를 바꾸면 편집이 그 문단의 lineseg 를 지우므로 그때는 계산한 높이가 된다.
             if (storedPitch >= 0) line.height = storedPitch;
+            const bool gridded = frame.lineGrid > 0 && paraShape && paraShape->snapToGrid;
+            const std::int32_t gridPitch = line.height;
+            gridLine(line);
+            if (line.lineData().auditLine) line.editContent().measuredSeg.vertPos = y + line.y;
+            // 줄 격자에서는 격자에 맞춘 윗변에서 줄 피치(줄 간격 포함)가 본문 안에 들어야 그 쪽에 남는다.
             const std::int32_t finalLineBox =
-                sized && sized->textHeight > 0 ? sized->textHeight : lineCharBox(line);
+                gridded ? gridPitch : (sized && sized->textHeight > 0 ? sized->textHeight : lineCharBox(line));
             const bool linePastPage = y > 0 || !paragraph.children.empty() || pageHasContent;
             if (stopAtBottom && y + localY + finalLineBox >= column.height && linePastPage) {
+                const KeepRestart restart = keepAtBreak(lineStartCursor, cursor >= atoms.size());
                 paragraph.height = std::max(localY, 0);
                 if (localY > 0 && !paragraph.children.empty()) {
                     if (frame.story > 0) stampStory(paragraph, frame.story);
                     column.children.push_back(std::move(paragraph));
                 }
-                resume.paragraph = pi;
-                resume.atom = lineStartCursor;
+                resume.paragraph = restart.paragraph;
+                resume.atom = restart.atom;
                 resume.textPos = fill.start < 0 ? 0 : fill.start;
+                if (restart.paragraph != pi || restart.atom == 0) resume.textPos = 0;
+                else if (restart.atom != lineStartCursor && restart.atom < atoms.size()) resume.textPos = atoms[restart.atom].pos;
                 resume.done = false;
                 if (pageOnOverflow) resume.breakPage = true;
                 return resume;
             }
             // 줄 높이(vertsize)는 줄 시작부터 단 폭을 넘칠 때까지 잰다. 다음 줄 앞 글자도 들 수 있다.
-            line.measuredSeg.vertSize =
+            line.editContent().measuredSeg.vertSize =
                 scannedVertSize(doc, atoms, tallest, lineStartCursor, cursor, lineTextBox(line),
                                 lineStartCursor == 0 ? numberingPush(paragraph, doc, para) : 0, column.width);
             // 글자 폭과 개체 가로 위치는 이 줄을 그릴 때 잡는다.
             // 글자처럼 취한 개체와 캡션이 저장된 줄 밖으로 나가면 그 비트맵만 늘린다. 다음 줄 자리는 그대로다.
             markInlineOverflow(line);
-            if (useLines) line.deferTabs = true;
+            if (useLines) line.editContent().deferTabs = true;
             if (firstLine) attachHeading(line, paragraph, doc, para, !useLines);
+            const int jumpGap = fill.jumpGap;
+            lineAtoms.push_back(lineStartCursor);
             paragraph.children.push_back(std::move(line));
-            localY += paragraph.children.back().height;
+            // 개체를 놓으면 문단 자식 뒤에 붙는다. 이 줄은 번호로 찾는다.
+            const std::size_t lineIndex = paragraph.children.size() - 1;
+            // 이 줄에 붙은 띄운 개체를 이 줄 위에서 놓는다. 그 개체가 이 줄 글 높이에 걸치면 이 줄을 다시 짠다.
+            if (!anchored.empty()) {
+                const Node& placed = paragraph.children[lineIndex];
+                const std::int32_t lineTop = placed.y;
+                const std::int32_t bandTop = y + lineTop;
+                const std::int32_t lineL = marginLeft + placed.x;
+                const std::int32_t lineR = lineL + placed.width;
+                bool redo = false;
+                for (auto it = anchored.begin(); it != anchored.end();) {
+                    if (it->atom < lineStartCursor || (it->atom >= cursor && cursor < atoms.size())) {
+                        ++it;
+                        continue;
+                    }
+                    const std::size_t before = obstacles.size();
+                    placeFloat(*it->control, lineTop);
+                    for (std::size_t oi = before; oi < obstacles.size(); ++oi) {
+                        const Obstacle& o = obstacles[oi];
+                        const bool across = o.block || (o.x < lineR && o.x + o.width > lineL);
+                        if (across && bandTop < o.y + o.height && bandTop + lineEm > o.y) redo = true;
+                    }
+                    it = anchored.erase(it);
+                }
+                if (redo && rowGap == 0 && !storedRow) {
+                    paragraph.children.erase(paragraph.children.begin() + static_cast<std::ptrdiff_t>(lineIndex));
+                    cursor = lineStartCursor;
+                    rowHeight = 0;
+                    firstLine = lineStartCursor == 0;
+                    continue;
+                }
+            }
+            rowHeight = std::max(rowHeight, paragraph.children[lineIndex].height);
             firstLine = false;
+            // 개체를 건너 다음 칸으로 가면 같은 높이에서 그 칸부터 새 줄을 잇는다. 줄 높이는 그 줄들 중 큰 값이다.
+            if (jumpGap > 0 && cursor < atoms.size()) {
+                rowGap += static_cast<std::size_t>(jumpGap);
+                continue;
+            }
+            // 저장된 줄은 다음 lineseg 가 같은 vertpos 면 같은 높이에서 잇는다(개체를 비켜 갈라진 줄).
+            if (useLines && cached && cursor < atoms.size()) {
+                const LineSeg* nextSeg = storedLineAt(frame, para, atoms[cursor].pos);
+                if (nextSeg && nextSeg != cached && nextSeg->vertPos == cached->vertPos) {
+                    storedRow = true;
+                    continue;
+                }
+            }
+            storedRow = false;
+            localY += rowHeight;
+            rowHeight = 0;
+            rowGap = 0;
         }
 
         if (trailingBreak) {
@@ -3188,35 +3746,42 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             line.indent = glyphShift();
             line.align = paragraph.align;
             line.vertAlign = paragraph.vertAlign;
-            line.lastLine = true;
+            line.editContent().lastLine = true;
             line.width = std::max<std::int32_t>(0, frameRight - line.x);
             line.fontSize = emptySize;
-            line.textHeight = line.fontSize;
+            line.editContent().textHeight = line.fontSize;
             line.height = pitchOf(line.fontSize);
             if (trailingSeg) {
                 const int storedPitch = storedLinePitch(trailingSize);
                 if (storedPitch >= 0) line.height = storedPitch;
-                line.storedSeg = *trailingSeg;
+                line.editContent().storedSeg = *trailingSeg;
                 line.marginLeft = marginLeft;
             }
             line.start = atoms.back().pos + 1;
             line.end = atoms.back().pos + 1;
+            gridLine(line);
             paragraph.children.push_back(std::move(line));
             localY += paragraph.children.back().height;
         }
 
         for (auto it = paragraph.children.rbegin(); it != paragraph.children.rend(); ++it) {
             if (it->kind != NodeKind::Line) continue;
-            it->lastLine = true;
+            it->editContent().lastLine = true;
             break;
         }
         if (spacingNext > 0) localY += spacingNext;
+        // 줄 격자에서는 문단 아래 간격 끝도 격자 줄까지 내린다.
+        if (frame.lineGrid > 0 && paraShape && paraShape->snapToGrid && spacingNext > 0) {
+            const std::int32_t bottom = std::max<std::int32_t>(0, y + localY);
+            localY += (bottom + frame.lineGrid - 1) / frame.lineGrid * frame.lineGrid - bottom;
+        }
         // 글자가 10pt보다 작으면 그 글자 줄 높이만 차지한다. 10pt 줄로 바닥을 깔면 출처처럼 낮은 줄이 벌어진다.
         paragraph.height = std::max(localY, 0);
         if (frame.story > 0) stampStory(paragraph, frame.story);
         column.children.push_back(std::move(paragraph));
         y += column.children.back().height;
-        if (!resume.carryTables.empty()) {
+        if (std::any_of(resume.carryTables.begin(), resume.carryTables.end(),
+                        [](const TableCarry& c) { return !c.moved; })) {
             resume.paragraph = pi;
             resume.atom = atoms.size();
             resume.done = false;
@@ -3230,6 +3795,14 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             if (pageOnOverflow) resume.breakPage = true;
             return resume;
         }
+    }
+    if (!resume.carryTables.empty() && !paragraphs.empty()) {
+        // 글은 이 쪽에서 끝났고 보낸 표만 남았다.
+        resume.paragraph = static_cast<int>(paragraphs.size()) - 1;
+        resume.atom = kCarryPastEnd;
+        resume.done = false;
+        if (pageOnOverflow) resume.breakPage = true;
+        return resume;
     }
     resume.done = true;
     return resume;
@@ -3246,7 +3819,10 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                 if (!visualObject(item.control) || !item.control.placement || item.control.placement->treatAsChar) {
                     continue;
                 }
-                const Placement& placement = *item.control.placement;
+                // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 놓는다.
+                const Placement turnedOwn =
+                    frame.textDirection != 0 ? turnedPlacement(*item.control.placement) : Placement{};
+                const Placement& placement = frame.textDirection != 0 ? turnedOwn : *item.control.placement;
                 if (placement.vertRelTo == "PARA" || placement.horzRelTo == "PARA") continue;
                 const bool paperRel = placement.vertRelTo == "PAPER" || placement.horzRelTo == "PAPER";
                 const std::int32_t originX = paperRel && frame.page ? 0 : column.x + (body ? body->x : 0);
@@ -3275,9 +3851,16 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                     localX = absX - body->x;
                     localY = absY - body->y;
                 }
-                parent->children.push_back(
-                    makeObject(item.control, localX, localY, doc, frame.depth, frame.defaultTab,
-                               frame.useStoredLineHeight));
+                Node built = makeObject(item.control, localX, localY, doc, frame.depth, frame.defaultTab,
+                                        frame.useStoredLineHeight, frame.deferSpans);
+                const int ordinal = itemOrdinal(para, &item.control);
+                built.extMut().objMut().anchorStory = frame.story;
+                built.extMut().objMut().anchorParagraph = pi;
+                built.extMut().objMut().anchorItem = ordinal;
+                parent->children.push_back(frame.textDirection != 0 ? uprightObject(std::move(built)) : std::move(built));
+                parent->children.back().extMut().objMut().anchorStory = frame.story;
+                parent->children.back().extMut().objMut().anchorParagraph = pi;
+                parent->children.back().extMut().objMut().anchorItem = ordinal;
                 if (textAvoids(placement.textWrap)) {
                     const std::int32_t captionDrop = parent->children.back().y - localY;
                     const std::int32_t captionShift = std::max<std::int32_t>(0, parent->children.back().x - localX);
@@ -3290,8 +3873,8 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                     }
                     obstacle.width = static_cast<std::int32_t>(placement.width) + placement.marginLeft +
                                      placement.marginRight + captionShift;
-                    obstacle.height = parent->children.back().height + placement.marginTop +
-                                      placement.marginBottom;
+                    obstacle.height = parent->children.back().height + captionBelow(parent->children.back()) +
+                                      placement.marginTop + placement.marginBottom;
                     obstacle.block = placement.textWrap == "TOP_AND_BOTTOM";
                     obstacle.paragraph = pi;
                     obstacles.push_back(obstacle);
@@ -3316,9 +3899,11 @@ Node layoutFrame(const Frame& given, int startParagraph, std::size_t startAtom, 
     const std::int32_t contentLeft = frame.page ? static_cast<std::int32_t>(page.marginLeft) : 0;
     const std::int32_t contentTop =
         frame.page ? static_cast<std::int32_t>(page.marginTop) + static_cast<std::int32_t>(page.marginHeader) : 0;
+    // 줄 폭은 4의 배수로 내린다. 쪽 본문 42526·42522 가 lineseg horzsize 42524·42520, 표 칸 안 5102 가 5100,
+    // 글상자 안 50425 가 50424 가 된다(한글 2024).
     const std::int32_t contentW =
-        frame.page ? std::max<std::int32_t>(200, paperW - contentLeft - static_cast<std::int32_t>(page.marginRight))
-                   : paperW;
+        frame.page ? std::max<std::int32_t>(200, paperW - contentLeft - static_cast<std::int32_t>(page.marginRight)) / 4 * 4
+                   : paperW / 4 * 4;
     const std::int32_t contentH =
         frame.page ? std::max<std::int32_t>(200, paperH - contentTop - static_cast<std::int32_t>(page.marginBottom) -
                                                      static_cast<std::int32_t>(page.marginFooter) - frame.bottomReserve)
@@ -3684,6 +4269,8 @@ void fillPageFields(Paragraph& para, int pageNumber, int pageCount, bool hideNum
                 item = InlineItem::makeText(hideNumber ? std::string() : numberText(control, pageNumber, pageCount));
                 item.ignoreSpacing = true;
                 item.markpen = pen;
+                item.synthetic = true;
+                item.replacedUnits = 8;
                 continue;
             }
             if (bare && control.kind == ControlKind::Field && dateCommand(control.command) &&
@@ -3971,8 +4558,8 @@ struct CellLineRange {
 void collectCellLineRanges(const Node& node, int paragraph, int row, int col, std::vector<CellLineRange>& out) {
     if (node.kind == NodeKind::Cell) {
         if (row >= 0) return;
-        row = node.row;
-        col = node.col;
+        row = node.ext().row;
+        col = node.ext().col;
     }
     if (row >= 0 && node.kind == NodeKind::Line && node.end > node.start && node.paragraph >= 0) {
         out.push_back(CellLineRange{paragraph, row, col, LineRange{node.paragraph, node.start, node.end}});
@@ -4039,19 +4626,23 @@ void replaceNoteNumber(Paragraph& para, const std::string& label, bool endnote, 
             const std::string pen = item.markpen;
             item = InlineItem::makeText(label);
             item.markpen = pen;
+            item.synthetic = true;
+            item.replacedUnits = 8;
             replaced = true;
         }
     }
     if (!prepend || replaced) return;
     const std::string text = para.text();
     if (text.compare(0, label.size(), label) == 0) return;
+    InlineItem added = InlineItem::makeText(label);
+    added.synthetic = true;
     if (para.runs.empty()) {
         Run run;
-        run.items.push_back(InlineItem::makeText(label));
+        run.items.push_back(std::move(added));
         para.runs.push_back(std::move(run));
         return;
     }
-    para.runs.front().items.insert(para.runs.front().items.begin(), InlineItem::makeText(label));
+    para.runs.front().items.insert(para.runs.front().items.begin(), std::move(added));
 }
 
 struct NoteBand {
@@ -4082,9 +4673,9 @@ NoteBand makeNoteBand(const Document& doc, const NoteShape& shape, const std::ve
         line.y = std::max<std::int32_t>(0, shape.above);
         line.width = rule;
         line.height = std::max<std::int32_t>(shape.lineWidth, 1);
-        line.borderTop.type = shape.lineType;
-        line.borderTop.width = shape.lineWidth > 0 ? shape.lineWidth : 34;
-        line.borderTop.color = shape.lineColor.empty() || shape.lineColor == "none" ? "#000000" : shape.lineColor;
+        line.extMut().borderTop.type = shape.lineType;
+        line.extMut().borderTop.width = shape.lineWidth > 0 ? shape.lineWidth : 34;
+        line.extMut().borderTop.color = shape.lineColor.empty() || shape.lineColor == "none" ? "#000000" : shape.lineColor;
         band.node.children.push_back(std::move(line));
     }
     bool any = false;
@@ -4257,7 +4848,7 @@ void placeEndnoteColumns(std::vector<Node>& pages, const Node& body, const std::
 
 // 각주가 쪽 아래를 예약하면 그 빈칸에는 미주를 두지 않는다. 본문이 있는 쪽에는 구분선을 긋고,
 // 본문이 없는 이어진 쪽은 구분선 없이 본문 맨 위에서 미주를 시작한다.
-void placeEndnoteFlow(std::vector<Node>& pages, const Document& doc, const noting::model::Section& section,
+void placeEndnoteFlow(std::vector<Node>& pages, const Document& doc, const chwp::model::Section& section,
                       const PageDef& page, const std::vector<const Control*>& notes, bool storedLines,
                       int sectionIndex) {
     if (notes.empty() || pages.empty()) return;
@@ -4318,6 +4909,43 @@ std::int32_t pageContentRoom(const PageDef& page) {
 
 bool pageChromeRole(const std::string& role) { return role == "pageFill" || role == "pageBorder"; }
 
+// 쪽의 내용 전체(쪽 테두리·배경 빼고)를 다른 쪽 여백 자리로 옮긴다. 다시 짜지 않고 붙이는 쪽의 번호 홀짝이 바뀔 때 쓴다.
+// 세로쓰기 본문(turned)은 돌린 틀의 여백으로, 머리말 따위 띠는 종이 여백으로 옮긴다.
+void shiftPageSide(Node& paper, const chwp::model::Section& section, int fromNumber, int toNumber) {
+    const PageDef from = section.page.value_or(PageDef{}).side(fromNumber);
+    const PageDef to = section.page.value_or(PageDef{}).side(toNumber);
+    const PageDef flowFrom = section.flowPage(fromNumber);
+    const PageDef flowTo = section.flowPage(toNumber);
+    for (Node& child : paper.children) {
+        if (pageChromeRole(child.role)) continue;
+        const PageDef& a = child.turned ? flowFrom : from;
+        const PageDef& b = child.turned ? flowTo : to;
+        child.x += static_cast<std::int32_t>(b.marginLeft) - static_cast<std::int32_t>(a.marginLeft);
+        child.y += static_cast<std::int32_t>(b.marginTop) - static_cast<std::int32_t>(a.marginTop);
+    }
+}
+
+// 홀수 쪽 여백으로 짠 본문과 각주·미주를 이 쪽의 여백 자리로 옮긴다. 머리말 따위 띠는 처음부터 그 쪽 여백으로 놓는다.
+void moveBodyToSide(Node& paper, const PageDef& flow, const PageDef& side) {
+    const std::int32_t dx = static_cast<std::int32_t>(side.marginLeft) - static_cast<std::int32_t>(flow.marginLeft);
+    const std::int32_t dy = static_cast<std::int32_t>(side.marginTop) - static_cast<std::int32_t>(flow.marginTop);
+    if (dx == 0 && dy == 0) return;
+    for (Node& child : paper.children) {
+        if (child.kind != NodeKind::Body || child.pageBand || child.fromMaster) continue;
+        child.x += dx;
+        child.y += dy;
+    }
+}
+
+// 세로쓰기 쪽. 돌린 틀로 짠 본문·각주·미주는 좌표를 그대로 두고 turned 로 표시한다. 종이는 세워 놓는다.
+void turnPaper(Node& paper, std::uint8_t direction) {
+    std::swap(paper.width, paper.height);
+    for (Node& child : paper.children) {
+        if (child.pageBand || child.fromMaster || pageChromeRole(child.role)) continue;
+        child.turned = direction;
+    }
+}
+
 bool pageBorderHasInk(const BorderFill* fill) {
     if (!fill) return false;
     auto on = [](const BorderSide& side) { return !side.type.empty() && side.type != "NONE"; };
@@ -4350,13 +4978,13 @@ void clearPageChrome(Node& paper) {
 // 종이 기준은 용지 맨 왼쪽 위다. 여백은 빼지 않고, 간격만큼 안쪽으로 들어온다.
 // 쪽 기준은 위(머리말 여백 포함), 왼쪽·오른쪽 여백, 아래(꼬리말 여백 포함)를 뺀 본문 칸이다.
 // 그 칸의 바깥으로 간격만큼 나간다. 머리말·꼬리말 포함은 종이 기준에서만 본다.
-void stampPageChrome(Node& paper, const Document& doc, const noting::model::Section& section, int pageNumber) {
+void stampPageChrome(Node& paper, const Document& doc, const chwp::model::Section& section, int pageNumber) {
     clearPageChrome(paper);
     const PageBorderFill* spec = pageBorderForNumber(doc, section.pageBorders, pageNumber);
     if (!spec) return;
-    const noting::model::BorderFill* fill = findBorderFill(doc, spec->borderFillId);
+    const chwp::model::BorderFill* fill = findBorderFill(doc, spec->borderFillId);
     if (!fill) return;
-    const PageDef page = section.page.value_or(PageDef{});
+    const PageDef page = section.page.value_or(PageDef{}).side(pageNumber);
     const std::int32_t paperW = paper.width > 0 ? paper.width : static_cast<std::int32_t>(page.width);
     const std::int32_t paperH = paper.height > 0 ? paper.height : static_cast<std::int32_t>(page.height);
     const std::int32_t bodyX = static_cast<std::int32_t>(page.marginLeft);
@@ -4406,16 +5034,16 @@ void stampPageChrome(Node& paper, const Document& doc, const noting::model::Sect
         Node node;
         node.kind = NodeKind::Object;
         node.role = "pageFill";
-        node.textWrap = "BEHIND_TEXT";
+        node.extMut().objMut().textWrap = "BEHIND_TEXT";
         node.x = fillX;
         node.y = fillY;
         node.width = fillW;
         node.height = fillH;
         applyBorderFill(node, doc, spec->borderFillId);
-        node.borderLeft = node.borderRight = node.borderTop = node.borderBottom = {};
+        node.extMut().borderLeft = node.extMut().borderRight = node.extMut().borderTop = node.extMut().borderBottom = {};
         paper.children.push_back(std::move(node));
     }
-    auto sideOn = [](const noting::model::BorderSide& side) {
+    auto sideOn = [](const chwp::model::BorderSide& side) {
         return !side.type.empty() && side.type != "NONE";
     };
     if ((sideOn(fill->left) || sideOn(fill->right) || sideOn(fill->top) || sideOn(fill->bottom)) && right > left &&
@@ -4428,10 +5056,10 @@ void stampPageChrome(Node& paper, const Document& doc, const noting::model::Sect
         node.width = right - left;
         node.height = bottom - top;
         applyBorderFill(node, doc, spec->borderFillId);
-        node.fillColor.clear();
-        node.gradColor.clear();
-        node.binItemId.clear();
-        node.imageFillMode = -1;
+        node.extMut().fillColor.clear();
+        node.extMut().gradColor.clear();
+        node.extMut().objMut().binItemId.clear();
+        node.extMut().objMut().imageFillMode = -1;
         paper.children.push_back(std::move(node));
     }
 }
@@ -4464,6 +5092,7 @@ FlowAt pageFlowStart(const Node& paper) {
     const Node* body = paperBody(paper);
     if (!body) return at;
     const Node* best = nullptr;
+    bool carried = false;
     const auto walk = [&](const auto& self, const Node& node) -> void {
         if (node.kind == NodeKind::Line) {
             if (!best || node.paragraph < best->paragraph ||
@@ -4472,10 +5101,16 @@ FlowAt pageFlowStart(const Node& paper) {
             }
             return;
         }
+        // 표·글상자 안 줄의 문단 번호는 그 안 글 묶음 것이다. 본문 문단과 섞으면 앞 문단부터 다시 조판한다.
+        if (node.kind == NodeKind::Object) {
+            if (node.ext().obj().splitTail) carried = true;
+            return;
+        }
         for (const Node& child : node.children) self(self, child);
     };
     walk(walk, *body);
-    if (!best || best->paragraph < 0) return at;
+    // 앞 쪽에서 넘어온 표 조각이 있으면 첫 줄 문단부터 다시 놓아도 그 조각이 빠진다.
+    if (!best || best->paragraph < 0 || carried) return at;
     at.ok = true;
     at.para = best->paragraph;
     at.textPos = std::max(0, best->start);
@@ -4494,6 +5129,8 @@ const Node* firstBodyLine(const Node& paper) {
             }
             return;
         }
+        // 표·글상자 안 줄의 문단 번호는 그 안 글 묶음 것이다. 본문 문단과 섞으면 앞 문단부터 다시 조판한다.
+        if (node.kind == NodeKind::Object) return;
         for (const Node& child : node.children) self(self, child);
     };
     walk(walk, *body);
@@ -4515,16 +5152,19 @@ int bodyUsedBottom(const Node& body) {
 }
 
 void rewriteExactNumber(Node& node, const std::string& from, const std::string& to) {
-    if (node.kind == NodeKind::Line && node.text == from) {
-        node.text = to;
-        for (Node& child : node.children) {
-            if (child.kind == NodeKind::Span && child.text == from) child.text = to;
+    if (node.kind == NodeKind::Line && node.text() == from) {
+        node.textMut() = to;
+        // 번호 하나뿐인 줄이라 그 글자 구간이 줄 글자 전체다.
+        for (LineRun& run : node.glyphsMut().runs) {
+            if (run.kind == RunKind::Text && run.textBegin == 0 && run.textEnd == from.size()) {
+                run.textEnd = static_cast<std::uint16_t>(to.size());
+            }
         }
     }
     for (Node& child : node.children) rewriteExactNumber(child, from, to);
 }
 
-std::vector<Node> layoutSection(const Document& doc, const noting::model::Section& section, int& nextNumber,
+std::vector<Node> layoutSection(const Document& doc, const chwp::model::Section& section, int& nextNumber,
                                 int pageBudget, bool useStoredLineHeight, int sectionIndex, bool deferSpans,
                                 std::vector<const Control*>* pendingEndnotes, bool lastSection,
                                 const ColumnResume* begin = nullptr,                                 const std::vector<FlowAt>* reuseStarts = nullptr,
@@ -4537,9 +5177,14 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
     frame.paragraphs = &section.paragraphs;
     frame.page = true;
     frame.headings = &headings;
-    if (section.page) frame.pageDef = *section.page;
+    // 줄은 홀수 쪽 여백으로 나눈다. 짝수 쪽은 본문 폭이 같고 자리만 다르다(제본 여백).
+    if (section.page) frame.pageDef = section.flowPage(1);
     if (section.defaultTab > 0) frame.defaultTab = section.defaultTab;
     if (section.columnRegionGap > 0) frame.columnRegionGap = section.columnRegionGap;
+    frame.lineGrid = section.lineGrid;
+    frame.charGrid = section.charGrid;
+    frame.wongoji = section.wongoji;
+    frame.textDirection = section.textDirection;
     frame.useStoredLineHeight = useStoredLineHeight;
     frame.deferSpans = deferSpans;
     frame.sectionIndex = sectionIndex;
@@ -4557,7 +5202,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
     std::size_t fromAtom = resume.atom;
     std::vector<const Control*> sectionEndnotes;
     bool placedEndnotes = false;
-    const PageDef pageForRoom = section.page ? *section.page : frame.pageDef;
+    const PageDef pageForRoom = section.page ? section.flowPage(1) : frame.pageDef;
     const std::int32_t room = pageContentRoom(pageForRoom);
     const bool lineLog = gPageCalcLog && useStoredLineHeight;
     gPageObjOn = lineLog;
@@ -4567,7 +5212,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
         const int pageNo = gPageLogIndex + 1;
         const auto pageStarted = std::chrono::steady_clock::now();
         if (lineLog) resetPageObj();
-        else if (gPageCalcLog) std::fprintf(stderr, "[noting] 쪽 %d 시작\n", pageNo);
+        else if (gPageCalcLog) std::fprintf(stderr, "[ClassingHWP] 쪽 %d 시작\n", pageNo);
         if (gPageCalcLog) layout::setFontLoadPage(pageNo);
         const ColumnResume pageStart = resume;
         std::int32_t reserve = 0;
@@ -4646,10 +5291,10 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
             logLineCachePage(pageNo, cut.begin + 1, cut.end, pageCalcMs(pageStarted));
         } else if (gPageCalcLog) {
             if (cut.end > cut.begin) {
-                std::fprintf(stderr, "[noting] 쪽 %d 문단 %d-%d %.1fms\n", pageNo, cut.begin + 1, cut.end,
+                std::fprintf(stderr, "[ClassingHWP] 쪽 %d 문단 %d-%d %.1fms\n", pageNo, cut.begin + 1, cut.end,
                              pageCalcMs(pageStarted));
             } else {
-                std::fprintf(stderr, "[noting] 쪽 %d %.1fms\n", pageNo, pageCalcMs(pageStarted));
+                std::fprintf(stderr, "[ClassingHWP] 쪽 %d %.1fms\n", pageNo, pageCalcMs(pageStarted));
             }
         }
         ++gPageLogIndex;
@@ -4661,7 +5306,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
             const Node* newBody = paperBody(cuts.back().paper);
             bool hardFence = false;
             if (resume.paragraph >= 0 && resume.paragraph < static_cast<int>(section.paragraphs.size())) {
-                const noting::model::Paragraph& next = section.paragraphs[static_cast<std::size_t>(resume.paragraph)];
+                const chwp::model::Paragraph& next = section.paragraphs[static_cast<std::size_t>(resume.paragraph)];
                 // 쪽 나눔·단 설정 나누기는 앞에 빈칸이 있어도 올라오지 않는다.
                 hardFence = next.pageBreak || next.columnBreak || next.layoutBreak || paragraphStartsPage(next, doc);
             }
@@ -4684,7 +5329,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
     }
     gPageObjOn = false;
     if (gPageCalcLog) layout::setFontLoadPage(0);
-    const PageDef page = section.page ? *section.page : frame.pageDef;
+    const PageDef flowPage = section.page ? section.flowPage(1) : frame.pageDef;
     const std::tm dateNow = clockNow();
     const std::tm docDate = clockFromText(doc.metadata.createdAt, dateNow);
     int numberCursor = section.pageStart > 0 ? static_cast<int>(section.pageStart) : nextNumber;
@@ -4694,7 +5339,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
     const Control* pageNum = nullptr;
     const int pageCount = static_cast<int>(cuts.size());
     const auto bandStarted = std::chrono::steady_clock::now();
-    if (gPageCalcLog && pageCount > 0 && !lineLog) std::fprintf(stderr, "[noting] 머리말 시작\n");
+    if (gPageCalcLog && pageCount > 0 && !lineLog) std::fprintf(stderr, "[ClassingHWP] 머리말 시작\n");
     for (std::size_t index = 0; index < cuts.size(); ++index) {
         int number = numberCursor;
         const bool firstPage = static_cast<int>(index) + pageIndexBase == 0;
@@ -4713,6 +5358,8 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
             }
         }
         numberCursor = number + 1;
+        // 머리말·꼬리말·쪽 번호·바탕쪽은 이 쪽 번호의 여백(제본 여백이 놓이는 쪽)으로 놓는다. 세로쓰기여도 가로 종이다.
+        const PageDef page = section.page ? section.page->side(number) : flowPage;
         if (!hideHeader) {
             if (const Control* header = bandFor(heads, number)) {
                 attachBand(cuts[index].paper, *header, page, doc, number, pageCount, hidePageNum, dateNow, docDate,
@@ -4740,7 +5387,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
         }
         cuts[index].paper.section = sectionIndex;
         cuts[index].paper.pageNumber = number;
-        cuts[index].paper.pageLabel = formatNumber(number, pageNum ? pageNum->numFormat : std::string());
+        cuts[index].paper.extMut().pageLabel = formatNumber(number, pageNum ? pageNum->numFormat : std::string());
         cuts[index].paper.pageNumberHidden = hidePageNum;
         pages.push_back(std::move(cuts[index].paper));
     }
@@ -4749,7 +5396,7 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
             std::printf("{\"머리말\":%.1f,\"쪽수\":%d}\n", pageCalcMs(bandStarted), pageCount);
             std::fflush(stdout);
         } else {
-            std::fprintf(stderr, "[noting] 머리말 %.1fms\n", pageCalcMs(bandStarted));
+            std::fprintf(stderr, "[ClassingHWP] 머리말 %.1fms\n", pageCalcMs(bandStarted));
         }
     }
     nextNumber = numberCursor;
@@ -4775,6 +5422,8 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
             paperNode.section = sectionIndex;
             paperNode.pageNumber = extraNumber++;
         }
+        if (section.page) moveBodyToSide(paperNode, flowPage, section.flowPage(paperNode.pageNumber));
+        if (section.vertical()) turnPaper(paperNode, section.textDirection);
         stampPageChrome(paperNode, doc, section, paperNode.pageNumber);
     }
     return pages;
@@ -4783,23 +5432,51 @@ std::vector<Node> layoutSection(const Document& doc, const noting::model::Sectio
 bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
     if (!line.spansLater) return false;
     line.spansLater = false;
-    if (paragraph.section < 0 || paragraph.section >= static_cast<int>(doc.sections.size())) return false;
-    const auto& paras = doc.sections[static_cast<std::size_t>(paragraph.section)].paragraphs;
-    if (paragraph.paragraph < 0 || paragraph.paragraph >= static_cast<int>(paras.size())) return false;
-    const Paragraph& para = paras[static_cast<std::size_t>(paragraph.paragraph)];
+    // 본문 문단은 구역으로, 표 칸·글상자·캡션 문단은 글 묶음 번호로 찾는다.
+    const Paragraph* found = nullptr;
+    if (paragraph.story > 0) {
+        found = storyParagraph(doc, paragraph.story, paragraph.paragraph);
+    } else if (paragraph.section >= 0 && paragraph.section < static_cast<int>(doc.sections.size())) {
+        const auto& paras = doc.sections[static_cast<std::size_t>(paragraph.section)].paragraphs;
+        if (paragraph.paragraph >= 0 && paragraph.paragraph < static_cast<int>(paras.size())) {
+            found = &paras[static_cast<std::size_t>(paragraph.paragraph)];
+        }
+    }
+    if (!found) return false;
+    const Paragraph& para = *found;
     const int from = std::max(0, line.start);
     const int to = line.end < 0 ? 0 : line.end;
 
-    std::vector<Node> headings;
+    // 쪽을 쌓을 때 둔 개체와 각주·미주 번호는 지금 글자 표에 있다. 꺼내 두고 글자 차례대로 다시 붙인다.
+    // 머리 번호(글자는 표, 그림은 자식)는 그대로 둔다.
+    LineGlyphs old = std::move(line.glyphs());
+    const std::string oldText = std::move(line.text());
+    std::vector<Node> oldChildren = std::move(line.children);
+    struct KeptNote {
+        LineRun run;
+        std::string text;
+        std::vector<std::int32_t> advances;
+        std::vector<std::int32_t> inks;
+    };
     std::vector<Node> objects;
-    std::vector<Node> notes;
-    for (Node& child : line.children) {
-        if (child.noteMark) notes.push_back(std::move(child));
-        else if (child.headingMark) headings.push_back(std::move(child));
-        else if (child.kind == NodeKind::Object) objects.push_back(std::move(child));
-    }
+    std::vector<KeptNote> notes;
     line.children.clear();
-    for (Node& head : headings) line.children.push_back(std::move(head));
+    for (Node& child : oldChildren) {
+        if (child.headingMark) line.children.push_back(child);
+    }
+    for (const LineRun& run : old.runs) {
+        if (run.kind == RunKind::Object) {
+            if (run.slot < oldChildren.size()) objects.push_back(std::move(oldChildren[run.slot]));
+        } else if (run.kind == RunKind::Note) {
+            KeptNote note{run, oldText.substr(run.textBegin, run.textEnd - run.textBegin), {}, {}};
+            note.advances.assign(old.advances.begin() + run.advanceAt,
+                                 old.advances.begin() + run.advanceAt + run.advanceCount);
+            note.inks.assign(old.inks.begin() + run.inkAt, old.inks.begin() + run.inkAt + run.inkCount);
+            notes.push_back(std::move(note));
+        }
+    }
+    line.glyphsMut() = {};
+    line.glyphsMut().heading = std::move(old.heading);
 
     CharShape fallback;
     fallback.height = 1000;
@@ -4807,13 +5484,39 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
     std::size_t objectAt = 0;
     std::size_t noteAt = 0;
     std::string lineText;
-    Node span;
-    bool open = false;
+    // 모으는 중인 글자 구간. 같은 꼴 글자가 이어지면 한 구간이다.
+    struct Pending {
+        bool open = false;
+        std::size_t begin = 0;
+        std::uint32_t charShapeId = 0;
+        std::string font;
+        int fontSize = 0;
+        int ratio = 100;
+        int relSize = 100;
+        int spacing = 0;
+        int charOffset = 0;
+        std::string markpen;
+    } span;
     auto flush = [&] {
-        if (!open) return;
-        if (!span.text.empty()) line.children.push_back(std::move(span));
-        span = Node{};
-        open = false;
+        if (!span.open) return;
+        span.open = false;
+        if (lineText.size() <= span.begin) return;
+        LineRun run;
+        run.kind = lineText.compare(span.begin, std::string::npos, "\t") == 0 ? RunKind::Tab : RunKind::Text;
+        run.textBegin = static_cast<std::uint16_t>(span.begin);
+        run.textEnd = static_cast<std::uint16_t>(lineText.size());
+        run.charShapeId = span.charShapeId;
+        run.style = runStyleOf(span.fontSize, span.font, span.markpen, std::string{}, span.ratio, span.relSize,
+                               span.spacing, span.charOffset);
+        appendLineRun(line.glyphsMut(), run);
+    };
+    auto pushObject = [&](Node obj) { appendLineObject(line, std::move(obj), lineText.size()); };
+    auto pushNote = [&](KeptNote& note) {
+        note.run.textBegin = static_cast<std::uint16_t>(lineText.size());
+        lineText += note.text;
+        note.run.textEnd = static_cast<std::uint16_t>(lineText.size());
+        appendLineRun(line.glyphsMut(), note.run, note.advances.data(), note.advances.size(), note.inks.data(),
+                      note.inks.size());
     };
     int pos = 0;
     for (const auto& run : para.runs) {
@@ -4830,24 +5533,34 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
                     pos += units;
                     if (cp == '\n' || at < from || at >= to) continue;
                     if (cp == '\t' || cp == ' ' || cp == 0x2007) {
-                        flush();
-                        span.kind = NodeKind::Span;
-                        span.charShapeId = run.charShapeId;
                         const GlyphFace gapFace = glyphFace(doc, *shape, cp, false);
-                        span.font = gapFace.font;
-                        span.fontSize = fontSize;
-                        span.ratio = gapFace.ratio > 0 ? gapFace.ratio : 100;
-                        span.relSize = gapFace.relSize > 0 ? gapFace.relSize : 100;
-                        span.spacing = item.ignoreSpacing ? 0 : gapFace.spacing;
+                        Pending gap;
+                        gap.open = true;
+                        gap.begin = lineText.size();
+                        gap.charShapeId = run.charShapeId;
+                        gap.font = gapFace.font;
+                        gap.fontSize = fontSize;
+                        gap.ratio = gapFace.ratio > 0 ? gapFace.ratio : 100;
+                        gap.relSize = gapFace.relSize > 0 ? gapFace.relSize : 100;
+                        gap.spacing = item.ignoreSpacing ? 0 : gapFace.spacing;
                         const Lang gapLang = isHangul(cp) ? Lang::Hangul : Lang::Latin;
                         const auto gapSlot = static_cast<std::size_t>(gapLang);
-                        span.charOffset = gapSlot < shape->offset.size() ? shape->offset[gapSlot] : 0;
-                        span.markpen = item.markpen;
-                        paintCharStyle(span, doc, run.charShapeId);
-                        span.text = cp == '\t' ? "\t" : (cp == ' ' ? " " : "\u2007");
-                        open = true;
-                        flush();
+                        gap.charOffset = gapSlot < shape->offset.size() ? shape->offset[gapSlot] : 0;
+                        gap.markpen = item.markpen;
+                        // 빈칸도 그릴 때 낱말과 같이 한 글자씩 잰다. 꼴이 같으면 앞 구간에 붙여 구간 수를 줄인다.
+                        // 탭은 칸 자리를 그릴 때 정하므로 늘 혼자 구간이다.
+                        const bool same = cp != '\t' && span.open && span.charShapeId == gap.charShapeId &&
+                                          span.font == gap.font && span.fontSize == gap.fontSize &&
+                                          span.ratio == gap.ratio && span.relSize == gap.relSize &&
+                                          span.spacing == gap.spacing && span.charOffset == gap.charOffset &&
+                                          span.markpen == gap.markpen &&
+                                          lineText.compare(span.begin, std::string::npos, "\t") != 0;
+                        if (!same) {
+                            flush();
+                            span = std::move(gap);
+                        }
                         appendUtf8(lineText, cp);
+                        if (cp == '\t') flush();
                         continue;
                     }
                     const bool probe = (cp >= 0xE000 && cp <= 0xF8FF) || (cp >= 0xF0000 && cp <= 0xFFFFD) ||
@@ -4857,13 +5570,15 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
                     const auto slot = static_cast<std::size_t>(lang);
                     const std::int32_t offset = slot < shape->offset.size() ? shape->offset[slot] : 0;
                     const std::int32_t spacing = item.ignoreSpacing ? 0 : drawn.spacing;
-                    const bool same = open && span.charShapeId == run.charShapeId && span.font == drawn.font &&
+                    const bool same = span.open && span.charShapeId == run.charShapeId && span.font == drawn.font &&
                                       span.fontSize == fontSize && span.ratio == drawn.ratio &&
                                       span.relSize == drawn.relSize && span.spacing == spacing &&
                                       span.charOffset == offset && span.markpen == item.markpen;
                     if (!same) {
                         flush();
-                        span.kind = NodeKind::Span;
+                        span = Pending{};
+                        span.open = true;
+                        span.begin = lineText.size();
                         span.charShapeId = run.charShapeId;
                         span.font = drawn.font;
                         span.fontSize = fontSize;
@@ -4872,11 +5587,7 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
                         span.spacing = spacing;
                         span.charOffset = offset;
                         span.markpen = item.markpen;
-                        paintCharStyle(span, doc, run.charShapeId);
-                        open = true;
                     }
-                    if (cp == '\t') span.text = "\t";
-                    else appendUtf8(span.text, cp);
                     appendUtf8(lineText, cp);
                 }
                 continue;
@@ -4887,14 +5598,13 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
             if (item.control.kind == ControlKind::Footnote || item.control.kind == ControlKind::Endnote) {
                 flush();
                 if (noteAt < notes.size()) {
-                    lineText += notes[noteAt].text;
-                    line.children.push_back(std::move(notes[noteAt++]));
+                    pushNote(notes[noteAt++]);
                 } else {
                     Atom marker;
                     marker.charShapeId = run.charShapeId;
                     fillNoteAtom(marker, doc, item.control, *shape, fontSize, paragraph.section, 0, false);
                     std::int32_t unused = 0;
-                    placeOccupyingNote(line, marker, doc, unused, lineText);
+                    placeOccupyingNote(line, marker, unused, lineText);
                 }
                 continue;
             }
@@ -4904,35 +5614,42 @@ bool fillDeferredLine(const Document& doc, const Node& paragraph, Node& line) {
                     Node obj = std::move(objects[objectAt++]);
                     obj.charShapeId = run.charShapeId;
                     obj.fontSize = fontSize;
-                    line.children.push_back(std::move(obj));
+                    pushObject(std::move(obj));
                 }
             }
         }
     }
     flush();
-    for (; noteAt < notes.size(); ++noteAt) line.children.push_back(std::move(notes[noteAt]));
-    for (; objectAt < objects.size(); ++objectAt) line.children.push_back(std::move(objects[objectAt]));
-    line.text = std::move(lineText);
-    line.deferTabs = true;
+    for (; noteAt < notes.size(); ++noteAt) pushNote(notes[noteAt]);
+    for (; objectAt < objects.size(); ++objectAt) pushObject(std::move(objects[objectAt]));
+    line.textMut() = std::move(lineText);
+    trimLineGlyphs(line.glyphsMut());
+    line.children.shrink_to_fit();
+    line.editContent().deferTabs = true;
     // 배치 때는 글 칸이 없어 수식을 줄 맨 위에 둔다. 글자를 채운 뒤에 기준선으로 다시 앉힌다.
     const std::int32_t keptHeight = line.height;
     const std::int32_t keptMargin = line.marginTop;
+    // 글꼴에 어울리는 줄 높이면 글꼴로 잰 기준선을 쓴다. 미루지 않은 줄과 같고, 한글이 lineSeg 에 적는 기준선과 같다.
+    // 글자 상자 높이는 쪽을 짤 때 lineSeg 로 정했으니 그대로 둔다.
+    const std::int32_t keptTextHeight = line.lineData().textHeight;
+    applyFontBaseline(line, findParaShape(doc, para.paraShapeId));
+    line.editContent().textHeight = keptTextHeight;
     placeInlineObjects(line, SpacingKind::Fixed, keptHeight > 0 ? keptHeight : 1, true);
     if (line.height != keptHeight) line.height = keptHeight;
     const std::int32_t drop = line.marginTop - keptMargin;
-    if (drop > 0) line.auditBelow += drop;
+    if (drop > 0) line.editContent().auditBelow += drop;
     for (const Node& child : line.children) {
         if (child.kind != NodeKind::Object || (!child.treatAsChar && !child.headingMark)) continue;
         const std::int32_t top = child.headingMark ? child.y : child.y + child.marginTop;
         const std::int32_t bottom = top + std::max(child.height, 0);
-        if (top < 0) line.auditRise = std::max(line.auditRise, -top);
-        if (bottom > line.height) line.auditBelow = std::max(line.auditBelow, bottom - line.height);
+        if (top < 0) line.editContent().auditRise = std::max(line.lineData().auditRise, -top);
+        if (bottom > line.height) line.editContent().auditBelow = std::max(line.lineData().auditBelow, bottom - line.height);
         for (const Node& cap : child.children) {
             if (cap.role != "caption") continue;
             const std::int32_t capTop = top + cap.y;
             const std::int32_t capBottom = capTop + std::max(cap.height, 0);
-            if (capTop < 0) line.auditRise = std::max(line.auditRise, -capTop);
-            if (capBottom > line.height) line.auditBelow = std::max(line.auditBelow, capBottom - line.height);
+            if (capTop < 0) line.editContent().auditRise = std::max(line.lineData().auditRise, -capTop);
+            if (capBottom > line.height) line.editContent().auditBelow = std::max(line.lineData().auditBelow, capBottom - line.height);
         }
     }
     return true;
@@ -4997,7 +5714,7 @@ bool repackTreatAsCharPicture(const Document& doc, std::vector<Node>& pages, int
     Node* picturePara = nullptr;
     Node* pictureColumn = nullptr;
     const auto locate = [&](const auto& self, Node& node, int page, Node* column, Node* paragraph, Node* line) -> bool {
-        if (node.kind == NodeKind::Object && node.treatAsChar && node.role == "picture" && node.binItemId == bin) {
+        if (node.kind == NodeKind::Object && node.treatAsChar && node.role == "picture" && node.ext().obj().binItemId == bin) {
             picture = &node;
             picturePage = page;
             pictureLine = line;
@@ -5024,7 +5741,7 @@ bool repackTreatAsCharPicture(const Document& doc, std::vector<Node>& pages, int
     picture->width = newW;
     picture->height = newH;
     placeInlineObjects(*pictureLine, SpacingKind::Between, extra);
-    const int fitted = std::max(pictureLine->textHeight, lineCharBox(*pictureLine));
+    const int fitted = std::max(pictureLine->lineData().textHeight, lineCharBox(*pictureLine));
     if (pictureLine->height < fitted) pictureLine->height = fitted;
 
     struct Carried {
@@ -5045,7 +5762,7 @@ bool repackTreatAsCharPicture(const Document& doc, std::vector<Node>& pages, int
     };
     const int pictureTop = picturePara->y + pictureLine->y;
     const int picturePitch = pictureLine->height;
-    const int pictureBox = std::max(pictureLine->textHeight, lineCharBox(*pictureLine));
+    const int pictureBox = std::max(pictureLine->lineData().textHeight, lineCharBox(*pictureLine));
     const int pictureParaId = picturePara->paragraph;
     const int pictureStory = picturePara->story;
     const int pictureLimit = flowLimit(picturePage, pictureColumn);
@@ -5180,7 +5897,7 @@ bool repackTreatAsCharPicture(const Document& doc, std::vector<Node>& pages, int
             for (const Node& line : para.children) {
                 if (line.kind != NodeKind::Line) continue;
                 for (const Node& child : line.children) {
-                    if (child.kind == NodeKind::Object && child.binItemId == bin) paraChild = i;
+                    if (child.kind == NodeKind::Object && child.ext().obj().binItemId == bin) paraChild = i;
                 }
             }
         }
@@ -5192,7 +5909,7 @@ bool repackTreatAsCharPicture(const Document& doc, std::vector<Node>& pages, int
     const int oldSectionPages = sectionEnd - picturePage;
 
     for (Carried& item : carried) {
-        const int need = std::max(item.line.textHeight, lineCharBox(item.line));
+        const int need = std::max(item.line.lineData().textHeight, lineCharBox(item.line));
         const int limit = flowLimit(page, column);
         const bool newPara =
             paraChild < 0 || column->children[static_cast<std::size_t>(paraChild)].paragraph != item.paraId;
@@ -5315,6 +6032,205 @@ PageFillGuard::PageFillGuard() { pageFillMutex().lock(); }
 
 PageFillGuard::~PageFillGuard() { pageFillMutex().unlock(); }
 
+const NodeExtra& noNodeExtra() {
+    static const NodeExtra none;
+    return none;
+}
+
+const std::string* Name::empty_() {
+    static const std::string none;
+    return &none;
+}
+
+const std::string* Name::intern(std::string_view value) {
+    if (value.empty()) return empty_();
+    // 스레드마다 최근 값을 들고, 없을 때만 잠그고 공용 집합에서 찾는다. 집합 원소 자리는 그대로다.
+    thread_local std::unordered_map<std::string, const std::string*> recent;
+    if (const auto found = recent.find(std::string(value)); found != recent.end()) return found->second;
+    static std::unordered_set<std::string> names;
+    static std::mutex mu;
+    const std::string* at = nullptr;
+    {
+        std::lock_guard lock(mu);
+        at = &*names.emplace(value).first;
+    }
+    if (recent.size() > 4096) recent.clear();
+    recent.emplace(*at, at);
+    return at;
+}
+
+namespace {
+
+const LineContent& noLineContent() {
+    static const LineContent none;
+    return none;
+}
+
+}  // namespace
+
+const LineContent& Node::lineData() const {
+    return content ? *content : noLineContent();
+}
+
+LineContent& Node::editContent() {
+    if (!content) content = std::make_shared<LineContent>();
+    else if (content.use_count() > 1) content = std::make_shared<LineContent>(*content);
+    return *content;
+}
+
+const std::string* nameRef(const std::string& name) {
+    if (name.empty()) return nullptr;
+    // 노드 이름(Name)과 같은 집합을 쓴다. 스레드마다 최근 값을 들어 잠금이 드물고, 원소 자리는 그대로다.
+    return &Name(name).str();
+}
+
+namespace {
+
+struct RunStyleHash {
+    std::size_t operator()(const RunStyle& s) const {
+        std::size_t h = std::hash<const void*>{}(s.font);
+        const auto mix = [&](std::size_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+        mix(std::hash<const void*>{}(s.markpen));
+        mix(std::hash<const void*>{}(s.tabLeader));
+        mix(static_cast<std::size_t>(static_cast<std::uint32_t>(s.fontSize)));
+        mix(static_cast<std::size_t>(static_cast<std::uint16_t>(s.ratio)) |
+            (static_cast<std::size_t>(static_cast<std::uint16_t>(s.relSize)) << 16));
+        mix(static_cast<std::size_t>(static_cast<std::uint16_t>(s.spacing)) |
+            (static_cast<std::size_t>(static_cast<std::uint16_t>(s.charOffset)) << 16));
+        return h;
+    }
+};
+
+}  // namespace
+
+const RunStyle* defaultRunStyle() {
+    static const RunStyle none;
+    return &none;
+}
+
+const RunStyle* runStyleRef(const RunStyle& style) {
+    if (style == *defaultRunStyle()) return defaultRunStyle();
+    // 스레드마다 최근 꼴을 들고, 없을 때만 잠그고 공용 집합에서 찾는다. 노드 기반 집합이라 원소 자리는 그대로다.
+    thread_local std::unordered_map<RunStyle, const RunStyle*, RunStyleHash> recent;
+    if (const auto found = recent.find(style); found != recent.end()) return found->second;
+    static std::unordered_set<RunStyle, RunStyleHash> styles;
+    static std::mutex mu;
+    const RunStyle* at = nullptr;
+    {
+        std::lock_guard lock(mu);
+        at = &*styles.insert(style).first;
+    }
+    if (recent.size() > 4096) recent.clear();
+    recent.emplace(style, at);
+    return at;
+}
+
+const RunStyle* runStyleOf(std::int32_t fontSize, const std::string& font, const std::string& markpen,
+                           const std::string& tabLeader, std::int32_t ratio, std::int32_t relSize, std::int32_t spacing,
+                           std::int32_t charOffset) {
+    RunStyle style;
+    style.fontSize = fontSize;
+    style.font = nameRef(font);
+    style.markpen = nameRef(markpen);
+    style.tabLeader = nameRef(tabLeader);
+    style.ratio = static_cast<std::int16_t>(ratio);
+    style.relSize = static_cast<std::int16_t>(relSize);
+    style.spacing = static_cast<std::int16_t>(spacing);
+    style.charOffset = static_cast<std::int16_t>(charOffset);
+    return runStyleRef(style);
+}
+
+void appendLineRun(LineGlyphs& glyphs, LineRun run, const std::int32_t* advances, std::size_t advanceCount,
+                   const std::int32_t* inks, std::size_t inkCount) {
+    run.advanceAt = static_cast<std::uint16_t>(glyphs.advances.size());
+    run.advanceCount = static_cast<std::uint16_t>(advanceCount);
+    if (advanceCount > 0) glyphs.advances.insert(glyphs.advances.end(), advances, advances + advanceCount);
+    run.inkAt = static_cast<std::uint16_t>(glyphs.inks.size());
+    run.inkCount = static_cast<std::uint16_t>(inkCount);
+    if (inkCount > 0) glyphs.inks.insert(glyphs.inks.end(), inks, inks + inkCount);
+    glyphs.runs.push_back(run);
+}
+
+void appendLineObject(Node& line, Node object, std::size_t textAt) {
+    LineRun run;
+    run.kind = RunKind::Object;
+    run.slot = static_cast<std::uint16_t>(line.children.size());
+    run.textBegin = static_cast<std::uint16_t>(textAt);
+    run.textEnd = run.textBegin;
+    line.children.push_back(std::move(object));
+    appendLineRun(line.glyphsMut(), run);
+}
+
+void trimLineGlyphs(LineGlyphs& glyphs) {
+    glyphs.runs.shrink_to_fit();
+    glyphs.advances.shrink_to_fit();
+    glyphs.inks.shrink_to_fit();
+}
+
+bool lineStartsWithObject(const Node& line) {
+    if (line.glyphs().heading) return false;
+    if (!line.children.empty() && line.children.front().headingMark) return line.children.front().kind == NodeKind::Object;
+    return !line.glyphs().runs.empty() && line.glyphs().runs.front().kind == RunKind::Object;
+}
+
+namespace {
+
+std::size_t gSceneKinds[8] = {};
+std::size_t gSceneSpansLater = 0;
+std::size_t gSceneExtras = 0;
+std::size_t gSceneParts[kScenePartCount] = {};
+
+void sceneNodeBytes(const Node& node, std::size_t& nodes) {
+    ++nodes;
+    gSceneParts[kScenePartHeads] += sizeof(Node);
+    if (node.extra.get()) {
+        gSceneParts[kScenePartTails] += sizeof(NodeExtra) + (node.ext().object.get() ? sizeof(ObjectExtra) : 0);
+        ++gSceneExtras;
+    }
+    ++gSceneKinds[static_cast<int>(node.kind) & 7];
+    if (node.kind == NodeKind::Paper && node.spansLater) ++gSceneSpansLater;
+    const auto heap = [](const std::string& s) { return s.capacity() > 22 ? s.capacity() : std::size_t{0}; };
+    gSceneParts[kScenePartOther] += node.ext().obj().points.capacity() * sizeof(model::ShapePoint);
+    gSceneParts[kScenePartChildSlack] += (node.children.capacity() - node.children.size()) * sizeof(Node);
+    if (const LineContent* content = node.content.get()) {
+        gSceneParts[kScenePartLines] += sizeof(LineContent);
+        gSceneParts[kScenePartRuns] += content->glyphs.runs.capacity() * sizeof(LineRun);
+        gSceneParts[kScenePartRunCount] += content->glyphs.runs.size();
+        gSceneParts[kScenePartWidths] +=
+            (content->glyphs.advances.capacity() + content->glyphs.inks.capacity()) * sizeof(std::int32_t);
+        gSceneParts[kScenePartOther] += heap(content->text) + content->tabStops.capacity() * sizeof(LineTab);
+    }
+    for (const Node& child : node.children) sceneNodeBytes(child, nodes);
+}
+
+}  // namespace
+
+std::size_t scenePart(ScenePart part) {
+    return gSceneParts[part];
+}
+
+std::size_t sceneKindCount(int kind) {
+    if (kind == 8) return gSceneSpansLater;
+    if (kind == 9) return gSceneExtras;
+    return gSceneKinds[kind & 7];
+}
+
+std::size_t sceneMemory(const std::vector<Node>& pages, std::size_t& nodes) {
+    // 일꾼이 쪽 조각을 채우는 중에 훑지 않게 쪽 채우기 잠금을 잡는다.
+    PageFillGuard guard;
+    for (std::size_t& k : gSceneKinds) k = 0;
+    gSceneSpansLater = 0;
+    gSceneExtras = 0;
+    for (std::size_t& part : gSceneParts) part = 0;
+    nodes = 0;
+    for (const Node& page : pages) sceneNodeBytes(page, nodes);
+    std::size_t total = 0;
+    for (int part = 0; part < kScenePartCount; ++part) {
+        if (part != kScenePartRunCount) total += gSceneParts[part];
+    }
+    return total;
+}
+
 int ensurePageSpans(const model::Document& doc, Node& page) {
     if (!page.spansLater && page.huBoundsReady && page.contentHash != 0) return 0;
     PageFillGuard guard;
@@ -5369,6 +6285,16 @@ model::CursorTarget resolveCursor(model::Document& doc, model::CursorPos pos) {
     return ensureStoryMap(doc).resolve(pos);
 }
 
+namespace {
+
+// 다 짠 쪽의 자식 배열에서 쌓는 동안 늘려 둔 빈자리를 돌려준다. 노드 자리가 옮겨지므로 캐시가 노드를 가리키기 전에 한다.
+void trimChildren(Node& node) {
+    node.children.shrink_to_fit();
+    for (Node& child : node.children) trimChildren(child);
+}
+
+}  // namespace
+
 std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredLineHeight, bool deferSpans) {
     // 새 트리는 옛 노드 주소를 다시 쓸 수 있다. 주소로 찾는 캐럿·블록 캐시를 먼저 비운다.
     forgetLayoutNodeCaches();
@@ -5378,7 +6304,7 @@ std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredL
         bool line = false;
         std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         explicit CalcLog(bool lineCache) : line(lineCache) {
-            if (gPageCalcLog && !line) std::fprintf(stderr, "[noting] 페이지 계산 시작\n");
+            if (gPageCalcLog && !line) std::fprintf(stderr, "[ClassingHWP] 페이지 계산 시작\n");
         }
         ~CalcLog() {
             if (!gPageCalcLog) return;
@@ -5386,7 +6312,7 @@ std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredL
                 std::printf("{\"페이지계산\":%.1f}\n", pageCalcMs(started));
                 std::fflush(stdout);
             } else {
-                std::fprintf(stderr, "[noting] 페이지 계산 %.1fms\n", pageCalcMs(started));
+                std::fprintf(stderr, "[ClassingHWP] 페이지 계산 %.1fms\n", pageCalcMs(started));
             }
         }
     } calcLog(useStoredLineHeight);
@@ -5404,24 +6330,24 @@ std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredL
         ParagraphGlyphs& operator=(const ParagraphGlyphs&) = delete;
     };
     const auto glyphStarted = std::chrono::steady_clock::now();
-    if (gPageCalcLog && !useStoredLineHeight) std::fprintf(stderr, "[noting] 글자 폭 시작\n");
+    if (gPageCalcLog && !useStoredLineHeight) std::fprintf(stderr, "[ClassingHWP] 글자 폭 시작\n");
     ParagraphGlyphs glyphs(doc, !useStoredLineHeight);
     if (gPageCalcLog && !useStoredLineHeight) {
-        std::fprintf(stderr, "[noting] 글자 폭 %.1fms\n", pageCalcMs(glyphStarted));
+        std::fprintf(stderr, "[ClassingHWP] 글자 폭 %.1fms\n", pageCalcMs(glyphStarted));
     }
     std::vector<Node> pages;
     resetStories(doc);
     int nextNumber = doc.header.beginNumbers.page > 0 ? static_cast<int>(doc.header.beginNumbers.page) : 1;
     gPageLogIndex = 0;
     const auto stackStarted = std::chrono::steady_clock::now();
-    if (gPageCalcLog && !useStoredLineHeight) std::fprintf(stderr, "[noting] 쪽 쌓기 시작\n");
+    if (gPageCalcLog && !useStoredLineHeight) std::fprintf(stderr, "[ClassingHWP] 쪽 쌓기 시작\n");
     auto logStack = [&]() {
         if (!gPageCalcLog) return;
         if (useStoredLineHeight) {
             std::printf("{\"쪽쌓기\":%.1f,\"쪽수\":%d}\n", pageCalcMs(stackStarted), static_cast<int>(pages.size()));
             std::fflush(stdout);
         } else {
-            std::fprintf(stderr, "[noting] 쪽 쌓기 %.1fms\n", pageCalcMs(stackStarted));
+            std::fprintf(stderr, "[ClassingHWP] 쪽 쌓기 %.1fms\n", pageCalcMs(stackStarted));
         }
     };
     int sectionIndex = 0;
@@ -5442,6 +6368,7 @@ std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredL
             logStack();
             Node page = std::move(pages[static_cast<std::size_t>(onlyPage)]);
             page.marginTop = defaultPageMarginTopHu(static_cast<std::size_t>(onlyPage));
+            trimChildren(page);
             return {std::move(page)};
         }
     }
@@ -5450,10 +6377,13 @@ std::vector<Node> layoutPages(const Document& doc, int onlyPage, bool useStoredL
     if (onlyPage >= 0) {
         if (onlyPage < static_cast<int>(pages.size())) {
             Node page = std::move(pages[static_cast<std::size_t>(onlyPage)]);
+            trimChildren(page);
             return {std::move(page)};
         }
         return {};
     }
+    for (Node& page : pages) trimChildren(page);
+    pages.shrink_to_fit();
     return pages;
 }
 
@@ -5503,8 +6433,37 @@ bool samePageBox(const PageBox& box, const Node& page) {
 
 }  // namespace
 
+namespace {
+
+// 옛 문단 번호를 편집 뒤 번호로. 지운 문단이면 -1 이다.
+int shiftedParagraph(int para, int after, int delta) {
+    if (para <= after || delta == 0) return para;
+    if (delta < 0 && para <= after - delta) return -1;
+    return para + delta;
+}
+
+// 그대로 붙이는 옛 쪽의 본문 문단 번호를 새 번호로 바꾼다. 머리말·꼬리말과 개체 안 글(표 칸·글상자)은 다른 글 묶음이라 두고,
+// 본문 단의 문단·줄과 본문에 놓인 개체(기준 문단 포함)만 고친다.
+void shiftFlowParagraphs(Node& node, int story, int after, int delta) {
+    if (node.pageBand || node.fromMaster) return;
+    if (node.kind == NodeKind::Object) {
+        if (node.paragraph > after) node.paragraph = std::max(0, shiftedParagraph(node.paragraph, after, delta));
+        if ((node.ext().obj().anchorStory == story || node.ext().obj().anchorStory <= 0) && node.ext().obj().anchorParagraph > after) {
+            node.extMut().objMut().anchorParagraph = std::max(0, shiftedParagraph(node.ext().obj().anchorParagraph, after, delta));
+        }
+        return;
+    }
+    if ((node.kind == NodeKind::Paragraph || node.kind == NodeKind::Line) && node.paragraph > after) {
+        node.paragraph = std::max(0, shiftedParagraph(node.paragraph, after, delta));
+    }
+    for (Node& child : node.children) shiftFlowParagraphs(child, story, after, delta);
+}
+
+}  // namespace
+
 SectionReflow reflowPagesFrom(const model::Document& doc, std::vector<Node>& pages, int startPage,
-                              bool useStoredLineHeight, bool deferSpans) {
+                              bool useStoredLineHeight, bool deferSpans, int shiftStory, int shiftAfter,
+                              int shiftDelta) {
     SectionReflow out;
     startPage = rewindToParagraphStart(pages, startPage);
     if (startPage < 0) return out;
@@ -5527,7 +6486,19 @@ SectionReflow reflowPagesFrom(const model::Document& doc, std::vector<Node>& pag
     for (int i = 0; i < static_cast<int>(pages.size()); ++i) {
         starts[static_cast<std::size_t>(i)] = pageFlowStart(pages[static_cast<std::size_t>(i)]);
     }
-    const noting::model::Section& section = doc.sections[static_cast<std::size_t>(sectionIndex)];
+    // 문단을 넣거나 지웠으면 옛 쪽 시작 문단은 옛 번호다. 새로 놓은 문단 번호와 맞춰 보려면 새 번호로 바꾼다.
+    // 그러지 않으면 넣은 문단 수만큼 앞선 옛 쪽과 맞아 그 사이 쪽이 통째로 빠진다.
+    const bool shifting = shiftDelta != 0 && shiftAfter >= 0;
+    if (shifting) {
+        for (int i = startPage + 1; i < sectionEnd; ++i) {
+            FlowAt& at = starts[static_cast<std::size_t>(i)];
+            if (!at.ok) continue;
+            const int moved = shiftedParagraph(at.para, shiftAfter, shiftDelta);
+            if (moved < 0) at.ok = false;
+            else at.para = moved;
+        }
+    }
+    const chwp::model::Section& section = doc.sections[static_cast<std::size_t>(sectionIndex)];
     int nextNumber = pages[static_cast<std::size_t>(startPage)].pageNumber > 0
                          ? pages[static_cast<std::size_t>(startPage)].pageNumber
                          : startPage + 1;
@@ -5559,6 +6530,10 @@ SectionReflow reflowPagesFrom(const model::Document& doc, std::vector<Node>& pag
     bool freezeNumber = false;
     for (int i = tailFrom; i < static_cast<int>(pages.size()); ++i) {
         Node page = std::move(pages[static_cast<std::size_t>(i)]);
+        // 같은 구역의 붙인 옛 쪽은 본문 문단 번호가 옛 번호다. 새 번호로 고친다.
+        if (shifting && i < sectionEnd && page.section == sectionIndex) {
+            shiftFlowParagraphs(page, shiftStory, shiftAfter, shiftDelta);
+        }
         if (page.section != prevSection) {
             prevSection = page.section;
             if (page.section >= 0 && page.section < static_cast<int>(doc.sections.size()) &&
@@ -5569,11 +6544,21 @@ SectionReflow reflowPagesFrom(const model::Document& doc, std::vector<Node>& pag
         if (!freezeNumber && delta != 0 && page.pageNumber > 0) {
             // 쪽 나눔 뒤에서 그대로 붙인 쪽이다. 번호 글자만 고치고 본문 캐시는 비우지 않는다.
             const std::string from = std::to_string(page.pageNumber);
+            const int oldNumber = page.pageNumber;
             page.pageNumber += delta;
             const std::string to = std::to_string(page.pageNumber);
             for (Node& child : page.children) {
                 if (!child.pageBand && !child.fromMaster) continue;
                 rewriteExactNumber(child, from, to);
+            }
+            // 홀짝이 바뀌면 제본 여백이 반대쪽으로 간다. 본문·띠를 그 쪽 자리로 옮기고 테두리를 다시 놓는다.
+            const chwp::model::Section* sec =
+                page.section >= 0 && page.section < static_cast<int>(doc.sections.size())
+                    ? &doc.sections[static_cast<std::size_t>(page.section)]
+                    : nullptr;
+            if (sec && sec->page && (delta % 2 != 0) && sec->page->sidesDiffer()) {
+                shiftPageSide(page, *sec, oldNumber, page.pageNumber);
+                stampPageChrome(page, doc, *sec, page.pageNumber);
             }
         }
         result.push_back(std::move(page));
@@ -5653,7 +6638,9 @@ SectionReflow reflowEditedPages(const model::Document& doc, std::vector<Node>& p
         }
     }
     if (start < 0) return out;
-    return reflowPagesFrom(doc, pages, start, spec.useStoredLineHeight, spec.useStoredLineHeight);
+    const int shiftDelta = spec.paragraphsShifted ? 0 : spec.paraDelta;
+    return reflowPagesFrom(doc, pages, start, spec.useStoredLineHeight, spec.useStoredLineHeight, spec.story,
+                           spec.paraIndex, shiftDelta);
 }
 
 bool reflowResizedPages(const model::Document& doc, std::vector<Node>& pages, int startPage, bool useStoredLineHeight,
@@ -5664,7 +6651,7 @@ bool reflowResizedPages(const model::Document& doc, std::vector<Node>& pages, in
 
 model::LineSeg lineSegFor(const Node& line, std::int32_t vertPos) {
     model::LineSeg seg;
-    const std::int32_t textHeight = line.textHeight > 0 ? line.textHeight : line.fontSize;
+    const std::int32_t textHeight = line.lineData().textHeight > 0 ? line.lineData().textHeight : line.fontSize;
     seg.textPos = line.start > 0 ? static_cast<std::uint32_t>(line.start) : 0;
     seg.vertPos = vertPos;
     // 글자 높이와 글자처럼 취한 개체 높이 중 큰 값이다.
@@ -5672,16 +6659,16 @@ model::LineSeg lineSegFor(const Node& line, std::int32_t vertPos) {
     seg.textHeight = box;
     // vertsize 는 다음 줄로 넘어간 앞 글자까지 잰 높이라 textheight 보다 클 수 있다.
     seg.vertSize = box;
-    if (line.measuredSeg.vertSize > seg.vertSize) seg.vertSize = line.measuredSeg.vertSize;
+    if (line.lineData().measuredSeg.vertSize > seg.vertSize) seg.vertSize = line.lineData().measuredSeg.vertSize;
     // 글자 기준선, 그림은 위에서 85%, 수식은 수식 높이×백분율 중 큰 값이다.
-    const std::int32_t glyphBaseline = line.lineBaseline >= 0 ? line.lineBaseline
+    const std::int32_t glyphBaseline = line.lineData().lineBaseline >= 0 ? line.lineData().lineBaseline
                                                               : layout::glyphBaseline(textHeight);
     seg.baseline = lineSegBaseline(line, box, glyphBaseline);
     seg.spacing = line.height - textHeight;
     seg.horzPos = line.x;
     seg.horzSize = std::max(kMinParagraphWidth, line.width);
     // 저장된 줄은 글자 이동에 들여쓰기가 남아 있다. 다시 조판한 줄은 측정할 때 이미 플래그를 넣는다.
-    seg.flags = line.measuredSeg.flags != 0 ? line.measuredSeg.flags : measuredLineFlags(line.indent > 0, line.indent);
+    seg.flags = line.lineData().measuredSeg.flags != 0 ? line.lineData().measuredSeg.flags : measuredLineFlags(line.indent > 0, line.indent);
     return seg;
 }
 
@@ -5702,20 +6689,32 @@ ParagraphPlace paragraphPlace(const Node& node) {
         line.width = child.width;
         line.height = child.height;
         std::int32_t pen = 0;
-        for (const auto& slot : child.children) {
-            if (slot.kind == NodeKind::Span) {
-                if (!slot.advances.empty()) {
-                    for (const std::int32_t width : slot.advances) {
-                        line.xs.push_back(pen);
-                        pen += width;
-                    }
-                } else {
+        // 머리 번호는 줄 앞에 있다. 본문 글자는 줄 글자 표로 센다.
+        const LineGlyphs& glyphs = lineGlyphs(child);
+        if (const HeadingRun* head = glyphs.heading.get()) {
+            if (!head->advances.empty()) {
+                for (const std::int32_t width : head->advances) {
                     line.xs.push_back(pen);
-                    pen += slot.width;
+                    pen += width;
                 }
-            } else if (slot.kind == NodeKind::Object) {
+            } else {
+                line.xs.push_back(pen);
+                pen += head->width;
+            }
+        }
+        for (const LineRun& run : glyphs.runs) {
+            if (run.kind == RunKind::Object) {
+                const Node& slot = child.children[run.slot];
                 line.xs.push_back(slot.x);
                 pen = slot.x + slot.width + slot.marginLeft + slot.marginRight;
+            } else if (run.advanceCount > 0) {
+                for (std::uint32_t i = 0; i < run.advanceCount; ++i) {
+                    line.xs.push_back(pen);
+                    pen += glyphs.advances[run.advanceAt + i];
+                }
+            } else {
+                line.xs.push_back(pen);
+                pen += run.width;
             }
         }
         paragraph.lines.push_back(std::move(line));
@@ -5833,7 +6832,7 @@ bool relayoutPageBands(const Document& doc, std::vector<Node>& pages, const Cont
             const model::Section& section = doc.sections[static_cast<std::size_t>(sec)];
             if (!section.page) return false;
             Node scratch;
-            attachBand(scratch, control, *section.page, doc, paper.pageNumber,
+            attachBand(scratch, control, section.page->side(paper.pageNumber), doc, paper.pageNumber,
                        sectionPages[static_cast<std::size_t>(sec)], paper.pageNumberHidden, dateNow, docDate,
                        useStoredLineHeight);
             if (scratch.children.empty()) return false;
@@ -5856,4 +6855,4 @@ bool relayoutPageBands(const Document& doc, std::vector<Node>& pages, const Cont
     return true;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

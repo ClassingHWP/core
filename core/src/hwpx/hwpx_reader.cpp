@@ -1,4 +1,4 @@
-#include "noting/hwpx/hwpx_reader.hpp"
+#include "chwp/hwpx/hwpx_reader.hpp"
 
 #include <algorithm>
 #include <algorithm>
@@ -9,16 +9,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include "noting/common/unicode.hpp"
-#include "noting/unit.hpp"
-#include "noting/container/zip.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/unit.hpp"
+#include "chwp/container/zip.hpp"
 #include "pugixml.hpp"
 
-namespace noting::hwpx {
+namespace chwp::hwpx {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 // 접두사(hp:, hh: ...)는 관례일 뿐이므로 로컬 이름으로 비교한다.
 std::string_view localName(const char* name) {
@@ -280,6 +280,13 @@ BorderFill readBorderFill(const pugi::xml_node& node) {
     }
     if (auto brush = child(node, "fillBrush")) {
         readFill(brush, fill.faceColor, fill.gradColor, fill.gradAngle, fill.imageId, fill.imageMode);
+        if (auto win = child(brush, "winBrush")) {
+            const std::string hatch = str(win, "hatchStyle");
+            if (!hatch.empty() && hatch != "NONE") {
+                fill.hatchStyle = hatch;
+                fill.hatchColor = str(win, "hatchColor");
+            }
+        }
     }
     return fill;
 }
@@ -882,6 +889,10 @@ void Parser::parseSection(const pugi::xml_node& sec, Section& section) {
                     section.page = item.control.page;
                     if (item.control.defaultTab > 0) section.defaultTab = item.control.defaultTab;
                     if (item.control.columnRegionGap > 0) section.columnRegionGap = item.control.columnRegionGap;
+                    section.textDirection = item.control.textDirection;
+                    section.lineGrid = item.control.lineGrid;
+                    section.charGrid = item.control.charGrid;
+                    section.wongoji = item.control.wongoji;
                     section.pageStart = item.control.number;
                     section.hideHeader = item.control.hideHeader;
                     section.hideFooter = item.control.hideFooter;
@@ -1023,6 +1034,10 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
 SubList Parser::parseSubList(const pugi::xml_node& subList) {
     SubList out;
     if (const std::string align = str(subList, "vertAlign"); !align.empty()) out.vertAlign = align;
+    {
+        const std::string dir = str(subList, "textDirection");
+        out.textDirection = dir == "VERTICALALL" ? 2 : (dir == "VERTICAL" ? 1 : 0);
+    }
     out.textWidth = u32(subList, "textWidth");
     out.textHeight = u32(subList, "textHeight");
     for (auto p : subList.children()) {
@@ -1134,6 +1149,8 @@ Control Parser::parseSecPr(const pugi::xml_node& node) {
         page.width = u32(pagePr, "width");
         page.height = u32(pagePr, "height");
         page.landscape = str(pagePr, "landscape") == "NARROWLY";
+        const std::string gutter = str(pagePr, "gutterType");
+        page.gutterType = gutter == "LEFT_RIGHT" ? 1 : (gutter == "TOP_BOTTOM" ? 2 : 0);
         if (auto m = child(pagePr, "margin")) {
             page.marginLeft = u32(m, "left");
             page.marginRight = u32(m, "right");
@@ -1151,6 +1168,16 @@ Control Parser::parseSecPr(const pugi::xml_node& node) {
     c.defaultTab = tabVal > 0 ? tabVal : (tabRaw > 0 ? tabRaw / 2 : 4000);
     if (const std::int32_t gap = i32(node, "spaceColumns"); gap > 0) c.columnRegionGap = gap;
     if (auto start = child(node, "startNum")) c.number = u32(start, "page");
+    // 글자 방향 이름: 0 HORIZONTAL, 1 VERTICAL, 2 VERTICALALL (한글 2024 와 같은 차례).
+    {
+        const std::string dir = str(node, "textDirection");
+        c.textDirection = dir == "VERTICALALL" ? 2 : (dir == "VERTICAL" ? 1 : 0);
+    }
+    if (auto grid = child(node, "grid")) {
+        c.lineGrid = i32(grid, "lineGrid");
+        c.charGrid = i32(grid, "charGrid");
+        c.wongoji = i32(grid, "wonggojiFormat") != 0;
+    }
     if (auto vis = child(node, "visibility")) {
         c.hideFirstHeader = flag(vis, "hideFirstHeader");
         c.hideFirstFooter = flag(vis, "hideFirstFooter");
@@ -1318,6 +1345,7 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
     p.zOrder = i32(node, "zOrder");
     p.textWrap = str(node, "textWrap");
     if (const std::string flow = str(node, "textFlow"); !flow.empty()) p.textFlow = flow;
+    p.numberingType = str(node, "numberingType");
     std::uint32_t orgW = 0;
     std::uint32_t orgH = 0;
     if (auto org = child(node, "orgSz")) {
@@ -1724,4 +1752,4 @@ ParseResult parse(ByteView data, const ParseOptions& options) {
     return result;
 }
 
-}  // namespace noting::hwpx
+}  // namespace chwp::hwpx

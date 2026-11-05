@@ -1,9 +1,9 @@
-#include "noting/input/pointer.hpp"
+#include "chwp/input/pointer.hpp"
 
 #include <algorithm>
 #include <cmath>
 
-namespace noting::input {
+namespace chwp::input {
 namespace {
 
 bool containsId(const std::vector<int>& ids, int id) {
@@ -214,13 +214,15 @@ PointerOutcome PointerInput::endPinch(render::PageView& view, Phase phase) {
     return out;
 }
 
-PointerOutcome PointerInput::endPair(render::PageView& view, Phase phase) {
+PointerOutcome PointerInput::endPair(render::PageView& view, Phase phase, double time) {
     if (pinching_) return endPinch(view, phase);
     pair_ = false;
     held_ = !touches_.empty();
     PointerOutcome out;
     out.phase = phase;
-    if (phase == Phase::Up && midVel_) out.camera = finish(view_.fling(view, -midVelX_, -midVelY_));
+    // 두 손가락을 멈춘 채 있다가 떼면 남은 속도는 지난 것이다. 한 손가락과 같은 기준으로 관성을 주지 않는다.
+    const bool fresh = time <= 0 || midTime_ <= 0 || time - midTime_ <= ViewportInput::kFlingFreshMs;
+    if (phase == Phase::Up && midVel_ && fresh) out.camera = finish(view_.fling(view, -midVelX_, -midVelY_));
     else out.camera = quiet(view, true);
     midVelX_ = 0;
     midVelY_ = 0;
@@ -322,7 +324,7 @@ PointerOutcome PointerInput::pointer(render::PageView& view, const PointerEvent&
     if (pair_ && touches_.size() < 2) {
         tapId_ = -1;
         tapMoved_ = true;
-        return endPair(view, event.phase);
+        return endPair(view, event.phase, event.time);
     }
     if (held_) {
         tapId_ = -1;
@@ -434,4 +436,4 @@ Camera PointerInput::setGridMode(render::PageView& view, render::PageGridMode mo
     return view_.setGridMode(view, mode, cols, rows, fit);
 }
 
-}  // namespace noting::input
+}  // namespace chwp::input

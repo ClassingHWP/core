@@ -4,7 +4,9 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace noting::render::paint_detail {
+#include "render/paint_detail.hpp"
+
+namespace chwp::render::paint_detail {
 
 namespace {
 
@@ -21,9 +23,7 @@ void storeFrameBorders(int id, float scale, std::vector<BorderPiece> pieces) {
     }
     auto made = std::make_shared<FrameBorders>();
     made->scale = scale;
-#if NOTING_HAS_SKIA
     made->mesh = makeBorderMesh(pieces);
-#endif
     made->pieces = std::move(pieces);
     std::lock_guard lock(gFrameBorderMu);
     gFrameBorders[id] = std::move(made);
@@ -62,20 +62,10 @@ std::shared_ptr<const FrameBorders> frameBorders(int id) {
 
 void forceBordersOnScreen(bool on) { gForcedOnScreen = on; }
 
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-bool screenVectors();  // paint.cpp
-#endif
+bool bordersOnScreen() { return screenVectors() || gForcedOnScreen; }
 
-bool bordersOnScreen() {
-#if defined(__EMSCRIPTEN__) && NOTING_HAS_SKIA
-    if (screenVectors()) return true;
-#endif
-    return gForcedOnScreen;
-}
+}  // namespace chwp::render::paint_detail
 
-}  // namespace noting::render::paint_detail
-
-#if NOTING_HAS_SKIA
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -88,7 +78,7 @@ bool bordersOnScreen() {
 #include "include/core/SkPaint.h"
 #include "include/core/SkString.h"
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 namespace {
 
@@ -445,5 +435,4 @@ void drawBorderMesh(SkCanvas* canvas, const BorderMesh& mesh, float bakeScale, f
     canvas->restore();
 }
 
-}  // namespace noting::render::paint_detail
-#endif
+}  // namespace chwp::render::paint_detail

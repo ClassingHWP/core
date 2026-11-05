@@ -1,11 +1,11 @@
-#include "noting/render/cache_budget.hpp"
+#include "chwp/render/cache_budget.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <utility>
 
-namespace noting::render {
+namespace chwp::render {
 namespace {
 
 struct Entry {
@@ -82,7 +82,7 @@ void unregisterCachePool(CachePool& pool) {
 }
 
 bool setCacheBudget(const std::string& name, std::size_t budget) {
-    CachePool* found = nullptr;
+    std::vector<CachePool*> found;
     {
         std::lock_guard lock(registryMutex());
         auto& pending = pendingBudgets();
@@ -90,16 +90,16 @@ bool setCacheBudget(const std::string& name, std::size_t budget) {
         if (kept != pending.end()) kept->second = budget;
         else pending.emplace_back(name, budget);
         for (Entry& entry : registry()) {
-            if (name == entry.pool->name()) {
-                entry.budget = budget;
-                found = entry.pool;
-                break;
-            }
+            if (name != entry.pool->name()) continue;
+            entry.budget = budget;
+            found.push_back(entry.pool);
         }
     }
-    if (found) enforceCacheBudget(*found);
-    return found != nullptr;
+    for (CachePool* pool : found) enforceCacheBudget(*pool);
+    return !found.empty();
 }
+
+std::size_t cacheBudget(const CachePool& pool) { return budgetOf(pool); }
 
 void enforceCacheBudget(CachePool& pool) {
     const std::size_t budget = budgetOf(pool);
@@ -133,4 +133,4 @@ std::vector<CacheUsage> cacheUsage() {
     return out;
 }
 
-}  // namespace noting::render
+}  // namespace chwp::render

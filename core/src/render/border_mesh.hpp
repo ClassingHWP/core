@@ -12,16 +12,14 @@
 #include <memory>
 #include <vector>
 
-#if NOTING_HAS_SKIA
 #include "include/core/SkMesh.h"
 #include "include/core/SkRect.h"
 #include "include/core/SkRefCnt.h"
 
 class SkCanvas;
 class SkColorFilter;
-#endif
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 // 테두리 한 조각. 좌표는 칸 비트맵의 HU 다(픽셀 = HU × 구운 배율).
 // 선분은 (x0,y0)-(x1,y1) 중심선이고 inside 가 안쪽 방향이다.
@@ -41,7 +39,6 @@ struct BorderPiece {
     std::uint8_t b = 0;
 };
 
-#if NOTING_HAS_SKIA
 // 셰이더가 읽는 정점 묶음. 16비트 색인 한도에 맞춰 조각을 나눈다.
 struct BorderMesh {
     struct Chunk {
@@ -68,15 +65,12 @@ BorderMesh makeBorderMesh(const std::vector<BorderPiece>& pieces);
 // filter 가 있으면 그 색 거르개를 얹는다(선택 반전).
 void drawBorderMesh(SkCanvas* canvas, const BorderMesh& mesh, float bakeScale, float sx, float sy, SkPoint origin,
                     const SkRect& clip, sk_sp<SkColorFilter> filter = nullptr);
-#endif
 
 // 칸 id 별로 남긴 테두리. 칸을 구울 때마다 갈아 끼우고, 칸을 버리면 함께 버린다.
 struct FrameBorders {
     float scale = 0;  // 구운 배율(픽셀/HU)
     std::vector<BorderPiece> pieces;
-#if NOTING_HAS_SKIA
     BorderMesh mesh;
-#endif
 };
 
 void storeFrameBorders(int id, float scale, std::vector<BorderPiece> pieces);
@@ -91,4 +85,4 @@ std::shared_ptr<const FrameBorders> frameBorders(int id);
 bool bordersOnScreen();
 void forceBordersOnScreen(bool on);
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

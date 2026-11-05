@@ -1,6 +1,6 @@
-#include "noting/common/unicode.hpp"
+#include "chwp/common/unicode.hpp"
 
-namespace noting {
+namespace chwp {
 
 void appendUtf8(std::string& out, char32_t cp) {
     if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
@@ -88,4 +88,4 @@ std::u16string utf8ToUtf16(std::string_view text) {
     return out;
 }
 
-}  // namespace noting
+}  // namespace chwp

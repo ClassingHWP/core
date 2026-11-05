@@ -1,11 +1,11 @@
-#include "noting/container/cfb.hpp"
+#include "chwp/container/cfb.hpp"
 
 #include <algorithm>
 #include <cstring>
 
-#include "noting/common/unicode.hpp"
+#include "chwp/common/unicode.hpp"
 
-namespace noting::cfb {
+namespace chwp::cfb {
 
 namespace {
 
@@ -580,4 +580,4 @@ bool CompoundWriter::build(Bytes& out, std::string* error) const {
     return true;
 }
 
-}  // namespace noting::cfb
+}  // namespace chwp::cfb

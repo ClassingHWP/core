@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-#include "noting/model/document.hpp"
-#include "noting/render/scene.hpp"
+#include "chwp/model/document.hpp"
+#include "chwp/render/scene.hpp"
 
-namespace noting::render {
+namespace chwp::render {
 
 struct LinePlaceCheck {
     long lines = 0;
@@ -29,4 +29,4 @@ LinePlaceCheck checkCaretTops(const model::Document& doc, const std::vector<Node
 std::vector<std::int32_t> cachedCaretEdges(const model::Document& doc, const Node& line);
 std::vector<std::int32_t> freshCaretEdges(const model::Document& doc, const Node& line);
 
-}  // namespace noting::render
+}  // namespace chwp::render

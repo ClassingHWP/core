@@ -4,12 +4,12 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "noting/render/paint.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/render/paint.hpp"
+#include "chwp/render/view.hpp"
 #include "render/border_mesh.hpp"
 #include "render/painter.hpp"
 
-#if NOTING_HAS_DAWN
+#if CHWP_HAS_DAWN
 #include <memory>
 
 #include "dawn/dawn_proc.h"
@@ -28,9 +28,9 @@
 #include "include/gpu/graphite/dawn/DawnBackendContext.h"
 #endif
 
-namespace noting::render {
+namespace chwp::render {
 
-#if NOTING_HAS_DAWN
+#if CHWP_HAS_DAWN
 namespace {
 
 using paint_detail::frameBorders;
@@ -295,4 +295,4 @@ BorderMeshCheck checkBorderMeshDawn(const model::Document&, const std::vector<No
 }
 #endif
 
-}  // namespace noting::render
+}  // namespace chwp::render

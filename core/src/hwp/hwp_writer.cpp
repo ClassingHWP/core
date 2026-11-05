@@ -1,4 +1,4 @@
-#include "noting/hwp/hwp_writer.hpp"
+#include "chwp/hwp/hwp_writer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,18 +8,18 @@
 #include <cstring>
 #include <unordered_map>
 
-#include "noting/common/unicode.hpp"
-#include "noting/container/cfb.hpp"
-#include "noting/container/zip.hpp"
-#include "noting/hwp/records.hpp"
-#include "noting/reader.hpp"
-#include "noting/unit.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/container/cfb.hpp"
+#include "chwp/container/zip.hpp"
+#include "chwp/hwp/records.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/unit.hpp"
 
-namespace noting::hwp {
+namespace chwp::hwp {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 // HWP 레코드 하나를 ByteWriter 에 추가한다.
 void appendRecord(ByteWriter& stream, std::uint16_t tagId, std::uint16_t level, ByteView payload) {
@@ -272,8 +272,9 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
             }
             return count;
         };
+        // 메모 모양, 변경 추적 내용, 변경 추적 작성자 개수. 문서 수준 변경 추적(TrackChange)은 세지 않는다.
         w.i32(keptCount(tag::MemoShape));
-        w.i32(keptCount(tag::TrackChange));
+        w.i32(keptCount(tag::TrackChangeContent));
         w.i32(keptCount(tag::TrackChangeAuthor));
         appendRecord(stream, tag::IdMappings, 0, w.view());
     }
@@ -347,16 +348,22 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         const std::uint16_t imgBinId = bins.resolve(bf.imageId);
         const bool hasImg = imgBinId > 0 && bf.imageMode >= 0;
 
+        static const char* const hatches[] = {"HORIZONTAL", "VERTICAL", "SLASH", "BACK_SLASH", "CROSS", "CROSS_DIAGONAL"};
+        std::int32_t hatch = -1;
+        for (std::int32_t i = 0; i < static_cast<std::int32_t>(std::size(hatches)); ++i) {
+            if (bf.hatchStyle == hatches[i]) hatch = i;
+        }
         std::uint32_t fillType = 0;
         if (hasGrad) fillType |= 4u;
-        else if (hasFace) fillType |= 1u;
+        else if (hasFace || hatch >= 0) fillType |= 1u;
         if (hasImg) fillType |= 2u;
         w.u32(fillType);
 
         if ((fillType & 1u) != 0) {
-            w.u32(hexToColorRef(bf.faceColor, 0xFFFFFFFFu));
-            w.u32(0x00000000u);  // pattern color
-            w.i32(-1);           // pattern type (none)
+            // 무늬만 있으면 면 색은 0xFFFFFFFF(없음)다.
+            w.u32(hasFace ? hexToColorRef(bf.faceColor, 0xFFFFFFFFu) : 0xFFFFFFFFu);
+            w.u32(hatch >= 0 ? hexToColorRef(bf.hatchColor.empty() ? "#000000" : bf.hatchColor, 0u) : 0u);
+            w.i32(hatch);
         }
         if ((fillType & 4u) != 0) {
             w.u8(1);  // linear gradient
@@ -445,7 +452,11 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
             else if (stop.type == "CENTER") t = 2;
             else if (stop.type == "DECIMAL") t = 3;
             w.u8(t);
-            w.u8(toHwpBorderKind(stop.leader));
+            // 탭 채움은 테두리 선과 달리 2 가 점선, 3 이 파선이다(한글 2024, tmp/roundtrip/leaders).
+            std::uint8_t leader = toHwpBorderKind(stop.leader);
+            if (leader == 2) leader = 3;
+            else if (leader == 3) leader = 2;
+            w.u8(leader);
             w.u16(0);
         }
         appendRecord(stream, tag::TabDef, 1, w.view());
@@ -554,7 +565,8 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         attr1 |= ((vAlign & 0x3u) << 20);
         if (ps.fontLineHeight) attr1 |= (1u << 22);
         attr1 |= ((headType & 0x3u) << 23);
-        attr1 |= ((ps.headingLevel & 0x7u) << 25);
+        // 수준 3비트는 6 에서 멈추고, 끝에 0~9 수준을 따로 적는다(한글 2022 이상).
+        attr1 |= ((std::min<std::uint32_t>(ps.headingLevel, 6u) & 0x7u) << 25);
         if (ps.borderConnect) attr1 |= (1u << 28);
         if (ps.borderIgnoreMargin) attr1 |= (1u << 29);
 
@@ -583,6 +595,7 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         w.u32(attr2);
         w.u32(lsType);
         w.u32(static_cast<std::uint32_t>(lsValue));
+        w.u32(std::min<std::uint32_t>(ps.headingLevel, 9u));
         appendRecord(stream, tag::ParaShape, 1, w.view());
     }
 
@@ -611,20 +624,22 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         return wrote;
     };
     for (const KeptRecord& rec : h.kept) {
-        if (rec.tag == tag::CompatibleDocument || rec.tag == tag::LayoutCompatibility) continue;
+        if (rec.tag == tag::CompatibleDocument || rec.tag == tag::LayoutCompatibility || rec.tag == tag::TrackChange) continue;
         appendRecord(stream, rec.tag, 1, ByteView(rec.data));
     }
-    // 12. CompatibleDocument & LayoutCompatibility
+    // 12. CompatibleDocument(단계 0)와 그 아래 LayoutCompatibility(단계 1), 그 뒤 변경 추적(단계 1).
+    // 한글은 이 차례·단계가 다르면 파일을 열지 않는다.
     if (!writeKept(tag::CompatibleDocument, 0)) {
         ByteWriter w;
         w.u32(0);
         appendRecord(stream, tag::CompatibleDocument, 0, w.view());
     }
-    if (!writeKept(tag::LayoutCompatibility, 0)) {
+    if (!writeKept(tag::LayoutCompatibility, 1)) {
         ByteWriter w;
         for (int i = 0; i < 5; ++i) w.u32(0);
-        appendRecord(stream, tag::LayoutCompatibility, 0, w.view());
+        appendRecord(stream, tag::LayoutCompatibility, 1, w.view());
     }
+    writeKept(tag::TrackChange, 1);
 
     return stream.take();
 }
@@ -711,8 +726,9 @@ std::uint16_t extendedCharForControl(const Control& ctrl) {
     return 11;
 }
 
-void writePlacementBytes(ByteWriter& w, const Placement& p) {
-    std::uint32_t attr = 0;
+void writePlacementBytes(ByteWriter& w, const Control& ctrl) {
+    const Placement p = ctrl.placement.value_or(Placement{});
+    std::uint32_t attr = p.attrKeep & ~kObjectKnownBits;
     if (p.treatAsChar) attr |= 1u;
 
     std::uint32_t vRel = 2;  // PARA
@@ -756,6 +772,14 @@ void writePlacementBytes(ByteWriter& w, const Placement& p) {
     else if (p.textFlow == "RIGHT_ONLY") flow = 2;
     else if (p.textFlow == "LARGEST_ONLY") flow = 3;
     attr |= ((flow & 0x3u) << 24);
+
+    const std::string_view numbering = objectNumberingType(ctrl.kind, p.numberingType);
+    std::uint32_t numberingBits = 0;  // NONE
+    if (numbering == "PICTURE") numberingBits = 1;
+    else if (numbering == "TABLE") numberingBits = 2;
+    else if (numbering == "EQUATION") numberingBits = 3;
+    attr |= (numberingBits << 26);
+    if (ctrl.caption) attr |= (1u << 29);
 
     w.u32(attr);
     w.i32(p.vertOffset);
@@ -802,7 +826,7 @@ void writeCaptionRecords(ByteWriter& stream, const Caption& cap, std::uint16_t l
     const std::uint32_t pCount =
         static_cast<std::uint32_t>(std::max<std::size_t>(1, cap.content.paragraphs.size()));
     w.u32(pCount);
-    w.u32(listAttrFromVertAlign(cap.content.vertAlign));
+    w.u32(listAttrFromVertAlign(cap.content.vertAlign, cap.content.textDirection & 0x7u));
     std::uint32_t sideCode = 3;  // BOTTOM
     if (cap.side == "LEFT") sideCode = 0;
     else if (cap.side == "RIGHT") sideCode = 1;
@@ -962,7 +986,7 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         const std::uint32_t pCount =
             static_cast<std::uint32_t>(std::max<std::size_t>(1, sub.paragraphs.size()));
         w.u32(pCount);
-        w.u32(listAttrFromVertAlign(sub.vertAlign));
+        w.u32(listAttrFromVertAlign(sub.vertAlign, sub.textDirection & 0x7u));
         w.i16(static_cast<std::int16_t>(ctrl.boxPadLeft));
         w.i16(static_cast<std::int16_t>(ctrl.boxPadRight));
         w.i16(static_cast<std::int16_t>(ctrl.boxPadTop));
@@ -1177,31 +1201,47 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                                                                      : 4000);
             const std::uint32_t pageStart =
                 ctrl.number > 0 ? ctrl.number : (firstParaSec ? firstParaSec->pageStart : 0);
+            // 격자는 구역 값이 기준이다. 편집은 구역만 고친다.
+            const std::int32_t lineGrid = firstParaSec ? firstParaSec->lineGrid : ctrl.lineGrid;
+            const std::int32_t charGrid = firstParaSec ? firstParaSec->charGrid : ctrl.charGrid;
+            const bool wongoji = firstParaSec ? firstParaSec->wongoji : ctrl.wongoji;
+            const std::uint32_t textDirection = firstParaSec ? firstParaSec->textDirection : ctrl.textDirection;
+            // 모델이 풀지 않는 속성 비트는 읽은 그대로 쓴다. 읽은 값이 없으면(새 문서, HWPX) 비운다.
+            const std::optional<std::uint32_t> keptAttr =
+                firstParaSec && firstParaSec->sectionAttrKeep ? firstParaSec->sectionAttrKeep : ctrl.sectionAttrKeep;
 
             {
                 ByteWriter w;
                 w.u32(kCtrlSecd);
-                std::uint32_t attr = 0;
+                std::uint32_t attr = keptAttr ? (*keptAttr & ~kSecdKnownBits) : 0u;
                 if (hideHeader) attr |= 0x01u;
                 if (hideFooter) attr |= 0x02u;
                 if (hideMaster) attr |= 0x04u;
                 if (hidePageNum) attr |= 0x20u;
+                if (wongoji) attr |= 1u << 22;
+                if (firstParaSec && !firstParaSec->masterPages.empty()) attr |= 1u << 29;
+                // 글자 방향은 한글 2024 처럼 속성 비트 16–18 이 아니라 아래 36번째 바이트에만 쓴다.
                 w.u32(attr);
                 w.u16(static_cast<std::uint16_t>(colRegionGap));
-                w.u16(0);
-                w.u16(0);
+                w.u16(static_cast<std::uint16_t>(std::clamp(lineGrid, 0, 0xFFFF)));
+                w.u16(static_cast<std::uint16_t>(std::clamp(charGrid, 0, 0xFFFF)));
                 w.u32(static_cast<std::uint32_t>(defaultTab * 2));
                 w.u16(1);
                 w.u16(static_cast<std::uint16_t>(pageStart));
                 w.u16(0);
                 w.u16(0);
                 w.u16(0);
+                // 한글 2024 처럼 47바이트로 쓴다. 대표 언어 2바이트 뒤 6바이트를 비우고, 36번째 바이트에 글자 방향 × 2 를 둔다.
+                w.u16(0);
+                for (int i = 0; i < 6; ++i) w.u8(0);
+                w.u8(static_cast<std::uint8_t>((std::min<std::uint32_t>(textDirection, 2) & 0x3u) << 1));
+                for (int i = 0; i < 10; ++i) w.u8(0);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
             {
                 ByteWriter w;
-                w.u32(pd.width);
-                w.u32(pd.height);
+                w.u32(pd.storedWidth());
+                w.u32(pd.storedHeight());
                 w.u32(pd.marginLeft);
                 w.u32(pd.marginRight);
                 w.u32(pd.marginTop);
@@ -1209,7 +1249,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 w.u32(pd.marginHeader);
                 w.u32(pd.marginFooter);
                 w.u32(pd.marginGutter);
-                w.u32(pd.landscape ? 1u : 0u);
+                w.u32((pd.landscape ? 1u : 0u) | (static_cast<std::uint32_t>(std::min<int>(pd.gutterType, 2)) << 1));
                 appendRecord(stream, tag::PageDef, ctrlLevel + 1, w.view());
             }
             for (int fn = 0; fn < 2; ++fn) {
@@ -1299,7 +1339,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             {
                 ByteWriter w;
                 w.u32(kCtrlTable);
-                writePlacementBytes(w, ctrl.placement.value_or(Placement{}));
+                writePlacementBytes(w, ctrl);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
             if (ctrl.caption) {
@@ -1338,7 +1378,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 const std::uint32_t pCount = static_cast<std::uint32_t>(
                     std::max<std::size_t>(1, c.content.paragraphs.size()));
                 w.u32(pCount);
-                std::uint32_t extra = 0;
+                std::uint32_t extra = c.content.textDirection & 0x7u;
                 if (c.hasMargin) extra |= (1u << 16);
                 if (c.header) extra |= (1u << 18);
                 const std::string_view va =
@@ -1371,7 +1411,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             {
                 ByteWriter w;
                 w.u32(kCtrlGso);
-                writePlacementBytes(w, ctrl.placement.value_or(Placement{}));
+                writePlacementBytes(w, ctrl);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
             if (ctrl.caption) {
@@ -1384,7 +1424,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             {
                 ByteWriter w;
                 w.u32(kCtrlEquation);
-                writePlacementBytes(w, ctrl.placement.value_or(Placement{}));
+                writePlacementBytes(w, ctrl);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
             if (ctrl.caption) {
@@ -1422,7 +1462,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 const std::uint32_t pCount =
                     static_cast<std::uint32_t>(std::max<std::size_t>(1, sub.paragraphs.size()));
                 w.u32(pCount);
-                w.u32(listAttrFromVertAlign(sub.vertAlign));
+                w.u32(listAttrFromVertAlign(sub.vertAlign, sub.textDirection & 0x7u));
                 w.u32(sub.textWidth);
                 w.u32(sub.textHeight);
                 appendRecord(stream, tag::ListHeader, ctrlLevel + 1, w.view());
@@ -1445,7 +1485,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 const std::uint32_t pCount =
                     static_cast<std::uint32_t>(std::max<std::size_t>(1, sub.paragraphs.size()));
                 w.u32(pCount);
-                w.u32(listAttrFromVertAlign(sub.vertAlign));
+                w.u32(listAttrFromVertAlign(sub.vertAlign, sub.textDirection & 0x7u));
                 appendRecord(stream, tag::ListHeader, ctrlLevel + 1, w.view());
             }
             writeSubListParagraphs(stream, sub.paragraphs, ctrlLevel + 1, bins);
@@ -1538,7 +1578,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 const std::uint32_t pCount =
                     static_cast<std::uint32_t>(std::max<std::size_t>(1, sub.paragraphs.size()));
                 w.u32(pCount);
-                w.u32(listAttrFromVertAlign(sub.vertAlign));
+                w.u32(listAttrFromVertAlign(sub.vertAlign, sub.textDirection & 0x7u));
                 appendRecord(stream, tag::ListHeader, ctrlLevel + 1, w.view());
             }
             writeSubListParagraphs(stream, sub.paragraphs, ctrlLevel + 1, bins);
@@ -1688,6 +1728,14 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
     textWriter.u16(13);
     ++wcharPos;
 
+    // 형광펜 밖의 영역(글자 겹침·책갈피 등)은 읽은 그대로 다시 쓴다. 형광펜(종류 2)은 위에서 글자로부터 다시 만들었다.
+    std::vector<const TextRange*> keptRanges;
+    for (const TextRange& range : para.ranges) {
+        if (range.kind != 2) keptRanges.push_back(&range);
+    }
+    // 한글은 문단 머리의 영역 개수가 PARA_RANGE_TAG 의 항목 수와 다르면 파일을 열지 않는다.
+    const std::size_t rangeCount = markRanges.size() + keptRanges.size();
+
     // 1. ParaHeader
     {
         ByteWriter w;
@@ -1701,7 +1749,7 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
         if (para.columnBreak) brk |= 0x08u;
         w.u8(brk);
         w.u16(static_cast<std::uint16_t>(charShapeMap.size()));
-        w.u16(static_cast<std::uint16_t>(markRanges.size()));
+        w.u16(static_cast<std::uint16_t>(rangeCount));
         w.u16(static_cast<std::uint16_t>(para.lineSegs.size()));
         w.u32(0);
         w.u16(0);
@@ -1741,18 +1789,17 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
     }
 
     // 5. ParaRangeTag. 형광펜은 글자에서 다시 만들고, 그 외 종류는 읽어 둔 영역을 그대로 적는다.
-    if (!markRanges.empty() || !para.ranges.empty()) {
+    if (rangeCount > 0) {
         ByteWriter w;
         for (const auto& mr : markRanges) {
             w.u32(mr.start);
             w.u32(mr.end);
             w.u32((2u << 24) | (mr.colorRef24 & 0xFFFFFFu));
         }
-        for (const TextRange& range : para.ranges) {
-            if (range.kind == 2) continue;
-            w.u32(range.start);
-            w.u32(range.end);
-            w.u32((range.kind << 24) | (range.data & 0xFFFFFFu));
+        for (const TextRange* range : keptRanges) {
+            w.u32(range->start);
+            w.u32(range->end);
+            w.u32((range->kind << 24) | (range->data & 0xFFFFFFu));
         }
         appendRecord(stream, tag::ParaRangeTag, baseLevel + 1, w.view());
     }
@@ -1941,5 +1988,5 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
     return cfb.build(out, error);
 }
 
-}  // namespace noting::hwp
+}  // namespace chwp::hwp
 

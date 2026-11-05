@@ -1,24 +1,24 @@
-add_executable(noting_wasm noting_wasm.cpp)
-target_link_libraries(noting_wasm PRIVATE Noting::core)
-target_include_directories(noting_wasm PRIVATE ${CMAKE_SOURCE_DIR}/core/src)
+add_executable(chwp_wasm chwp_wasm.cpp)
+target_link_libraries(chwp_wasm PRIVATE chwp::core)
+target_include_directories(chwp_wasm PRIVATE ${CMAKE_SOURCE_DIR}/core/src)
 
-set_target_properties(noting_wasm PROPERTIES
-    OUTPUT_NAME "noting"
+set_target_properties(chwp_wasm PROPERTIES
+    OUTPUT_NAME "chwp"
     SUFFIX ".mjs")
 
-set(_noting_emdawn "${CMAKE_SOURCE_DIR}/build/skia/out/dawn-wasm/emdawnwebgpu_pkg/emdawnwebgpu.port.py")
+set(_chwp_emdawn "${CMAKE_SOURCE_DIR}/build/skia/out/dawn-wasm/emdawnwebgpu_pkg/emdawnwebgpu.port.py")
 # 링크 전에 JS 라이브러리를 고친다. Dawn 패키지를 다시 만들어도 같은 복사가 들어간다.
-add_custom_command(TARGET noting_wasm PRE_LINK
+add_custom_command(TARGET chwp_wasm PRE_LINK
     COMMAND python "${CMAKE_SOURCE_DIR}/bindings/wasm/patch-emdawn-heap.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     VERBATIM)
-target_compile_options(noting_wasm PRIVATE -fexceptions -pthread "SHELL:--use-port=${_noting_emdawn}")
-target_link_options(noting_wasm PRIVATE
+target_compile_options(chwp_wasm PRIVATE -fexceptions -pthread "SHELL:--use-port=${_chwp_emdawn}")
+target_link_options(chwp_wasm PRIVATE
     -lembind
-    "SHELL:--use-port=${_noting_emdawn}"
+    "SHELL:--use-port=${_chwp_emdawn}"
     "-sMODULARIZE=1"
     "-sEXPORT_ES6=1"
-    "-sEXPORT_NAME=createNotingModule"
+    "-sEXPORT_NAME=createChwpModule"
     "-sALLOW_MEMORY_GROWTH=1"
     # 1은 브라우저가 키울 수 있는 버퍼를 지원하면 쓰고, 없으면 예전 방식으로 는다.
     # 2로 올리면 경고는 사라지지만 파이어폭스 154 전에서는 메모리 증가가 깨진다.
@@ -33,34 +33,34 @@ target_link_options(noting_wasm PRIVATE
     "-sSTACK_SIZE=1048576"
     -fexceptions
     "-sFORCE_FILESYSTEM=1"
-    "SHELL:--preload-file ${NOTING_MICROTEX_RES_DIR}@/microtex-res")
+    "SHELL:--preload-file ${CHWP_MICROTEX_RES_DIR}@/microtex-res")
 
-if(TARGET Noting::core_single)
-    add_executable(noting_wasm_single noting_wasm.cpp)
-    target_link_libraries(noting_wasm_single PRIVATE Noting::core_single)
-    target_include_directories(noting_wasm_single PRIVATE ${CMAKE_SOURCE_DIR}/core/src)
+if(TARGET chwp::core_single)
+    add_executable(chwp_wasm_single chwp_wasm.cpp)
+    target_link_libraries(chwp_wasm_single PRIVATE chwp::core_single)
+    target_include_directories(chwp_wasm_single PRIVATE ${CMAKE_SOURCE_DIR}/core/src)
 
-    set_target_properties(noting_wasm_single PROPERTIES
-        OUTPUT_NAME "noting-single"
+    set_target_properties(chwp_wasm_single PROPERTIES
+        OUTPUT_NAME "chwp-single"
         SUFFIX ".mjs")
 
-    add_custom_command(TARGET noting_wasm_single PRE_LINK
+    add_custom_command(TARGET chwp_wasm_single PRE_LINK
         COMMAND python "${CMAKE_SOURCE_DIR}/bindings/wasm/patch-emdawn-heap.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         VERBATIM)
-    target_compile_options(noting_wasm_single PRIVATE -fexceptions "SHELL:--use-port=${_noting_emdawn}")
-    target_link_options(noting_wasm_single PRIVATE
+    target_compile_options(chwp_wasm_single PRIVATE -fexceptions "SHELL:--use-port=${_chwp_emdawn}")
+    target_link_options(chwp_wasm_single PRIVATE
         -lembind
-        "SHELL:--use-port=${_noting_emdawn}"
+        "SHELL:--use-port=${_chwp_emdawn}"
         "-sMODULARIZE=1"
         "-sEXPORT_ES6=1"
-        "-sEXPORT_NAME=createNotingModule"
+        "-sEXPORT_NAME=createChwpModule"
         "-sALLOW_MEMORY_GROWTH=1"
         "-sENVIRONMENT=web,worker,node"
         "-sSTACK_SIZE=1048576"
         -fexceptions
         "-sFORCE_FILESYSTEM=1"
-        "SHELL:--preload-file ${NOTING_MICROTEX_RES_DIR}@/microtex-res")
+        "SHELL:--preload-file ${CHWP_MICROTEX_RES_DIR}@/microtex-res")
 
-    add_dependencies(noting_wasm noting_wasm_single)
+    add_dependencies(chwp_wasm chwp_wasm_single)
 endif()

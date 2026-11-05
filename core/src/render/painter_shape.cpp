@@ -2,14 +2,14 @@
 
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
-#include "noting/common/unicode.hpp"
-#include "noting/reader.hpp"
-#include "noting/render/view.hpp"
+#include "chwp/common/unicode.hpp"
+#include "chwp/reader.hpp"
+#include "chwp/render/view.hpp"
 #include "render/equation_raster.hpp"
 
 // Painter: 도형과 수식: 경로, 둥근 상자, 타원
 
-namespace noting::render::paint_detail {
+namespace chwp::render::paint_detail {
 
 void Painter::stamp(int x, int y, int radius, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
     const int rr = radius * radius;
@@ -36,29 +36,29 @@ void Painter::thickLine(int x0, int y0, int x1, int y1, int thick, std::uint8_t 
 }
 
 void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place) {
-    if (node.points.size() < 2) return;
+    if (node.ext().obj().points.size() < 2) return;
     std::uint8_t r, g, b;
-    const bool stroke = !node.borderLeft.type.empty() && node.borderLeft.type != "NONE";
-    parseHex(node.borderLeft.color.empty() ? "#000000" : node.borderLeft.color, r, g, b);
-    const int thick = std::max(1, px(node.borderLeft.width > 0 ? node.borderLeft.width : 28));
-    const bool close = !node.fillColor.empty() && node.fillColor != "none";
+    const bool stroke = !node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE";
+    parseHex(node.ext().borderLeft.color.empty() ? "#000000" : node.ext().borderLeft.color, r, g, b);
+    const int thick = std::max(1, px(node.ext().borderLeft.width > 0 ? node.ext().borderLeft.width : 28));
+    const bool close = !node.ext().fillColor.empty() && node.ext().fillColor != "none";
     if (show(place) && close) {
         std::uint8_t fr, fg, fb;
-        parseHex(node.fillColor, fr, fg, fb);
-        int minY = px(y + node.points[0].y);
+        parseHex(node.ext().fillColor, fr, fg, fb);
+        int minY = px(y + node.ext().obj().points[0].y);
         int maxY = minY;
-        for (const auto& point : node.points) {
+        for (const auto& point : node.ext().obj().points) {
             const int py = px(y + point.y);
             minY = std::min(minY, py);
             maxY = std::max(maxY, py);
         }
-        const std::size_t count = node.points.size();
+        const std::size_t count = node.ext().obj().points.size();
         for (int scan = minY; scan <= maxY; ++scan) {
             std::vector<int> hits;
             for (std::size_t i = 0; i < count; ++i) {
-                const int x0 = px(x + node.points[i].x);
-                const int y0 = px(y + node.points[i].y);
-                const auto& next = node.points[(i + 1) % count];
+                const int x0 = px(x + node.ext().obj().points[i].x);
+                const int y0 = px(y + node.ext().obj().points[i].y);
+                const auto& next = node.ext().obj().points[(i + 1) % count];
                 const int x1 = px(x + next.x);
                 const int y1 = px(y + next.y);
                 if (y0 == y1 || scan < std::min(y0, y1) || scan >= std::max(y0, y1)) continue;
@@ -72,21 +72,20 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     }
     if (!show(frameStroke()) || !stroke) return;
     float intervals[8];
-    const int dashes = gdiDash(node.borderLeft, intervals);
-#if NOTING_HAS_SKIA
+    const int dashes = gdiDash(node.ext().borderLeft, intervals);
     if (dashes >= 2) {
         if (SkCanvas* canvas = this->canvas()) {
             SkPathBuilder path;
-            path.moveTo(static_cast<float>(px(x + node.points[0].x)), static_cast<float>(px(y + node.points[0].y)));
-            for (std::size_t i = 1; i < node.points.size(); ++i) {
-                path.lineTo(static_cast<float>(px(x + node.points[i].x)), static_cast<float>(px(y + node.points[i].y)));
+            path.moveTo(static_cast<float>(px(x + node.ext().obj().points[0].x)), static_cast<float>(px(y + node.ext().obj().points[0].y)));
+            for (std::size_t i = 1; i < node.ext().obj().points.size(); ++i) {
+                path.lineTo(static_cast<float>(px(x + node.ext().obj().points[i].x)), static_cast<float>(px(y + node.ext().obj().points[i].y)));
             }
             if (close) path.close();
             SkPaint paint;
             paint.setAntiAlias(true);
             paint.setStyle(SkPaint::kStroke_Style);
-            paint.setStrokeWidth(penPx(node.borderLeft));
-            const bool round = node.borderLeft.end == 0 || node.borderLeft.type == "CIRCLE";
+            paint.setStrokeWidth(penPx(node.ext().borderLeft));
+            const bool round = node.ext().borderLeft.end == 0 || node.ext().borderLeft.type == "CIRCLE";
             paint.setStrokeCap(round ? SkPaint::kRound_Cap : SkPaint::kButt_Cap);
             paint.setStrokeJoin(round ? SkPaint::kRound_Join : SkPaint::kMiter_Join);
             paint.setColor(SkColorSetARGB(255, r, g, b));
@@ -96,7 +95,6 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
             return;
         }
     }
-#endif
     const ClipSuspend open(bitmap);
     auto segment = [&](int x0, int y0, int x1, int y1) {
         if (dashes < 2) {
@@ -125,13 +123,13 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
             ++slot;
         }
     };
-    for (std::size_t i = 0; i + 1 < node.points.size(); ++i) {
-        segment(px(x + node.points[i].x), px(y + node.points[i].y), px(x + node.points[i + 1].x),
-                px(y + node.points[i + 1].y));
+    for (std::size_t i = 0; i + 1 < node.ext().obj().points.size(); ++i) {
+        segment(px(x + node.ext().obj().points[i].x), px(y + node.ext().obj().points[i].y), px(x + node.ext().obj().points[i + 1].x),
+                px(y + node.ext().obj().points[i + 1].y));
     }
     if (close) {
-        const auto& tail = node.points.back();
-        const auto& head = node.points.front();
+        const auto& tail = node.ext().obj().points.back();
+        const auto& head = node.ext().obj().points.front();
         segment(px(x + tail.x), px(y + tail.y), px(x + head.x), px(y + head.y));
     }
 }
@@ -141,15 +139,13 @@ void Painter::equation(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     const int dy = px(y);
     const int dw = std::max(1, px(x + node.width) - dx);
     const int dh = std::max(1, px(y + node.height) - dy);
-    const int baseline = node.baseLine < 0 ? -1 : (node.baseLine == 0 ? 85 : node.baseLine);
-#if NOTING_HAS_SKIA
+    const int baseline = node.ext().obj().baseLine < 0 ? -1 : (node.ext().obj().baseLine == 0 ? 85 : node.ext().obj().baseLine);
     if (SkCanvas* canvas = this->canvas()) {
-        if (paintHangulEquation(*canvas, node.script, dx, dy, dw, dh, baseline)) return;
+        if (paintHangulEquation(*canvas, node.ext().obj().script, dx, dy, dw, dh, baseline)) return;
     }
-#endif
-    const EquationRaster image = rasterHangulEquation(node.script, dw, dh, baseline);
+    const EquationRaster image = rasterHangulEquation(node.ext().obj().script, dw, dh, baseline);
     if (image.width <= 0 || image.height <= 0 || image.rgba.empty()) {
-        box(x, y, node.width, node.height, node.fillColor, node.borderLeft, node.role, place);
+        box(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, node.role, place);
         return;
     }
     const int ox = dx;
@@ -251,7 +247,6 @@ int Painter::dashPattern(const BorderEdge& edge, int* out) const {
 
 void Painter::roundBox(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h, int ratio, const std::string& fill,
                        const BorderEdge& edge, PaintLayer place) {
-#if NOTING_HAS_SKIA
     if (SkCanvas* canvas = this->canvas()) {
         const float x0 = static_cast<float>(px(x));
         const float y0 = static_cast<float>(px(y));
@@ -291,7 +286,6 @@ void Painter::roundBox(std::int32_t x, std::int32_t y, std::int32_t w, std::int3
         }
         return;
     }
-#endif
     const int x0 = px(x);
     const int y0 = px(y);
     const int pw = px(x + w) - x0;
@@ -362,7 +356,6 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
     if (show(place) && !fill.empty() && fill != "none") {
         std::uint8_t r, g, b;
         parseHex(fill, r, g, b);
-#if NOTING_HAS_SKIA
         if (SkCanvas* canvas = this->canvas()) {
             SkPaint paint;
             paint.setAntiAlias(true);
@@ -371,14 +364,12 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
                                                static_cast<float>(pw), static_cast<float>(ph)),
                               paint);
         } else
-#endif
             fillOval(x0, y0, pw, ph, r, g, b);
     }
     if (!show(frameStroke()) || edge.type.empty() || edge.type == "NONE") return;
     std::uint8_t r, g, b;
     parseHex(edge.color.empty() ? "#000000" : edge.color, r, g, b);
     const int thick = std::max(1, px(edge.width > 0 ? edge.width : 28));
-#if NOTING_HAS_SKIA
     if (SkCanvas* canvas = this->canvas()) {
         SkPaint paint;
         paint.setAntiAlias(true);
@@ -398,7 +389,6 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
         canvas->drawOval(SkRect::MakeLTRB(x0 + inset, y0 + inset, x0 + pw - inset, y0 + ph - inset), paint);
         return;
     }
-#endif
     const int grow = thick / 2;
     const int ox = x0 - grow;
     const int oy = y0 - grow;
@@ -433,16 +423,16 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
 
 void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
     const PaintLayer place = objectPlace(node);
-    if (node.shapeType == "ellipse" || node.shapeType == "arc") {
-        ellipseBox(x, y, node.width, node.height, node.fillColor, node.borderLeft, place);
+    if (node.ext().obj().shapeType == "ellipse" || node.ext().obj().shapeType == "arc") {
+        ellipseBox(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, place);
         return;
     }
-    const int ratio = node.cornerRatio > 50 ? 0 : node.cornerRatio;
-    if (ratio > 0 && node.points.size() < 2) {
-        roundBox(x, y, node.width, node.height, ratio, node.fillColor, node.borderLeft, place);
+    const int ratio = node.ext().obj().cornerRatio > 50 ? 0 : node.ext().obj().cornerRatio;
+    if (ratio > 0 && node.ext().obj().points.size() < 2) {
+        roundBox(x, y, node.width, node.height, ratio, node.ext().fillColor, node.ext().borderLeft, place);
         return;
     }
-    if (node.points.size() >= 2) {
+    if (node.ext().obj().points.size() >= 2) {
         drawPath(node, x, y, place);
         return;
     }
@@ -450,14 +440,14 @@ void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
         if (show(place)) equation(node, x, y, place);
         return;
     }
-    if (node.role == "picture" && !node.binItemId.empty()) {
+    if (node.role == "picture" && !node.ext().obj().binItemId.empty()) {
         if (show(place)) picture(node, x, y);
-        if (!node.borderLeft.type.empty() && node.borderLeft.type != "NONE" && node.borderLeft.width > 0) {
-            box(x, y, node.width, node.height, "", node.borderLeft, node.role, place);
+        if (!node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE" && node.ext().borderLeft.width > 0) {
+            box(x, y, node.width, node.height, "", node.ext().borderLeft, node.role, place);
         }
         return;
     }
-    box(x, y, node.width, node.height, node.fillColor, node.borderLeft, node.role, place);
+    box(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, node.role, place);
 }
 
-}  // namespace noting::render::paint_detail
+}  // namespace chwp::render::paint_detail

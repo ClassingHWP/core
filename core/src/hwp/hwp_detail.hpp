@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-#include "noting/common/bytes.hpp"
-#include "noting/model/document.hpp"
+#include "chwp/common/bytes.hpp"
+#include "chwp/model/document.hpp"
 
-namespace noting::hwp::detail {
+namespace chwp::hwp::detail {
 
 // 파라미터 셋 아이템 ID: 책갈피/필드 이름
 constexpr std::uint16_t kParamItemName = 0x4000;
@@ -41,4 +41,4 @@ private:
     std::size_t mismatches_ = 0;
 };
 
-}  // namespace noting::hwp::detail
+}  // namespace chwp::hwp::detail

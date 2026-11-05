@@ -1,4 +1,4 @@
-#include "noting/export/text.hpp"
+#include "chwp/export/text.hpp"
 
 #include <algorithm>
 #include <map>
@@ -7,11 +7,11 @@
 
 #include "export/layout.hpp"
 
-namespace noting {
+namespace chwp {
 
 namespace {
 
-using namespace noting::model;
+using namespace chwp::model;
 
 void ensureNewline(std::string& out) {
     if (!out.empty() && out.back() != '\n') out += '\n';
@@ -144,4 +144,4 @@ std::vector<std::string> documentToPages(const Document& doc, const TextOptions&
     return layout::paginate(doc, options);
 }
 
-}  // namespace noting
+}  // namespace chwp

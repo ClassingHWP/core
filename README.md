@@ -13,41 +13,15 @@ The C++ document engine of ClassingHWP, a browser-based viewer and editor for Ha
 
 두 화면의 쓰는 법과 다른 페이지에 넣는 법은 [ClassingHWP/web](https://github.com/ClassingHWP/web#보기-전용과-편집기) 에 있다.
 
-## WASM 사용 예제
-
-엔진은 웹 앱([ClassingHWP/web](https://github.com/ClassingHWP/web))처럼 브라우저에서 바로 부를 수 있다. [examples/wasm/index.html](examples/wasm/index.html) 은 엔진만 불러 문서를 열고, 쪽을 그림으로 그리고, 본문 글자를 뽑는 가장 작은 예제다. 빌드하지 않고 미리 빌드한 엔진으로 돌릴 수 있다.
-
-1. [릴리스](https://github.com/ClassingHWP/core/releases/latest) 에서 `classinghwp-wasm-<버전>.zip` 을 받아 `examples/wasm/` 에 푼다.
-2. 그 폴더를 정적 서버로 띄우고 브라우저로 연다.
-
-```bash
-npx serve examples/wasm
-```
-
-엔진을 부르는 순서는 이렇다.
-
-```js
-import createNotingModule from "./noting-single.mjs";
-
-const noting = await createNotingModule({ canvas: new OffscreenCanvas(64, 64) });
-noting.setFontCatalog(JSON.stringify(catalog));      // 글꼴 서버의 index.json
-const info = noting.openDocument(bytes);              // info.faces: 문서가 쓰는 글꼴
-noting.decodeFont([face], fontBytes);                 // 그 글꼴들을 받아 넣는다
-const plan = JSON.parse(noting.planDocument(true));   // 쪽 나누기. plan.count 쪽
-noting.warmGlyphs(page, percent);                     // 그 배율의 글자 윤곽 준비
-const frame = noting.renderPagePixels(page, 1100);    // RGBA 픽셀 { width, height, pixels }
-const text = noting.extractText(bytes);               // 본문 글자
-```
-
-`noting-single` 은 단일 스레드 판이라 아무 서버에서나 돈다. 여러 스레드 판(`noting.mjs`)은 페이지가 Cross-Origin-Isolation 헤더(`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` 또는 `credentialless`)를 보내야 한다.
-
 ## 구성
 
 | 폴더 | 내용 |
 |---|---|
 | `core/` | 문서 엔진. HWP·HWPX 읽기·쓰기, 조판, 그리기(Skia) |
 | `bindings/wasm/` | 엔진을 웹에서 부르는 WebAssembly 바인딩 |
-| `examples/wasm/` | 엔진을 브라우저에서 부르는 예제 |
+| `tools/chwp-agent/` | 에이전트 API 를 부르는 명령줄 도구(JSON 한 줄씩) |
+| `tools/chwp-dump/` | 문서 구조를 텍스트로 보는 명령줄 도구 |
+| `skills/chwp-agent/` | AI 에이전트가 `chwp-agent` 로 한글 문서를 읽고 고치게 하는 스킬 |
 | `docs/` | 문서 구조 분석과 설계 메모 |
 | `cmake/` | 빌드 설정과 의존성, Skia GN 설정(`cmake/skia/`) |
 
@@ -60,7 +34,7 @@ const text = noting.extractText(bytes);               // 본문 글자
 - [Emscripten](https://emscripten.org) 6.0.10 (emsdk) — WebAssembly 빌드
 - Python 3 — Skia 의존성 받기
 
-FreeType, miniz, pugixml, brotli, woff2, MicroTeX, TinyXML-2 는 CMake 가 처음 구성할 때 받아 온다(`cmake/NotingDependencies.cmake`, `cmake/NotingMicrotex.cmake`).
+FreeType, miniz, pugixml, brotli, woff2, MicroTeX, TinyXML-2 는 CMake 가 처음 구성할 때 받아 온다(`cmake/ChwpDependencies.cmake`, `cmake/ChwpMicrotex.cmake`).
 
 ### Skia
 
@@ -73,25 +47,28 @@ git checkout 5b1a7f7c06448e5d5f38f3c9360b18cae315576e
 python tools/git-sync-deps
 ```
 
-빌드 설정은 `cmake/skia/` 에 있다. 산출물 폴더 이름은 `cmake/NotingSkia.cmake` 가 찾는 이름과 같아야 한다.
+빌드 설정은 `cmake/skia/` 에 있다. 산출물 폴더 이름은 `cmake/ChwpSkia.cmake` 가 찾는 이름과 같아야 한다.
 
 | 대상 | 설정 파일 | 산출물 |
 |---|---|---|
-| WebAssembly | `cmake/skia/noting-wasm-pthread.gn` | `build/skia/out/noting-wasm-pthread/libskia.a` |
-| Windows (Debug) | `cmake/skia/noting-win.gn` | `build/skia/out/noting-win/skia.lib` |
+| WebAssembly | `cmake/skia/chwp-wasm-pthread.gn` | `build/skia/out/chwp-wasm-pthread/libskia.a` |
+| Windows (Debug, GPU) | `cmake/skia/chwp-win-dawn.gn` | `build/skia/out/chwp-win-dawn/skia.lib` |
+| Windows (Release, GPU) | `cmake/skia/chwp-win-dawn-release.gn` | `build/skia/out/chwp-win-dawn-release/skia.lib` |
+| Windows (GPU 없음) | `cmake/skia/chwp-win.gn`, `chwp-win-release.gn` | `build/skia/out/chwp-win/skia.lib` 등 |
+| Linux 정적(에이전트 패키지) | `cmake/skia/chwp-linux-musl.gn` | `build/skia/out/chwp-linux-musl/libskia.a` |
 
 ```bash
-mkdir -p out/noting-wasm-pthread
-cp ../../cmake/skia/noting-wasm-pthread.gn out/noting-wasm-pthread/args.gn   # skia_emsdk_dir 를 고친다
-bin/gn gen out/noting-wasm-pthread
-ninja -C out/noting-wasm-pthread skia
+mkdir -p out/chwp-wasm-pthread
+cp ../../cmake/skia/chwp-wasm-pthread.gn out/chwp-wasm-pthread/args.gn   # skia_emsdk_dir 를 고친다
+bin/gn gen out/chwp-wasm-pthread
+ninja -C out/chwp-wasm-pthread skia
 ```
 
 WebAssembly 빌드는 Skia 에 딸린 Dawn 의 WebGPU 헤더(`out/dawn-wasm/gen/src/emdawnwebgpu/include`)도 쓴다. 이 헤더를 만드는 순서는 아직 정리 중이다.
 
-### 네이티브 라이브러리
+### 네이티브
 
-엔진만 정적 라이브러리로 빌드한다.
+엔진 정적 라이브러리와 명령줄 도구(`chwp-agent`, `chwp-dump`)를 빌드한다. 도구를 빼려면 `-DCHWP_BUILD_TOOLS=OFF` 를 준다.
 
 ```bash
 cmake --preset windows-msvc
@@ -115,6 +92,19 @@ cmake --preset wasm-release
 cmake --build build/wasm-release
 ```
 
+### 에이전트 스킬
+
+`skills/chwp-agent/` 는 AI 에이전트(Claude 등)가 한글 문서를 열어 읽고, 찾고, 고치고, 쪽을 PNG 로 그려 보고, HWP·HWPX 로 저장하게 하는 스킬이다.
+스킬은 `chwp-agent` 실행 파일을 부른다. 저장소에서 쓸 때는 먼저 빌드한다.
+
+```bash
+cmake --build build/windows-msvc --config Release --target chwp-agent
+python skills/chwp-agent/scripts/chwp_agent.py 문서.hwp -c '{"call":"info"}'
+```
+
+부르는 법과 요청 모양은 [skills/chwp-agent/SKILL.md](skills/chwp-agent/SKILL.md), [reference.md](skills/chwp-agent/reference.md) 에 있다.
+claude.ai 에 올릴 스킬 묶음(Linux 정적 실행 파일 포함)은 `tools/chwp-agent/package-skill.py` 가 Docker 로 만든다.
+
 ### 웹 앱
 
 웹 앱은 [ClassingHWP/web](https://github.com/ClassingHWP/web) 저장소에 있다. 이 저장소를 서브모듈 `core/` 로 넣고, 여기서 빌드한 WASM(`build/wasm-release`)을 쓴다.
@@ -123,7 +113,7 @@ cmake --build build/wasm-release
 
 저장소에는 글꼴이 없다. 엔진은 글꼴을 직접 갖지 않고, 웹 앱이 글꼴 서버(`https://ede.kr/hwp/fonts/`)에서 받아 넘겨준다. 글꼴이 없으면 그 글꼴을 쓴 문서는 다른 글꼴로 그려져 줄 나눔이 달라질 수 있다.
 
-- 라이선스 때문에 내줄 수 없는 글꼴(한컴 전용 글꼴, 윈도우 글꼴 등)은 OFL 글꼴 하나의 곡선으로 만든 읽기용 대체 글꼴 `Noting Fallback NNN` 으로 보여 준다. 문서를 고치기 시작하면 그 원본 OFL 글꼴로 바뀐다.
+- 라이선스 때문에 내줄 수 없는 글꼴(한컴 전용 글꼴, 윈도우 글꼴 등)은 OFL 글꼴 하나의 곡선으로 만든 읽기용 대체 글꼴 `ClassingHWP Fallback NNN` 으로 보여 준다. 문서를 고치기 시작하면 그 원본 OFL 글꼴로 바뀐다.
 - 글꼴마다의 라이선스와 출처는 웹 앱의 **파일 → ClassingHWP 정보 → 글꼴** 에 있다.
 
 ## 라이선스
