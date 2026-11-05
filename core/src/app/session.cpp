@@ -4391,6 +4391,9 @@ std::string hoverCursor(double vx, double vy) {
 // 배율 대화 상자: 사용자 배율 한 걸음, 여러 쪽의 가장 큰 칸 수.
 constexpr int kZoomDialogStep = 10;
 constexpr int kZoomDialogMaxGrid = 8;
+// 여러 쪽의 처음 칸 수. 배율 대화 상자와 임베드의 view=grid 가 같이 쓴다.
+constexpr int kGridCols = 4;
+constexpr int kGridRows = 3;
 
 std::string zoomDialogSpec() {
     JsonWriter writer(false);
@@ -4402,8 +4405,8 @@ std::string zoomDialogSpec() {
     writer.field("step", kZoomDialogStep);
     writer.field("minPercent", 1);
     writer.field("maxGrid", kZoomDialogMaxGrid);
-    writer.field("cols", 4);
-    writer.field("rows", 3);
+    writer.field("cols", kGridCols);
+    writer.field("rows", kGridRows);
     writer.endObject();
     return writer.take();
 }
@@ -4437,6 +4440,177 @@ const std::vector<KeyBinding>& keyBindings() {
     }();
     return table;
 }
+
+namespace {
+
+// 앞뒤 빈칸을 떼고 작은 글자로.
+std::string embedWord(std::string_view text) {
+    std::size_t begin = 0;
+    std::size_t end = text.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
+    std::string out(text.substr(begin, end - begin));
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+// "150", "150%", "12.5" 같은 수. 끝의 % 는 percent 가 참일 때만 받는다.
+std::optional<double> embedNumber(std::string word, bool percent) {
+    if (percent && !word.empty() && word.back() == '%') {
+        word.pop_back();
+        while (!word.empty() && std::isspace(static_cast<unsigned char>(word.back()))) word.pop_back();
+    }
+    if (word.empty() || !(std::isdigit(static_cast<unsigned char>(word[0])) || word[0] == '.')) return std::nullopt;
+    char* end = nullptr;
+    const double n = std::strtod(word.c_str(), &end);
+    if (end != word.c_str() + word.size() || !std::isfinite(n)) return std::nullopt;
+    return n;
+}
+
+// 주소 인자 글의 %XX 와 + 를 푼다.
+std::string decodeQueryPart(std::string_view text) {
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '+') {
+            out.push_back(' ');
+        } else if (c == '%' && i + 2 < text.size() && hex(text[i + 1]) >= 0 && hex(text[i + 2]) >= 0) {
+            out.push_back(static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2])));
+            i += 2;
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+EmbedCommand parseEmbedCommand(const std::string& command, const std::string& value, int cols, int rows, int pageCount) {
+    EmbedCommand out;
+    const std::string name = embedWord(command);
+    const std::string word = embedWord(value);
+    if (name == "zoom") {
+        if (word == "page") {
+            out.kind = EmbedCommand::Kind::FitPage;
+        } else if (word == "width") {
+            out.kind = EmbedCommand::Kind::FitWidth;
+        } else if (word == "in" || word == "out") {
+            out.kind = EmbedCommand::Kind::ZoomStep;
+            out.value = word == "in" ? 1 : -1;
+        } else if (const auto n = embedNumber(word, true); n && *n >= 1) {
+            // 범위(10~800%)는 화면(PageView)이 자른다.
+            out.kind = EmbedCommand::Kind::Zoom;
+            out.value = static_cast<int>(std::lround(std::min(*n, 100000.0)));
+        }
+    } else if (name == "page") {
+        if (pageCount <= 0) return out;
+        if (word == "next" || word == "prev") {
+            out.kind = EmbedCommand::Kind::PageStep;
+            out.value = word == "next" ? 1 : -1;
+        } else if (word == "first" || word == "last") {
+            out.kind = EmbedCommand::Kind::Page;
+            out.value = word == "first" ? 0 : pageCount - 1;
+        } else if (const auto n = embedNumber(word, false); n && *n >= 1 && *n == std::floor(*n)) {
+            out.kind = EmbedCommand::Kind::Page;
+            out.value = static_cast<int>(std::min(*n, static_cast<double>(pageCount))) - 1;
+        }
+    } else if (name == "view") {
+        if (word == "auto" || word == "single" || word == "two" || word == "grid") {
+            out.kind = EmbedCommand::Kind::View;
+            out.view = parseGridMode(word);
+            if (out.view == chwp::render::PageGridMode::Grid) {
+                out.cols = cols > 0 ? std::min(cols, kZoomDialogMaxGrid) : kGridCols;
+                out.rows = rows > 0 ? std::min(rows, kZoomDialogMaxGrid) : kGridRows;
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCount) {
+    std::string_view rest(query);
+    if (!rest.empty() && rest.front() == '?') rest.remove_prefix(1);
+    std::string zoom, view, page;
+    int cols = 0;
+    int rows = 0;
+    while (!rest.empty()) {
+        const std::size_t amp = rest.find('&');
+        const std::string_view part = rest.substr(0, amp);
+        rest = amp == std::string_view::npos ? std::string_view() : rest.substr(amp + 1);
+        const std::size_t eq = part.find('=');
+        if (eq == std::string_view::npos) continue;
+        const std::string key = decodeQueryPart(part.substr(0, eq));
+        const std::string value = decodeQueryPart(part.substr(eq + 1));
+        if (key == "zoom") {
+            zoom = value;
+        } else if (key == "view") {
+            view = value;
+        } else if (key == "page") {
+            page = value;
+        } else if (key == "cols" || key == "rows") {
+            const auto n = embedNumber(embedWord(value), false);
+            (key == "cols" ? cols : rows) = n && *n >= 1 ? static_cast<int>(std::min(*n, 1000.0)) : 0;
+        }
+    }
+    // 쪽 모양이 맞춤 배율을 바꾸고, 배율이 쪽 자리를 바꾸므로 이 차례로 놓는다.
+    std::vector<EmbedCommand> out;
+    for (const EmbedCommand& command : {parseEmbedCommand("view", view, cols, rows, pageCount),
+                                        parseEmbedCommand("zoom", zoom, 0, 0, pageCount),
+                                        parseEmbedCommand("page", page, 0, 0, pageCount)}) {
+        if (command.kind != EmbedCommand::Kind::None) out.push_back(command);
+    }
+    return out;
+}
+
+namespace {
+
+// 쪽 왼쪽 위(눈금자 포함)가 화면 왼쪽 위에 오게 한다.
+chwp::input::Camera revealPageCamera(int page) {
+    const chwp::render::ViewPlan layout = gCamera.plan(false);
+    for (const chwp::render::ViewPage& item : layout.pages) {
+        if (item.index != page) continue;
+        return gInput.setScroll(gCamera, item.outerX() - layout.ruler, item.outerY() - layout.ruler);
+    }
+    return gInput.tick(gCamera, 0);
+}
+
+// glide 면 배율이 Ctrl+휠처럼 다가가고, 아니면(처음 열 때) 바로 바뀐다.
+chwp::input::Camera applyEmbed(const EmbedCommand& command, bool glide) {
+    switch (command.kind) {
+        case EmbedCommand::Kind::Zoom:
+            return glide ? gInput.glideZoom(gCamera, command.value) : gInput.setZoom(gCamera, command.value);
+        case EmbedCommand::Kind::FitPage: return gInput.fitPage(gCamera);
+        case EmbedCommand::Kind::FitWidth: return gInput.fitWidth(gCamera);
+        case EmbedCommand::Kind::ZoomStep: {
+            const int target = chwp::input::zoomLadderStep(gCamera.state().percent, command.value);
+            return glide ? gInput.glideZoom(gCamera, target) : gInput.setZoom(gCamera, target);
+        }
+        case EmbedCommand::Kind::Page: return revealPageCamera(command.value);
+        case EmbedCommand::Kind::PageStep: {
+            // 화면 한 장(PageDown)이 아니라 쪽 한 줄씩 간다. 한 줄에 여러 쪽이면 그 수만큼 넘는다.
+            const chwp::render::ViewportState now = gCamera.state();
+            const int last = static_cast<int>(gDoc.pages.size()) - 1;
+            const int here = currentCameraPage(now.scrollX, now.scrollY, now.percent);
+            const int step = std::max(1, gCamera.effectiveCols());
+            return revealPageCamera(std::clamp(here + command.value * step, 0, std::max(0, last)));
+        }
+        case EmbedCommand::Kind::View:
+            return gInput.setGridMode(gCamera, command.view, command.cols, command.rows,
+                                      command.view == chwp::render::PageGridMode::Grid);
+        case EmbedCommand::Kind::None:
+        default: return gInput.tick(gCamera, 0);
+    }
+}
+
+}  // namespace
 
 InputReport input(const InputMessage& msg) {
     const std::string& type = msg.type;
@@ -4537,16 +4711,21 @@ InputReport input(const InputMessage& msg) {
         camera.zoomChanged = after.percent != before.percent || after.fitPage != before.fitPage || after.fitWidth != before.fitWidth;
         camera.handled = true;
     } else if (type == "revealPage") {
-        const int page = msg.page;
-        const chwp::render::ViewPlan layout = gCamera.plan(false);
-        bool found = false;
-        for (const chwp::render::ViewPage& item : layout.pages) {
-            if (item.index != page) continue;
-            camera = gInput.setScroll(gCamera, item.outerX() - layout.ruler, item.outerY() - layout.ruler);
-            found = true;
-            break;
+        camera = revealPageCamera(msg.page);
+    } else if (type == "embed") {
+        const int pageCount = static_cast<int>(gDoc.pages.size());
+        camera = applyEmbed(parseEmbedCommand(msg.mode, msg.choice, msg.cols, msg.rows, pageCount), true);
+    } else if (type == "embedOpen") {
+        // 여러 명령의 바뀜을 모아 한 번에 알린다.
+        const chwp::render::ViewportState before = gCamera.state();
+        camera = gInput.tick(gCamera, 0);
+        for (const EmbedCommand& command : parseEmbedQuery(msg.choice, static_cast<int>(gDoc.pages.size()))) {
+            camera = applyEmbed(command, false);
         }
-        if (!found) camera = gInput.tick(gCamera, 0);
+        const chwp::render::ViewportState after = gCamera.state();
+        camera.scrollChanged = after.scrollX != before.scrollX || after.scrollY != before.scrollY;
+        camera.zoomChanged = after.percent != before.percent || after.fitPage != before.fitPage || after.fitWidth != before.fitWidth;
+        camera.handled = true;
     } else if (type == "zoom") {
         camera = gInput.glideZoom(gCamera, msg.percent ? *msg.percent : gCamera.state().percent);
     } else if (type == "zoomStep") {

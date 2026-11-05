@@ -334,7 +334,7 @@ struct InputPointer {
     int button = 0;
 };
 // type: pointer, pointers, wheel, wheelRaw, gesture, tick, scroll, viewport, revealPage, zoom, zoomStep, pageStep, pageUp, pageDown,
-// fit, grid, pins, readOnly, rulers. 각 종류는 쓰는 칸만 읽는다.
+// fit, grid, pins, readOnly, rulers, embed, embedOpen. 각 종류는 쓰는 칸만 읽는다.
 struct InputMessage {
     std::string type;
     InputPointer pointer;
@@ -426,5 +426,24 @@ const std::vector<KeyBinding>& keyBindings();
 // 처음 칸 수. 적용은 input "zoomDialog" 하나로 보낸다(쪽 모양과 배율을 함께 core 가 정한다).
 std::string zoomDialogSpec();
 std::string hoverCursor(double vx, double vy);
+
+// ---- 임베드
+// 다른 페이지에 넣은 보기(웹 iframe 등)가 받은 명령. 셸은 받은 글을 그대로 넘기고, 뜻과 범위는 core 가 정한다.
+//   zoom: "150", "150%", "page"(쪽 맞춤), "width"(폭 맞춤), "in", "out"
+//   page: 쪽 번호(1부터, 넘치면 끝 쪽), "next", "prev"(쪽 한 줄씩), "first", "last"
+//   view: "auto", "single", "two", "grid"(cols·rows 를 함께 준다)
+// 알 수 없는 명령이나 값이면 kind 가 None 이다. 적용은 input "embed"(mode 명령, choice 값, cols·rows)로 보낸다.
+struct EmbedCommand {
+    enum class Kind { None, Zoom, FitPage, FitWidth, ZoomStep, Page, PageStep, View };
+    Kind kind = Kind::None;
+    int value = 0;  // Zoom: 배율, ZoomStep·PageStep: 방향(±1), Page: 0부터 센 쪽
+    render::PageGridMode view = render::PageGridMode::Auto;
+    int cols = 1;
+    int rows = 1;
+};
+EmbedCommand parseEmbedCommand(const std::string& command, const std::string& value, int cols, int rows, int pageCount);
+// 처음 열 때의 주소 인자("?file=…&view=two&zoom=150&page=3"). 쪽 모양, 배율, 쪽 차례로 적용할 명령을 준다.
+// 모르는 인자는 건너뛴다. 적용은 input "embedOpen"(choice 에 인자 글)으로 보낸다.
+std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCount);
 
 }  // namespace chwp::app
