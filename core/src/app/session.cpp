@@ -628,6 +628,8 @@ chwp::input::PointerInput gInput;
 chwp::input::WheelReader gWheel;
 // 사용자가 켠 눈금자. 셸이 저장해 둔 값을 넘기고, 없으면 켠다.
 bool gRulersWanted = true;
+// 보기 화면의 편집 단추. 넣은 페이지가 임베드 명령으로 켠다.
+bool gEditButton = false;
 // 쪽 그림(renderPagePng·renderPagePixels)을 그린 높이. 바뀌면 그린 그림을 버린다.
 int gPixelHeight = 0;
 int gLastPageGap = 0;
@@ -4531,6 +4533,14 @@ EmbedCommand parseEmbedCommand(const std::string& command, const std::string& va
                 out.rows = rows > 0 ? std::min(rows, kZoomDialogMaxGrid) : kGridRows;
             }
         }
+    } else if (name == "edit") {
+        if (word == "true" || word == "1" || word == "show") {
+            out.kind = EmbedCommand::Kind::EditButton;
+            out.value = 1;
+        } else if (word == "false" || word == "0" || word == "hide") {
+            out.kind = EmbedCommand::Kind::EditButton;
+            out.value = 0;
+        }
     }
     return out;
 }
@@ -4538,7 +4548,7 @@ EmbedCommand parseEmbedCommand(const std::string& command, const std::string& va
 std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCount) {
     std::string_view rest(query);
     if (!rest.empty() && rest.front() == '?') rest.remove_prefix(1);
-    std::string zoom, view, page;
+    std::string zoom, view, page, edit;
     int cols = 0;
     int rows = 0;
     while (!rest.empty()) {
@@ -4555,6 +4565,8 @@ std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCoun
             view = value;
         } else if (key == "page") {
             page = value;
+        } else if (key == "edit") {
+            edit = value;
         } else if (key == "cols" || key == "rows") {
             const auto n = embedNumber(embedWord(value), false);
             (key == "cols" ? cols : rows) = n && *n >= 1 ? static_cast<int>(std::min(*n, 1000.0)) : 0;
@@ -4562,7 +4574,8 @@ std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCoun
     }
     // 쪽 모양이 맞춤 배율을 바꾸고, 배율이 쪽 자리를 바꾸므로 이 차례로 놓는다.
     std::vector<EmbedCommand> out;
-    for (const EmbedCommand& command : {parseEmbedCommand("view", view, cols, rows, pageCount),
+    for (const EmbedCommand& command : {parseEmbedCommand("edit", edit, 0, 0, pageCount),
+                                        parseEmbedCommand("view", view, cols, rows, pageCount),
                                         parseEmbedCommand("zoom", zoom, 0, 0, pageCount),
                                         parseEmbedCommand("page", page, 0, 0, pageCount)}) {
         if (command.kind != EmbedCommand::Kind::None) out.push_back(command);
@@ -4605,6 +4618,9 @@ chwp::input::Camera applyEmbed(const EmbedCommand& command, bool glide) {
         case EmbedCommand::Kind::View:
             return gInput.setGridMode(gCamera, command.view, command.cols, command.rows,
                                       command.view == chwp::render::PageGridMode::Grid);
+        case EmbedCommand::Kind::EditButton:
+            gEditButton = command.value != 0;
+            return gInput.tick(gCamera, 0);
         case EmbedCommand::Kind::None:
         default: return gInput.tick(gCamera, 0);
     }
@@ -4800,6 +4816,7 @@ InputReport input(const InputMessage& msg) {
     out.ownsScroll = inputOwnsScroll();
     out.settled = inputSettled();
     out.rulersWanted = gRulersWanted;
+    out.editButton = gEditButton;
     out.needsTick = gInput.coasting() || gWheel.pending();
     if (type == "pointer" || type == "pointers") {
         out.pointer = true;

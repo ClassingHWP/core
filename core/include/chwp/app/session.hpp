@@ -403,6 +403,8 @@ struct InputReport {
     double tapSlop = input::ViewportInput::kTapSlop;
     // 사용자가 켠 눈금자 값(처음은 켬). 보기 전용이면 이 값과 달리 숨긴다. 셸은 이 값을 메뉴에 보이고 저장한다.
     bool rulersWanted = true;
+    // 보기 화면에 편집 단추를 보인다. 처음은 숨기고, 임베드 명령 edit 로 켠다.
+    bool editButton = false;
     bool pointer = false;  // pointer·pointers 면 selection 을 붙인다
     SelectionReport selection;
 };
@@ -432,17 +434,18 @@ std::string hoverCursor(double vx, double vy);
 //   zoom: "150", "150%", "page"(쪽 맞춤), "width"(폭 맞춤), "in", "out"
 //   page: 쪽 번호(1부터, 넘치면 끝 쪽), "next", "prev"(쪽 한 줄씩), "first", "last"
 //   view: "auto", "single", "two", "grid"(cols·rows 를 함께 준다)
+//   edit: "true"·"1"·"show"(편집 단추를 보임), "false"·"0"·"hide"(숨김)
 // 알 수 없는 명령이나 값이면 kind 가 None 이다. 적용은 input "embed"(mode 명령, choice 값, cols·rows)로 보낸다.
 struct EmbedCommand {
-    enum class Kind { None, Zoom, FitPage, FitWidth, ZoomStep, Page, PageStep, View };
+    enum class Kind { None, Zoom, FitPage, FitWidth, ZoomStep, Page, PageStep, View, EditButton };
     Kind kind = Kind::None;
-    int value = 0;  // Zoom: 배율, ZoomStep·PageStep: 방향(±1), Page: 0부터 센 쪽
+    int value = 0;  // Zoom: 배율, ZoomStep·PageStep: 방향(±1), Page: 0부터 센 쪽, EditButton: 1 보임·0 숨김
     render::PageGridMode view = render::PageGridMode::Auto;
     int cols = 1;
     int rows = 1;
 };
 EmbedCommand parseEmbedCommand(const std::string& command, const std::string& value, int cols, int rows, int pageCount);
-// 처음 열 때의 주소 인자("?file=…&view=two&zoom=150&page=3"). 쪽 모양, 배율, 쪽 차례로 적용할 명령을 준다.
+// 처음 열 때의 주소 인자("?file=…&view=two&zoom=150&page=3&edit=1"). 편집 단추, 쪽 모양, 배율, 쪽 차례로 적용할 명령을 준다.
 // 모르는 인자는 건너뛴다. 적용은 input "embedOpen"(choice 에 인자 글)으로 보낸다.
 std::vector<EmbedCommand> parseEmbedQuery(const std::string& query, int pageCount);
 

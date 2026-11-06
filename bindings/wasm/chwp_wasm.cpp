@@ -491,6 +491,7 @@ val packInput(const app::InputReport& report) {
     out.set("needsTick", report.needsTick);
     out.set("tapSlop", report.tapSlop);
     out.set("rulersWanted", report.rulersWanted);
+    out.set("editButton", report.editButton);
     out.set("scrollChanged", camera.scrollChanged);
     out.set("zoomChanged", camera.zoomChanged);
     out.set("coasting", camera.coasting);
