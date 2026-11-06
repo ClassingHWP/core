@@ -110,7 +110,23 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 ### undo / redo
 `{"call":"undo"}` → `{"done":true,"pages":14}`. apply 하나가 한 번이다. 같은 실행 안에서만 된다.
 
-## 글꼴 (CLI 옵션)
+## 글꼴
+
+스크립트(`scripts/chwp_agent.py`)가 글꼴 서버에서 목록과 파일을 받아 캐시에 넣고, 실행 파일에 `--font-dir` 로 넘긴다.
+
+| 환경 변수 | 뜻 |
+|---|---|
+| `CHWP_FONT_BASE` | 글꼴 서버(기본 `https://ede.kr/hwp/fonts/`). 목록과 글꼴 파일(`<폴더>/<파일>`)을 여기서 받는다 |
+| `CHWP_FONT_CACHE` | 캐시 폴더(기본 `~/.cache/chwp-agent/fonts`) |
+| `CHWP_FONT_INDEX` | `index.json` 대신 쓸 글꼴 목록. 파일 경로나 주소 |
+| `CHWP_FONT_LICENSE_SWAP` | `license-swap.json`(라이선스로 막힌 글꼴의 대역) 대신 쓸 것 |
+| `CHWP_FONT_REPLACE` | `replace.json`(이름 바꾸기) 대신 쓸 것 |
+
+목록은 실행마다 서버에 바뀌었는지 묻고(ETag), 바뀌었을 때만 새로 받는다. 받지 못하면 캐시에 있는 목록을 쓴다.
+서버 목록을 받아 고친 파일을 `CHWP_FONT_INDEX` 로 주면, 목록은 그것을 쓰고 글꼴 파일은 `CHWP_FONT_BASE` 에서 받는다.
+글꼴 파일은 한 번 받으면 다시 받지 않는다.
+
+### CLI 옵션
 
 스크립트가 대신 하므로 보통은 쓸 일이 없다.
 

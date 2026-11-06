@@ -28,7 +28,9 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
   내려받을 수 있는 출력 폴더에 저장한다.
 - **글꼴은 스크립트가 알아서 받는다.** 문서를 열기 전에 core 가 필요한 글꼴 파일을 정하고, 스크립트가 그것만
   글꼴 서버(`https://ede.kr/hwp/fonts/`, `CHWP_FONT_BASE` 로 바꿈)에서 받아 캐시(`~/.cache/chwp-agent/fonts`,
-  `CHWP_FONT_CACHE`)에 넣는다. 한 번 받은 것은 다시 받지 않는다. 네트워크가 막힌 곳에서는 `--no-font-fetch` 로 캐시만 쓴다.
+  `CHWP_FONT_CACHE`)에 넣는다. 글꼴 파일은 한 번 받으면 다시 받지 않고, 글꼴 목록(`index.json` 등)은 실행마다
+  바뀌었는지만 묻는다. 고친 목록을 쓰려면 `CHWP_FONT_INDEX`·`CHWP_FONT_LICENSE_SWAP`·`CHWP_FONT_REPLACE` 에 파일 경로나
+  주소를 준다(reference.md 의 글꼴). 네트워크가 막힌 곳에서는 `--no-font-fetch` 로 캐시만 쓴다.
 - `{"call":"info"}` 의 `missingFonts` 가 비어 있지 않으면 그 글꼴은 대체 글꼴로 재고 그렸다. 줄 나눔·그림이 한글과
   다를 수 있다고 사용자에게 알린다.
 - 라이선스로 막힌 글꼴(서버에 폭만 있는 글꼴)이 든 문서를 고치면, 편집기와 같이 편집 앞에 대역 원본 글꼴로 바꾼다.
