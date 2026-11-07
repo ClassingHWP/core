@@ -32,8 +32,7 @@ target_link_options(chwp_wasm PRIVATE
     # Emscripten 기본값(64KB)으로는 모자란다. 그리는 스레드와 같은 크기로 둔다.
     "-sSTACK_SIZE=1048576"
     -fexceptions
-    "-sFORCE_FILESYSTEM=1"
-    "SHELL:--preload-file ${CHWP_MICROTEX_RES_DIR}@/microtex-res")
+    "-sFORCE_FILESYSTEM=1")
 
 if(TARGET chwp::core_single)
     add_executable(chwp_wasm_single chwp_wasm.cpp)
@@ -59,8 +58,7 @@ if(TARGET chwp::core_single)
         "-sENVIRONMENT=web,worker,node"
         "-sSTACK_SIZE=1048576"
         -fexceptions
-        "-sFORCE_FILESYSTEM=1"
-        "SHELL:--preload-file ${CHWP_MICROTEX_RES_DIR}@/microtex-res")
+        "-sFORCE_FILESYSTEM=1")
 
     add_dependencies(chwp_wasm chwp_wasm_single)
 endif()

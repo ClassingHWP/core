@@ -5,7 +5,7 @@
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
+#include "render/equation_draw.hpp"
 
 // Painter: 도형과 수식: 경로, 둥근 상자, 타원
 
@@ -134,28 +134,35 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     }
 }
 
-void Painter::equation(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place) {
-    const int dx = px(x);
-    const int dy = px(y);
-    const int dw = std::max(1, px(x + node.width) - dx);
-    const int dh = std::max(1, px(y + node.height) - dy);
-    const int baseline = node.ext().obj().baseLine < 0 ? -1 : (node.ext().obj().baseLine == 0 ? 85 : node.ext().obj().baseLine);
-    if (SkCanvas* canvas = this->canvas()) {
-        if (paintHangulEquation(*canvas, node.ext().obj().script, dx, dy, dw, dh, baseline)) return;
-    }
-    const EquationRaster image = rasterHangulEquation(node.ext().obj().script, dw, dh, baseline);
-    if (image.width <= 0 || image.height <= 0 || image.rgba.empty()) {
-        box(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, node.role, place);
-        return;
-    }
-    const int ox = dx;
-    const int oy = dy;
-    for (int row = 0; row < image.height; ++row) {
-        const std::uint8_t* src = image.rgba.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(image.width) * 4u;
-        for (int col = 0; col < image.width; ++col) {
-            blend(bitmap, ox + col, oy + row, src[0], src[1], src[2], src[3]);
-            src += 4;
+void Painter::equation(const Node& node, std::int32_t x, std::int32_t y, PaintLayer) {
+    // 놓을 것은 한글 수식 엔진과 같은 자리다. 잰 크기를 개체 상자에 맞춰 늘린다(크기가 같으면 그대로).
+    // 수식 글꼴 윤곽이 아직 없으면(웹에서 글꼴을 받는 중이면) 그리지 않는다. 글꼴이 오면 다시 그린다.
+    EquationSize measured;
+    const auto inks = cachedEquationInk(node.ext().obj().script, node.ext().obj().eqBaseUnit, node.ext().obj().eqFont,
+                                        measured);
+    SkCanvas* canvas = this->canvas();
+    if (!inks || inks->empty() || measured.width <= 0 || measured.height <= 0 || !canvas) return;
+    const float ox = glyphPx(x);
+    const float oy = glyphPx(y);
+    const float kx = (glyphPx(x + node.width) - ox) / static_cast<float>(measured.width);
+    const float ky = (glyphPx(y + node.height) - oy) / static_cast<float>(measured.height);
+    for (const EquationInk& ink : *inks) {
+        const std::uint8_t r = static_cast<std::uint8_t>(ink.color >> 16);
+        const std::uint8_t g = static_cast<std::uint8_t>(ink.color >> 8);
+        const std::uint8_t b = static_cast<std::uint8_t>(ink.color);
+        if (ink.kind == EquationInk::Kind::Rect) {
+            SkPaint paint;
+            paint.setAntiAlias(true);
+            paint.setColor(SkColorSetARGB(255, r, g, b));
+            canvas->drawRect(SkRect::MakeXYWH(ox + ink.x * kx, oy + ink.y * ky, ink.width * kx,
+                                              std::max(ink.height * ky, 1.f)),
+                             paint);
+            continue;
         }
+        // 윤곽 점 하나는 1/kEquationInkUnit HWPUNIT 이다. 가로 배율을 em 으로, 세로는 fitY 로 준다.
+        const float unitX = kx / static_cast<float>(kEquationInkUnit);
+        const int fitY = static_cast<int>(std::lround(1000.f * ky / kx));
+        paintGlyph(ink.commands, unitX * 1000.f, 100, 1000, fitY, ox, oy, r, g, b, ink.stroke * (kx + ky) / 2.f);
     }
 }
 

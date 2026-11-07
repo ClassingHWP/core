@@ -21,6 +21,12 @@
 
 #include <woff2/decode.h>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_DRIVER_H
+#include FT_MODULE_H
+#include FT_OUTLINE_H
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -80,6 +86,7 @@ struct Metrics {
     std::uint16_t winAscent = 0;
     std::uint16_t winDescent = 0;
     std::int16_t ascender = 0;
+    std::int16_t descender = 0;
     std::uint16_t weight = 400;
     std::uint16_t numHMetrics = 0;
     std::uint32_t hmtx = 0;
@@ -366,6 +373,7 @@ bool parseMetrics(std::shared_ptr<const std::vector<std::uint8_t>> sharedData, s
         out.winDescent = u16(data.data() + os2 + 0x4C);
     }
     out.ascender = i16(data.data() + hhea + 4);
+    out.descender = i16(data.data() + hhea + 6);
     out.numHMetrics = u16(data.data() + hhea + 34);
     out.hmtx = hmtx;
     if (out.unitsPerEm == 0 || out.numHMetrics == 0) return false;
@@ -1778,6 +1786,226 @@ bool fontCopyDesignAdvances(const std::string& face, std::uint16_t& unitsPerEm, 
     return true;
 }
 
+namespace {
+
+// 정사각 크기 진행폭을 FreeType 으로 재는 글꼴 하나. 글꼴 바이트를 붙잡아 두어 FT_Face 가 그 바이트를 계속 본다.
+struct GridFace {
+    std::shared_ptr<const std::vector<std::uint8_t>> data;
+    FT_Face face = nullptr;
+    FT_UInt ppem = 0;
+    bool failed = false;
+    std::unordered_map<std::uint64_t, std::int32_t> advance;  // (ppem << 32) | 글리프
+};
+
+FT_Library gGridLibrary = nullptr;
+std::unordered_map<const Metrics*, GridFace> gGridFaces;
+
+const std::uint8_t* fontDirectory(const Metrics& font, std::uint16_t& count) {
+    count = 0;
+    if (!font.data || !inRange(*font.data, font.fontOffset, 12)) return nullptr;
+    const std::uint8_t* dir = font.data->data() + font.fontOffset;
+    count = u16(dir + 4);
+    if (!inRange(*font.data, font.fontOffset, 12u + count * 16u)) {
+        count = 0;
+        return nullptr;
+    }
+    return dir;
+}
+
+// 글꼴 원본인지. 윤곽(glyf)이나 내장 비트맵(EBLC)이 있어야 GDI 처럼 잴 수 있다. 폭 정보 파일에는 없다.
+bool hasGlyphPrograms(const Metrics& font) {
+    std::uint16_t count = 0;
+    const std::uint8_t* dir = fontDirectory(font, count);
+    return dir && (tableOffset(dir, count, "glyf") != 0 || tableOffset(dir, count, "EBLC") != 0);
+}
+
+// TTC 안 글꼴의 번호. FreeType 은 오프셋이 아니라 번호로 연다.
+FT_Long collectionIndex(const Metrics& font) {
+    const auto& bytes = *font.data;
+    if (font.fontOffset == 0 || !inRange(bytes, 0, 12) || std::memcmp(bytes.data(), "ttcf", 4) != 0) return 0;
+    const std::uint32_t count = u32(bytes.data() + 8);
+    for (std::uint32_t i = 0; i < count && inRange(bytes, 12 + i * 4, 4); ++i) {
+        if (u32(bytes.data() + 12 + i * 4) == font.fontOffset) return static_cast<FT_Long>(i);
+    }
+    return 0;
+}
+
+// GDI 는 정사각 크기에서 TrueType 힌팅 명령을 돌린 진행폭을 쓰고, 그 크기에 내장 비트맵이 있으면 비트맵 폭을 쓴다.
+// FreeType 의 v35 실행기가 같은 값을 낸다(HancomEQN·HYhwpEQ 5~300px 41만여 칸, 한컴바탕 기호 모두 GDI 와 같다).
+// 기본 실행기(v40)는 가로 힌팅을 하지 않아 HancomEQN 에서 6천여 칸이 다르다.
+// remember 가 거짓이면 잰 값을 담아 두지 않는다. 표를 만들 때는 칸이 수백만이라 담지 않는다.
+std::int32_t hintedAdvance(const Metrics& font, int glyph, std::int32_t ppem, bool remember) {
+    if (glyph <= 0 || ppem <= 0 || ppem > 0xFFFF || !openData(font) || !hasGlyphPrograms(font)) return -1;
+    GridFace& grid = gGridFaces[&font];
+    const std::uint64_t key = (static_cast<std::uint64_t>(ppem) << 32) | static_cast<std::uint32_t>(glyph);
+    if (const auto found = grid.advance.find(key); found != grid.advance.end()) return found->second;
+    if (grid.failed) return -1;
+    if (!grid.face) {
+        if (!gGridLibrary) {
+            if (FT_Init_FreeType(&gGridLibrary) != 0) {
+                gGridLibrary = nullptr;
+                grid.failed = true;
+                return -1;
+            }
+            FT_UInt version = TT_INTERPRETER_VERSION_35;
+            FT_Property_Set(gGridLibrary, "truetype", "interpreter-version", &version);
+        }
+        grid.data = font.data;
+        if (FT_New_Memory_Face(gGridLibrary, grid.data->data(), static_cast<FT_Long>(grid.data->size()),
+                               collectionIndex(font), &grid.face) != 0) {
+            grid.face = nullptr;
+            grid.failed = true;
+            return -1;
+        }
+    }
+    if (grid.ppem != static_cast<FT_UInt>(ppem)) {
+        if (FT_Set_Pixel_Sizes(grid.face, 0, static_cast<FT_UInt>(ppem)) != 0) return -1;
+        grid.ppem = static_cast<FT_UInt>(ppem);
+    }
+    std::int32_t px = -1;
+    if (FT_Load_Glyph(grid.face, static_cast<FT_UInt>(glyph), FT_LOAD_DEFAULT) == 0) {
+        px = static_cast<std::int32_t>((grid.face->glyph->advance.x + 32) >> 6);
+    }
+    if (remember) grid.advance.emplace(key, px);
+    return px;
+}
+
+// 폭 정보 파일의 CHgw 표: u16 판, u16 다룬 가장 큰 ppem, u32 칸 수, 칸마다 u32 코드 · u16 ppem · u16 진행폭(픽셀).
+// 칸은 (코드, ppem) 오름차순이다. 힌팅 없는 식과 다른 칸만 든다.
+constexpr std::uint32_t kGridHeader = 8;
+constexpr std::uint32_t kGridCell = 8;
+
+bool hasGridTable(const Metrics& font) {
+    std::uint16_t count = 0;
+    const std::uint8_t* dir = fontDirectory(font, count);
+    return dir && tableOffset(dir, count, "CHgw") != 0;
+}
+
+std::int32_t gridTableAdvance(const Metrics& font, char32_t cp, std::int32_t ppem) {
+    if (!openData(font)) return -1;
+    std::uint16_t count = 0;
+    const std::uint8_t* dir = fontDirectory(font, count);
+    if (!dir) return -1;
+    const std::uint32_t table = tableOffset(dir, count, "CHgw");
+    const std::uint32_t length = tableLength(dir, count, "CHgw");
+    const auto& bytes = *font.data;
+    if (!table || length < kGridHeader || !inRange(bytes, table, length)) return -1;
+    const std::uint8_t* p = bytes.data() + table;
+    if (u16(p) != 1 || ppem > u16(p + 2)) return -1;
+    const std::uint32_t cells = std::min(u32(p + 4), (length - kGridHeader) / kGridCell);
+    const std::uint64_t want = (static_cast<std::uint64_t>(cp) << 16) | static_cast<std::uint16_t>(ppem);
+    std::uint32_t lo = 0;
+    std::uint32_t hi = cells;
+    while (lo < hi) {
+        const std::uint32_t mid = lo + (hi - lo) / 2;
+        const std::uint8_t* cell = p + kGridHeader + mid * kGridCell;
+        const std::uint64_t at = (static_cast<std::uint64_t>(u32(cell)) << 16) | u16(cell + 4);
+        if (at == want) return u16(cell + 6);
+        if (at < want) lo = mid + 1;
+        else hi = mid;
+    }
+    return -1;
+}
+
+}  // namespace
+
+std::int32_t fontGridAdvancePx(const std::string& face, char32_t cp, std::int32_t ppem) {
+    if (face.empty() || ppem <= 0) return -1;
+    const FontWhyFallback why("폭", cp, &face);
+    std::lock_guard lock(gMutex);
+    const Metrics* metrics = metricsFor(face);
+    if (!metrics || !openData(*metrics)) return -1;
+    // 수식 폴백 글꼴처럼 윤곽은 있어도 원래 글꼴의 힌팅이 없는 파일은 원래 글꼴로 잰 CHgw 표를 따른다.
+    if (hasGlyphPrograms(*metrics) && !hasGridTable(*metrics)) {
+        return hintedAdvance(*metrics, lookupGlyph(*metrics, cp), ppem, true);
+    }
+    return gridTableAdvance(*metrics, cp, ppem);
+}
+
+std::int32_t fontHintedAdvancePx(const std::string& face, char32_t cp, std::int32_t ppem) {
+    if (face.empty() || ppem <= 0) return -1;
+    const FontWhyFallback why("폭", cp, &face);
+    std::lock_guard lock(gMutex);
+    const Metrics* metrics = metricsFor(face);
+    if (!metrics) return -1;
+    return hintedAdvance(*metrics, lookupGlyph(*metrics, cp), ppem, false);
+}
+
+namespace {
+
+// 원본 윤곽의 상자. 힌팅·크기 없이 디자인 단위로 연다. 윤곽이 없거나 비면 거짓.
+bool outlineInkBox(const Metrics& font, int glyph, FontInkBox& box) {
+    if (glyph <= 0 || !openData(font) || !hasGlyphPrograms(font)) return false;
+    hintedAdvance(font, glyph, 16, false);  // FT_Face 를 연다
+    GridFace& grid = gGridFaces[&font];
+    if (!grid.face) return false;
+    if (FT_Load_Glyph(grid.face, static_cast<FT_UInt>(glyph), FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) != 0)
+        return false;
+    const FT_Outline& outline = grid.face->glyph->outline;
+    if (grid.face->glyph->format != FT_GLYPH_FORMAT_OUTLINE || outline.n_points <= 0) return false;
+    FT_BBox bbox{};
+    FT_Outline_Get_CBox(&outline, &bbox);
+    box.xMin = static_cast<std::int32_t>(bbox.xMin);
+    box.yMin = static_cast<std::int32_t>(bbox.yMin);
+    box.xMax = static_cast<std::int32_t>(bbox.xMax);
+    box.yMax = static_cast<std::int32_t>(bbox.yMax);
+    return box.xMax > box.xMin || box.yMax > box.yMin;
+}
+
+}  // namespace
+
+bool fontGlyphInkBox(const std::string& face, char32_t cp, FontInkBox& box) {
+    if (face.empty()) return false;
+    std::lock_guard lock(gMutex);
+    const Metrics* metrics = metricsFor(face);
+    if (!metrics || !openData(*metrics)) return false;
+    return outlineInkBox(*metrics, lookupGlyph(*metrics, cp), box);
+}
+
+std::vector<std::uint8_t> fontGridTable(std::vector<FontGridCell> cells, std::int32_t maxPpem) {
+    std::sort(cells.begin(), cells.end(), [](const FontGridCell& a, const FontGridCell& b) {
+        return a.codePoint != b.codePoint ? a.codePoint < b.codePoint : a.ppem < b.ppem;
+    });
+    std::vector<std::uint8_t> out;
+    out.reserve(kGridHeader + cells.size() * kGridCell);
+    const auto put16 = [&](std::uint32_t v) {
+        out.push_back(static_cast<std::uint8_t>(v >> 8));
+        out.push_back(static_cast<std::uint8_t>(v));
+    };
+    const auto put32 = [&](std::uint32_t v) {
+        put16(v >> 16);
+        put16(v & 0xFFFF);
+    };
+    put16(1);
+    put16(static_cast<std::uint32_t>(std::clamp(maxPpem, 0, 0xFFFF)));
+    put32(static_cast<std::uint32_t>(cells.size()));
+    for (const FontGridCell& cell : cells) {
+        put32(static_cast<std::uint32_t>(cell.codePoint));
+        put16(static_cast<std::uint32_t>(cell.ppem));
+        put16(static_cast<std::uint32_t>(cell.advancePx));
+    }
+    return out;
+}
+
+bool fontWinMetrics(const std::string& face, std::int32_t& ascent, std::int32_t& descent) {
+    ascent = 0;
+    descent = 0;
+    if (face.empty()) return false;
+    const FontWhyFallback why("폭", 0, &face);
+    std::lock_guard lock(gMutex);
+    const Metrics* metrics = metricsFor(face);
+    if (!metrics) return false;
+    // OS/2 가 없는 폭 정보 파일은 hhea 값을 쓴다. 수식 글꼴과 바탕 계열은 두 값이 같다.
+    if (metrics->winAscent + metrics->winDescent > 0) {
+        ascent = metrics->winAscent;
+        descent = metrics->winDescent;
+    } else {
+        ascent = std::max<std::int32_t>(metrics->ascender, 0);
+        descent = std::max<std::int32_t>(-static_cast<std::int32_t>(metrics->descender), 0);
+    }
+    return ascent + descent > 0;
+}
+
 std::int32_t fontBaseline(const std::string& face, std::int32_t em) {
     if (face.empty() || em <= 0) return -1;
     const FontWhyFallback why("기준선", 0, &face);
@@ -1922,6 +2150,7 @@ struct UsedFaces {
     std::unordered_map<std::string, UsedFace> faces;
     std::vector<std::string> order;  // 처음 만난 차례
     bool nameless = false;           // 글꼴 이름이 없는 글자. 그리기가 함초롬바탕으로 간다
+    std::vector<std::string> equationFaces;  // 수식을 재고 그리는 수식 글꼴
 };
 
 bool nextUtf8(const std::string& text, std::size_t& i, char32_t& out) {
@@ -2068,6 +2297,18 @@ void useParagraphs(const model::Document& doc, const std::vector<model::Paragrap
                     // 각주·미주·쪽 번호는 그 런 글자 모양의 숫자와 장식으로 찍는다.
                     useText(doc, run.charShapeId, "0123456789()-.ivxIVX" + control.prefix + control.suffix, false, out);
                     break;
+                case model::ControlKind::Equation: {
+                    // 수식은 고른 수식 글꼴로 재고 그리며, 그 글꼴에 없는 글자는 HyhwpEQ·HancomEQN 에서 찾는다
+                    // (render/equation_draw symbolFaces). 받을 차례도 같다. 이름이 비면 HyhwpEQ 다.
+                    const std::string chosen = control.equationFont.empty() || control.equationFont == "HYhwpEQ"
+                                                   ? std::string("HyhwpEQ")
+                                                   : control.equationFont;
+                    for (const std::string& face : {chosen, std::string("HyhwpEQ"), std::string("HancomEQN")}) {
+                        if (std::find(out.equationFaces.begin(), out.equationFaces.end(), face) == out.equationFaces.end())
+                            out.equationFaces.push_back(face);
+                    }
+                    break;
+                }
                 case model::ControlKind::Dutmal:
                 case model::ControlKind::Compose:
                     useText(doc, run.charShapeId, control.text, false, out);
@@ -2112,6 +2353,7 @@ std::vector<std::string> documentFontFaces(const model::Document& doc) {
         const std::string path = fontCatalogPath(replaced.empty() ? face : replaced);
         if (path.rfind("full/", 0) != 0 && path.rfind("standin/", 0) != 0) batang = true;
     }
+    for (const std::string& face : used.equationFaces) add(face);
     if (batang) add("함초롬바탕");
     return out;
 }

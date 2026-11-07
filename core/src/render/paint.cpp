@@ -39,7 +39,7 @@
 #include "chwp/unit.hpp"
 #include "chwp/render/scene.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
+#include "render/equation_draw.hpp"
 #include "render/line_breaker.hpp"
 #include "render/page_texture_cache.hpp"
 #include "render/paint_detail.hpp"
@@ -805,6 +805,11 @@ bool ftCommands(const std::string& face, char32_t cp, bool bold, bool designedBo
         return false;
     }
     return ftDecompose(it->second, cp, commands);
+}
+
+bool faceGlyphCommands(const std::string& face, char32_t cp, std::vector<GlyphCommand>& commands) {
+    commands.clear();
+    return ftCommands(face, cp, false, false, commands);
 }
 
 struct OutlineKey {
@@ -3926,7 +3931,7 @@ void clearPageRenderCache() {
         std::lock_guard lock(gLineWarnMu);
         gLineWarnSeen.clear();
     }
-    clearEquationRasterCache();
+    clearEquationInkCache();
     clearSelectionSheets();
 }
 

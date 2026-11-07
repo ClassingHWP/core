@@ -15,8 +15,6 @@ ClassingHWP 문서 엔진에 들어가는 다른 사람의 코드와 글꼴이�
 | [WOFF2](https://github.com/google/woff2) | 1.0.2 | MIT | Copyright (c) 2013-2017 by the WOFF2 Authors. |
 | [miniz](https://github.com/richgel999/miniz) | 3.0.2 | MIT | Copyright 2013-2014 RAD Game Tools and Valve Software |
 | [pugixml](https://pugixml.org) | 1.14 | MIT | Copyright (c) 2006-2023 Arseny Kapoulkine |
-| [MicroTeX](https://github.com/NanoMichael/MicroTeX) | `0e3707f6` | MIT | Copyright (c) 2020 Nano Michael |
-| [TinyXML-2](https://github.com/leethomason/tinyxml2) | 10.0.0 | zlib | Lee Thomason |
 | [LZ4](https://github.com/lz4/lz4) (`core/third_party/lz4`) | — | BSD-2-Clause | Copyright (C) 2011-2023, Yann Collet. |
 | [stb](https://github.com/nothings/stb) (`core/third_party/stb`) | — | MIT 또는 퍼블릭 도메인 | Copyright (c) 2017 Sean Barrett |
 | [Emscripten](https://emscripten.org) 런타임 | 6.0.10 | MIT | Copyright (c) 2010-2014 Emscripten authors |

@@ -5,7 +5,6 @@
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
 
 // Painter: 캐럿과 선택: 글자 경계, 줄 찾기, 선택 칸, 복사
 

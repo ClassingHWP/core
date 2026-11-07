@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude.ai 에 올릴 chwp-agent 스킬 ZIP 을 만든다.
 
-Linux x86_64 정적 실행 파일을 Docker(alpine) 안에서 빌드하고, MicroTeX 수식 리소스와 함께 스킬 폴더의 bin/ 에 넣어
+Linux x86_64 정적 실행 파일을 Docker(alpine) 안에서 빌드하고, 스킬 폴더의 bin/ 에 넣어
 chwp-agent.zip 으로 묶는다. ZIP 안 맨 위는 chwp-agent/ 폴더이고, 실행 파일에는 실행 권한을 붙인다.
 
 core 는 Skia 로 그리므로 같은 alpine 에서 GPU 없는 Skia 정적 라이브러리(build/skia/out/chwp-linux-musl)를 먼저 만든다.
@@ -60,7 +60,6 @@ cmake -S . -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHWP_BUILD_TESTS=OFF -DCM
 cmake --build /b --target chwp-agent >>/b.log 2>&1 || { grep -E 'error|Error' /b.log | head -30 >&2; exit 1; }
 strip /b/tools/chwp-agent/chwp-agent
 mkdir -p /pkg && cp /b/tools/chwp-agent/chwp-agent /pkg/
-cp -r /b/_deps/microtex-src/res /pkg/microtex-res && rm -f /pkg/microtex-res/SAMPLES.tex
 cd /pkg && tar cf - .
 """
 

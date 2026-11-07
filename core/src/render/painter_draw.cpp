@@ -5,7 +5,6 @@
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
 
 // Painter: 그리기 바탕: 잘라내기, 글리프, 상자, 그림
 
@@ -305,7 +304,7 @@ SkCanvas* Painter::canvas() {
 }
 
 void Painter::paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, int ratio, int fitX, int fitY, float penX,
-                         float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+                         float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b, float strokePx) {
     if (commands.empty() || emPx <= 0.f) return;
     const float unit = emPx / 1000.f;
     const float sy = unit * static_cast<float>(std::max(1, fitY)) / 1000.f;
@@ -333,7 +332,8 @@ void Painter::paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, 
         }
         SkPaint paint;
         paint.setAntiAlias(true);
-        paint.setStyle(SkPaint::kFill_Style);
+        paint.setStyle(strokePx > 0.f ? SkPaint::kStrokeAndFill_Style : SkPaint::kFill_Style);
+        if (strokePx > 0.f) paint.setStrokeWidth(strokePx);
         paint.setColor(SkColorSetARGB(255, r, g, b));
         canvas->drawPath(path.detach(), paint);
     }

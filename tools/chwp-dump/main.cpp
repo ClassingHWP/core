@@ -18,7 +18,6 @@
 #include "chwp/reader.hpp"
 #include "chwp/unit.hpp"
 #include "chwp/writer.hpp"
-#include "render/equation_latex.hpp"
 #include "render/equation_layout.hpp"
 #include "chwp/render/paint.hpp"
 
@@ -489,7 +488,6 @@ void dumpOneEquation(const Control& control, int& index, std::ostream& os) {
        << ",\"eqnW\":" << hancom.width
        << ",\"eqnH\":" << hancom.height
        << ",\"eqnBase\":" << hancom.baseLine
-       << ",\"latex\":\"" << jsonEscape(render::hangulEquationToLatex(control.script)) << "\""
        << ",\"script\":\"" << jsonEscape(control.script) << "\"}\n";
 }
 

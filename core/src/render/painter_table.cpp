@@ -5,7 +5,6 @@
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
 
 // Painter: 표 테두리와 칸 꾸밈, 대각선
 

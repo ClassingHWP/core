@@ -169,8 +169,8 @@ int main(int argc, char** argv) {
             fontDir = argv[++i];
         } else if (arg == "--font-plan") {
             fontPlanOnly = true;
-        } else if (arg == "--tex-res" && i + 1 < argc) {
-            chwp::agent::setEquationResources(argv[++i]);
+        } else if (arg == "--verbose") {
+            // takeStdoutForReplies 앞에서 이미 봤다.
         } else if (arg == "--save" && i + 1 < argc) {
             save = argv[++i];
         } else if (arg == "--out-dir" && i + 1 < argc) {

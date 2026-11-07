@@ -34,11 +34,43 @@ std::int32_t fontXAvgCharWidth(const std::string& face);
 // OS/2 usWinAscent + usWinDescent. 표가 없으면 0.
 std::int32_t fontWinCell(const std::string& face);
 
+// OS/2 usWinAscent·usWinDescent. 표가 없으면 hhea 위·아래. 글꼴이 없으면 거짓.
+bool fontWinMetrics(const std::string& face, std::int32_t& ascent, std::int32_t& descent);
+
 // 글꼴 파일의 디자인 진행폭을 코드 포인트마다 sink 로 넘긴다. 파일이 없으면 거짓.
 // unitsPerEm, xAvgCharWidth, winCell 도 채운다. sink 의 advance 는 hmtx 값이고 0 이상이다.
 bool fontCopyDesignAdvances(const std::string& face, std::uint16_t& unitsPerEm, std::int32_t& xAvgCharWidth,
                             std::int32_t& winCell, void (*sink)(void* ctx, char32_t cp, std::int32_t advance),
                             void* ctx);
+
+// 가로·세로 배율이 같은 크기(ppem)에서 GDI 가 쓰는 글자 진행폭(픽셀).
+// 글꼴 원본이 있으면 FreeType v35 실행기로 힌팅 명령을 돌린다(그 크기에 내장 비트맵이 있으면 비트맵 폭).
+// 폭 정보 파일이나 CHgw 표를 담은 폴백 글꼴(윤곽은 있어도 원래 힌팅이 없다)이면 그 표를 본다. 표에 없는 칸과 모르는 글꼴은 -1 이고, 부르는 쪽이 힌팅 없는 식을 쓴다.
+std::int32_t fontGridAdvancePx(const std::string& face, char32_t codePoint, std::int32_t ppem);
+
+// fontGridAdvancePx 의 원본 쪽만. 원본이 아니면 -1. CHgw 표를 만들 때 쓴다.
+std::int32_t fontHintedAdvancePx(const std::string& face, char32_t codePoint, std::int32_t ppem);
+
+// 글자 잉크 상자. 디자인 단위이고 y 는 기준선에서 위로 잰다.
+struct FontInkBox {
+    std::int32_t xMin = 0;
+    std::int32_t yMin = 0;
+    std::int32_t xMax = 0;
+    std::int32_t yMax = 0;
+};
+
+// 글꼴 원본의 윤곽에서 읽는다. 폭 정보 파일(윤곽 없음), 윤곽이 없는 글자(공백), 모르는 글자는 거짓.
+bool fontGlyphInkBox(const std::string& face, char32_t codePoint, FontInkBox& box);
+
+// CHgw 표 한 칸. 힌팅 없는 식과 다른 진행폭이다.
+struct FontGridCell {
+    char32_t codePoint = 0;
+    std::int32_t ppem = 0;
+    std::int32_t advancePx = 0;
+};
+
+// CHgw 표 바이트. maxPpem 까지 잰 표라는 뜻이고, 그보다 큰 크기는 표가 모른다(-1).
+std::vector<std::uint8_t> fontGridTable(std::vector<FontGridCell> cells, std::int32_t maxPpem);
 
 // 글꼴에 어울리는 줄 높이의 기준선. em 글자 상자 위에서 글꼴 어센더까지.
 // 반올림은 0에서 멀어지게. 글꼴 파일이 없으면 -1.

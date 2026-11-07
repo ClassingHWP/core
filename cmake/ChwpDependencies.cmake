@@ -96,8 +96,6 @@ if(EMSCRIPTEN)
     target_compile_options(chwp_freetype_single PRIVATE -w)
 endif()
 
-include(ChwpMicrotex)
-
 # WOFF2 는 셸이 넘긴 바이트를 코어 메모리의 sfnt 로 푼다. 주소는 코어가 모른다.
 FetchContent_Declare(brotli
     URL https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz

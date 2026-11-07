@@ -5,7 +5,6 @@
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
-#include "render/equation_raster.hpp"
 #include "render/line_breaker.hpp"
 
 // Painter: 줄 그리기: 글자 표시, 글자 꾸밈, 문단 꾸밈, 조판 보고, 트리 순회

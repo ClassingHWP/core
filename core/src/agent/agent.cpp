@@ -24,7 +24,6 @@
 #include "chwp/render/scene.hpp"
 #include "chwp/writer.hpp"
 #include "export/font_metrics.hpp"
-#include "render/equation_raster.hpp"
 #include "render/paint_detail.hpp"
 
 // 에이전트 API 구현. 판정·조판·편집은 render 쪽 함수를 그대로 부르고, 여기서는 입구 검사와 모양 바꾸기만 한다.
@@ -887,7 +886,6 @@ void setFontCatalog(const std::string& index, const std::string& licenseSwap, co
     layout::setFontReplacements(replace.empty() ? "{}" : replace);
 }
 
-void setEquationResources(const std::string& dir) { render::setEquationResourceDir(dir); }
 
 std::vector<FontFile> AgentDocument::fontPlan() {
     // 편집기와 같은 목록이다: 문서 글자에 쓰인 글꼴, 편집이 부른 글꼴(DocSession::takeFontWants),

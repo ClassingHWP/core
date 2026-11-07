@@ -52,10 +52,8 @@ set(_chwp_core_sources
     src/render/page_texture_cache.cpp
     src/render/lz4_blob.cpp
     third_party/lz4/lz4.c
-    src/render/equation_latex.cpp
+    src/render/equation_draw.cpp
     src/render/equation_layout.cpp
-    src/render/equation_raster.cpp
-    src/render/microtex_graphics.cpp
     src/export/font_metrics.cpp
     src/agent/agent.cpp
     src/agent/agent_call.cpp
@@ -77,7 +75,7 @@ target_compile_features(chwp_core PUBLIC cxx_std_20)
 
 target_link_libraries(chwp_core
     PUBLIC  chwp::compiler_options
-    PRIVATE chwp::miniz chwp::pugixml chwp::microtex chwp::woff2 freetype)
+    PRIVATE chwp::miniz chwp::pugixml chwp::woff2 freetype)
 if(NOT EMSCRIPTEN)
     find_package(Threads REQUIRED)
     target_link_libraries(chwp_core PRIVATE Threads::Threads)
@@ -95,7 +93,6 @@ if(NOT MSVC)
     set_source_files_properties(src/render/screen_op_canvas.cpp PROPERTIES COMPILE_OPTIONS -fno-rtti)
 endif()
 if(EMSCRIPTEN)
-    target_compile_definitions(chwp_core PRIVATE "CHWP_MICROTEX_RES=\"/microtex-res\"")
     target_compile_options(chwp_core PRIVATE -fexceptions -pthread)
     if(CHWP_HAS_SKIA)
         # Graphite Dawn 헤더. 브라우저 WebGPU 심볼은 chwp_wasm 링크의 emdawnwebgpu 포트가 채운다.
@@ -115,16 +112,12 @@ if(EMSCRIPTEN)
         target_compile_features(chwp_core_single PUBLIC cxx_std_20)
         target_link_libraries(chwp_core_single
             PUBLIC  chwp::compiler_options
-            PRIVATE chwp::miniz_single chwp::pugixml_single chwp::microtex_single chwp_freetype_single chwp::woff2_single chwp::skia_single)
+            PRIVATE chwp::miniz_single chwp::pugixml_single chwp_freetype_single chwp::woff2_single chwp::skia_single)
         target_include_directories(chwp_core_single SYSTEM PRIVATE
             "${CMAKE_SOURCE_DIR}/build/skia"
             "${CMAKE_SOURCE_DIR}/build/skia/out/dawn-wasm/gen/src/emdawnwebgpu/include"
             "${CMAKE_SOURCE_DIR}/build/skia/third_party/externals/dawn/include")
-        target_compile_definitions(chwp_core_single PRIVATE
-            CHWP_HAS_SKIA=1
-            "CHWP_MICROTEX_RES=\"/microtex-res\"")
+        target_compile_definitions(chwp_core_single PRIVATE CHWP_HAS_SKIA=1)
         target_compile_options(chwp_core_single PRIVATE -fexceptions)
     endif()
-else()
-    target_compile_definitions(chwp_core PRIVATE "CHWP_MICROTEX_RES=\"${CHWP_MICROTEX_RES_DIR}\"")
 endif()

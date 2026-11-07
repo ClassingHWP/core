@@ -1254,6 +1254,8 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
         node.extMut().objMut().eqWidth = measured.width;
         node.extMut().objMut().eqHeight = measured.height;
         node.extMut().objMut().eqBase = measured.baseLine;
+        node.extMut().objMut().eqBaseUnit = control.baseUnit;
+        node.extMut().objMut().eqFont = control.equationFont;
         attachCaption(node, control, doc, depth, defaultTab, useStoredLineHeight, deferSpans);
         return node;
     } else node.role = "shape";

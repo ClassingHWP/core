@@ -611,7 +611,7 @@ struct Control {
     std::string script;           // Equation (한글 수식 스크립트)
     int baseLine = -1;            // 수식 상자 높이의 퍼센트. 0은 85. 없으면 -1. 조판에 쓴다
     std::int32_t baseUnit = 1000; // 수식 글자 크기. 1000 = 10pt. 측정에만 쓴다
-    std::string equationFont;     // 수식 글꼴. 비어 있으면 HYhwpEQ. 측정에만 쓴다
+    std::string equationFont;     // 수식 글꼴. 비어 있으면 HYhwpEQ. 재기와 그리기에 쓴다
     int fileBaseLine = -1;        // 파일 기준선. 조판 baseLine과 따로 요소 비교에만 쓴다
     std::string applyPageType;    // Header/Footer: BOTH, EVEN, ODD
     std::string numType;          // AutoNumber/NewNumber: PAGE, FOOTNOTE ...

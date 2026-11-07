@@ -288,7 +288,7 @@ struct ObjectExtra {
     int anchorStory = -1;
     int anchorParagraph = -1;
     int anchorItem = -1;  // 그 문단 runs 의 항목을 차례로 센 번호. 문서의 그 컨트롤이다
-    std::string script;     // 수식 스크립트. 그리기는 상자 크기에 맞춘 MicroTeX
+    std::string script;     // 수식 스크립트. 그리기는 layoutHangulEquation 이 놓은 자리를 상자 크기에 맞춘다
     Name binItemId;  // 그림 파일 참조
     model::PictureView picture;
     std::int32_t zOrder = 0;
@@ -304,6 +304,8 @@ struct ObjectExtra {
     std::int32_t eqWidth = 0;      // measureHangulEquation 너비. 조판 상자는 width 그대로다
     std::int32_t eqHeight = 0;
     int eqBase = -1;               // 측정 기준선 퍼센트. 재지 않았으면 -1
+    std::int32_t eqBaseUnit = 1000;  // 수식 글자 크기(1000 = 10pt). 그릴 때 다시 놓는다
+    std::string eqFont;              // 수식 글꼴. 비어 있으면 HYhwpEQ
     int fileEqBase = -1;           // 파일 기준선. 요소 비교용이고 조판에는 안 쓴다
     std::int32_t fileWidth = 0;
     std::int32_t fileHeight = 0;

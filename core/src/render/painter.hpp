@@ -548,8 +548,9 @@ struct Painter {
     SkCanvas* canvas();
 
     // 윤곽은 이미 한글 방식으로 편 직선이다. Skia 가 있으면 그 직선을 채우고, 없으면 우리 스캔라인이 채운다.
+    // strokePx 가 0 보다 크면 윤곽 둘레에 그 굵기의 선을 함께 긋는다(굵게 흉내).
     void paintGlyph(const std::vector<GlyphCommand>& commands, float emPx, int ratio, int fitX, int fitY, float penX,
-                    float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b);
+                    float baseY, std::uint8_t r, std::uint8_t g, std::uint8_t b, float strokePx = 0.f);
 
     int px(std::int32_t hu) const { return static_cast<int>(hu * scale + (hu < 0 ? -0.5f : 0.5f)); }
 

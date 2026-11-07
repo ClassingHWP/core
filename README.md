@@ -34,7 +34,7 @@ The C++ document engine of ClassingHWP, a browser-based viewer and editor for Ha
 - [Emscripten](https://emscripten.org) 6.0.10 (emsdk) — WebAssembly 빌드
 - Python 3 — Skia 의존성 받기
 
-FreeType, miniz, pugixml, brotli, woff2, MicroTeX, TinyXML-2 는 CMake 가 처음 구성할 때 받아 온다(`cmake/ChwpDependencies.cmake`, `cmake/ChwpMicrotex.cmake`).
+FreeType, miniz, pugixml, brotli, woff2 는 CMake 가 처음 구성할 때 받아 온다(`cmake/ChwpDependencies.cmake`).
 
 ### Skia
 

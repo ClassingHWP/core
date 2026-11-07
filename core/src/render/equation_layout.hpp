@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace chwp::render {
 
@@ -17,10 +19,15 @@ struct EquationSize {
 // 수식 상자 너비에 쓰는 글꼴 수치. TTF를 열지 않는다.
 // advanceWidth 는 유니코드에서 hmtx 진행폭(디자인 단위)이다.
 // unitsPerEm, xAvgCharWidth, winCell(usWinAscent + usWinDescent)은 그 글꼴의 가로 픽셀 식에 들어간다.
+// face 는 정사각 크기에서 힌팅·내장 비트맵 폭(layout::fontGridAdvancePx)을 찾을 글꼴 이름이다. 비면 식만 쓴다.
 struct EquationFont {
+    std::string face;
     std::int32_t unitsPerEm = 0;
     std::int32_t xAvgCharWidth = 0;
     std::int32_t winCell = 0;
+    // usWinAscent·usWinDescent. 대체 글꼴로 잰 글자의 상자 높이(GDI tmHeight + tmInternalLeading)에 쓴다.
+    std::int32_t winAscent = 0;
+    std::int32_t winDescent = 0;
     std::unordered_map<char32_t, std::int32_t> advanceWidth;
 };
 
@@ -48,5 +55,51 @@ EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUni
 // 10pt x_2 는 높이 1177, 기준선 72%다.
 EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUnit,
                                    std::string_view symbolFont = "HYhwpEQ");
+
+// 글꼴 원본으로 정사각 크기(높이 1~maxHeightPx)마다 힌팅·내장 비트맵이 바꾼 글자 진행폭을 모아
+// 폭 정보 파일에 넣을 CHgw 표를 만든다. 힌팅 없는 식과 같은 칸은 넣지 않는다. 원본이 없으면 빈 값이다.
+std::vector<std::uint8_t> equationGridTable(std::string_view face, std::int32_t maxHeightPx);
+
+// 수식 안에 놓을 것 하나. 자리는 수식 상자 왼쪽 위에서 잰 HWPUNIT 이고 y 는 아래로 자란다.
+// 크기를 잰 판단(measureHangulEquation)이 그대로 낸 자리다. 무엇으로 어떻게 그릴지는 그리는 쪽이 정한다.
+struct EquationItem {
+    enum class Kind {
+        Glyph,    // 글자 하나. x·y·width·height 는 그 글자 칸(진행폭 × 글자 높이)이다
+        Rule,     // 선. 분수선, 근호 윗줄, box 테두리. 칸이 곧 칠할 사각형이다
+        Fence,    // 늘어나는 울타리. 칸 높이만큼 늘려 그린다. cp 가 0 이면 그리지 않는다
+        Radical,  // 근호 기호. 칸 높이만큼 늘려 그린다. 윗줄은 따로 Rule 이다
+        Accent,   // 구조가 그리는 장식. 글자 위(아래) 꾸밈 띠(bar·under 는 선, vec·dyad 는 화살표, 그 밖은 기호), not 의 사선, 사다리의 ⋯, 중괄호
+    };
+    enum class Face {
+        Symbol,  // 수식 글꼴(HancomEQN·HYhwpEQ 자리)
+        Roman,   // 본문 글꼴. 따옴표 글, 한글, lim
+    };
+    Kind kind = Kind::Glyph;
+    Face face = Face::Symbol;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::int32_t em = 0;      // 그 자리의 글자 크기(HWPUNIT, 1000 = 10pt)
+    char32_t cp = 0;          // 뜻으로 본 유니코드 글자(기울임 a 도 'a' 다)
+    char32_t hwpCode = 0;     // 한글 수식 글꼴에서 잰 코드(사용자 영역일 수 있다). 그릴 때도 이 코드의 윤곽을 쓴다
+    bool italic = false;
+    bool bold = false;
+    bool under = false;       // Accent 가 글자 아래에 붙는다
+    std::int32_t raise = 0;   // Glyph: 그릴 때 기준선을 이만큼(HWPUNIT) 올린다
+    std::uint32_t color = 0xFF000000u;  // 0xRRGGBB. 맨 위 바이트가 있으면 수식 글자색을 쓴다
+};
+
+struct EquationLayout {
+    EquationSize size;
+    std::vector<EquationItem> items;
+};
+
+// 글자 크기 em 에서 수식 글자 칸의 높이(HWPUNIT). 한글이 재는 정수 픽셀 높이다(10pt 975).
+std::int32_t equationGlyphCellHeight(std::int32_t em);
+
+// 크기와 놓을 것을 함께 낸다. size 는 measureHangulEquation 과 같다.
+EquationLayout layoutHangulEquation(std::string_view script, std::int32_t baseUnit,
+                                    std::string_view symbolFont = "HYhwpEQ");
 
 }  // namespace chwp::render

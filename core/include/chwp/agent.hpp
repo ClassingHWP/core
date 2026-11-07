@@ -253,10 +253,6 @@ struct EditReport {
 // 목록에서 metrics/·standin/ 으로 적힌 글꼴은 라이선스로 막힌 글꼴이라, 편집하면 편집기처럼 대역 원본으로 바꾼다.
 void setFontCatalog(const std::string& index, const std::string& licenseSwap, const std::string& replace);
 
-// 수식을 그릴 MicroTeX 리소스 폴더. 실행 파일을 빌드한 곳이 아닌 데로 옮겨 쓰는 셸이 그 자리를 넘긴다.
-// 처음 수식을 그리기 전에 부른다. 넘기지 않으면 빌드할 때의 폴더다.
-void setEquationResources(const std::string& dir);
-
 // 받을 글꼴 파일 하나.
 struct FontFile {
     int id = 0;

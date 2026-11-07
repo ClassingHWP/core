@@ -322,6 +322,9 @@ model::Control* anchoredControl(model::Document& doc, int story, int paragraph, 
 void resizeControl(model::Control& ctrl, std::uint32_t oldW, std::uint32_t oldH, std::uint32_t newW,
                    std::uint32_t newH);
 
+// 이름으로 고른 글꼴 파일에서 글자 하나의 윤곽(1000 em, 기울임·굵기 없음). 글꼴이나 글자가 없으면 거짓.
+bool faceGlyphCommands(const std::string& face, char32_t cp, std::vector<GlyphCommand>& commands);
+
 // 글자 외곽선(글꼴 단위 1000 = emPx)을 쪽 그림과 같은 Painter 로 width x height 판에 칠한 알파. 시험이 쓴다.
 std::vector<std::uint8_t> glyphAlpha(const std::vector<GlyphCommand>& commands, float emPx, float penX, float baseY,
                                      int width, int height);

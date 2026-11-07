@@ -6,7 +6,7 @@ core 가 달라고 한 글꼴 파일을 받아 캐시 폴더에 넣는 일만 �
 
 실행 파일을 찾는 차례:
   1. 환경 변수 CHWP_AGENT_BIN
-  2. 스킬 폴더의 bin/chwp-agent(.exe)  (묶어서 배포할 때. 수식 리소스는 bin/microtex-res)
+  2. 스킬 폴더의 bin/chwp-agent(.exe)  (묶어서 배포할 때)
   3. 저장소 build/*/tools/chwp-agent/ 아래에서 가장 최근에 만든 것
 
 글꼴:
@@ -164,7 +164,7 @@ def fetch_fonts(binary: Path, args: list[str], stdin: bytes | None) -> None:
 
 def first_positional(args: list[str]) -> str | None:
     """실행 파일과 같은 규칙으로 문서 경로를 찾는다. 값을 받는 옵션의 값은 건너뛴다."""
-    takes_value = {"-c", "--call", "--save", "--out-dir", "--font-dir", "--tex-res"}
+    takes_value = {"-c", "--call", "--save", "--out-dir", "--font-dir"}
     skip = False
     for arg in args:
         if skip:
@@ -196,10 +196,6 @@ def main() -> int:
         fetch_fonts(binary, args, stdin)
     if document and (FONT_CACHE / "index.json").is_file():
         args += ["--font-dir", str(FONT_CACHE)]
-    # 묶어서 배포한 실행 파일은 수식 리소스를 옆 폴더에 둔다.
-    tex_res = binary.parent / "microtex-res"
-    if tex_res.is_dir():
-        args += ["--tex-res", str(tex_res)]
     return subprocess.run([str(binary), *args], input=stdin).returncode
 
 
