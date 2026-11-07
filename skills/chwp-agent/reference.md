@@ -9,7 +9,7 @@
 |---|---|
 | 위치 | `{"story":1,"paragraph":12,"char":4}` 또는 `"1:12:4"` |
 | 구간 | `{"from":위치,"to":위치}` 또는 `"1:12:4-1:12:10"`. 반열린 [from, to). 같은 story 여야 한다 |
-| 쪽 | `3`(쪽 번호) 또는 `{"page":3,"section":2,"nth":1}`. section·nth 는 번호가 겹칠 때만 |
+| 쪽 | `3`(쪽 번호), `{"page":3,"section":2,"nth":1}`(section·nth 는 번호가 겹칠 때만), 또는 `{"order":5}`(문서 안 물리 순서, `pages` 의 `order`). `order` 는 번호가 겹쳐도 하나로 정해진다 |
 | 길이 | HWPUNIT(HU). 1pt = 100, 1mm ≈ 283.46. 글자 크기는 `size` 1000 = 10pt |
 | 실패 | `{"ok":false,"error":{"code":"PositionOutOfRange","message":"..."}}` |
 
@@ -22,8 +22,10 @@
 ## 읽기
 
 ### info
-`{"call":"info"}` → `{"format":"hwp","pages":14,"sections":1,"stories":27,"warnings":[],"missingFonts":["○○체"]}`.
+`{"call":"info"}` → `{"format":"hwp","pages":14,"sections":1,"stories":27,"warnings":[],"missingFonts":["○○체"],"missingGlyphs":[{"font":"휴먼명조","code":"U+F06C"}],"missingGlyphCount":1}`.
 `missingFonts` 는 받지 못해 대체 글꼴로 재고 그린 글꼴이다.
+`missingGlyphs` 는 그 글꼴과 대체 글꼴 어디에도 없어 **그리지 못하는 글자**다. 그림에서 비거나 네모로 나온다.
+앞의 100개만 주고, 모두 몇 개인지는 `missingGlyphCount` 다.
 
 ### pages
 `{"call":"pages"}` → `{"pages":[{"page":1,"section":1,"label":"1","order":1,"width":84188,"height":59528,"sizeMm":"297.0x210.0","landscape":true}]}`
@@ -46,6 +48,8 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 → `{"stories":[{"story":1,...,"text":[{"paragraph":0,"text":"제목"},{"paragraph":1,"text":"￼","objects":[{"index":0,"kind":"table","at":0,"stories":[4,5,6]}]}]}],"next":{...}}`
 
 글 안의 `\t` 는 탭, `\n` 은 문단 안 줄바꿈, `￼`(U+FFFC)는 글자처럼 놓인 개체다.
+문단의 `pageOrder` 는 첫 글자가 놓인 쪽의 물리 순서(`pages` 의 `order`)다. 쪽에 놓이지 않는 글(바탕쪽 등)에는 없다.
+`paragraph` 응답에도 같은 칸이 있다.
 
 ### paragraph
 `{"call":"paragraph","story":1,"paragraph":2}` → 글, 스타일, 정렬(`JUSTIFY` `LEFT` `RIGHT` `CENTER` `DISTRIBUTE` `DISTRIBUTE_SPACE`),
@@ -61,7 +65,9 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 
 ### render
 `{"call":"render","page":1,"dpi":96,"pixelHeight":0,"name":"p1"}` → `{"file":"<out-dir>/p1.png","page":{...},"width":...,"height":...}`.
-`pixelHeight` 를 주면 dpi 대신 그것을 쓴다(20~8000). `name` 이 없으면 `page-s<구역>-p<쪽>.png`.
+`pixelHeight` 를 주면 dpi 대신 그것을 쓴다(32~8000, 넘거나 모자라면 끝값으로 자른다). `name` 이 없으면 `page-s<구역>-p<쪽>.png`
+(번호가 겹치는 쪽은 `-n<nth>` 가 붙는다). `--out-dir` 폴더는 없으면 만든다. 파일을 못 쓰면 `SaveFailed`, 그리기 자체가
+실패하면 `RenderFailed` 다.
 
 ## 고치기
 
@@ -134,6 +140,7 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 |---|---|
 | `--font-dir 폴더` | 글꼴 서버와 같은 모양의 캐시(`index.json`, `license-swap.json`, `replace.json`, `full/…`, `metrics/…`). core 가 고른 파일 중 있는 것은 넣고, 없는 것은 못 받은 글꼴로 친다 |
 | `--font-plan` | 요청을 부르지 않고 캐시에 아직 없어 받아야 할 파일을 `{"ok":true,"need":["full/HANBatang.woff2",...]}` 로 쓴다 |
+| `--verbose` | core 진단 기록(글꼴 받기·대체 시도 등)을 stderr 로 낸다. 주지 않으면 버린다. 빠진 글자는 이 기록 말고 `info` 의 `missingGlyphs` 로 본다 |
 
 받지 못한 파일은 캐시에 `파일.missing` 표시를 두면 그 실행 안에서 다시 묻지 않는다.
 

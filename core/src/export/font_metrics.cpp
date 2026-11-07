@@ -2209,4 +2209,39 @@ std::vector<std::string> documentFontGaps(const model::Document& doc) {
     return out;
 }
 
+std::vector<MissingGlyph> documentMissingGlyphs(const model::Document& doc) {
+    const UsedFaces used = documentUsedFaces(doc);
+    // 파일이 없거나 폭만 있는 글꼴은 함초롬바탕이 대신 그린다(documentFontFaces 와 같은 판단).
+    std::unordered_map<std::string, std::string> drawFace;
+    for (const std::string& face : used.order) {
+        const std::string replaced = fontReplacement(face);
+        const std::string path = fontCatalogPath(replaced.empty() ? face : replaced);
+        const bool hasFile = path.rfind("full/", 0) == 0 || path.rfind("standin/", 0) == 0;
+        drawFace[face] = hasFile ? face : std::string("함초롬바탕");
+    }
+    std::vector<MissingGlyph> out;
+    std::lock_guard lock(gMutex);
+    for (const std::string& face : used.order) {
+        const UsedFace& use = used.faces.at(face);
+        std::vector<char32_t> chars(use.chars.begin(), use.chars.end());
+        std::sort(chars.begin(), chars.end());
+        for (const char32_t cp : chars) {
+            if (cp <= 0x20 || cp == 0xA0 || cp == 0x2007) continue;
+            // fontWithGlyph 와 같은 차례: 그리는 글꼴, 문서 대체, 사용자 영역이면 같은 계열 함초롬과 Wingdings.
+            std::vector<std::string> chain{drawFace[face]};
+            for (const std::string& name : use.alternates) chain.push_back(name);
+            if (isPrivateUse(cp)) {
+                std::vector<const char*> family;
+                appendFamilyFallbacks(face, family);
+                for (const char* name : family) chain.emplace_back(name);
+                for (const char* name : {"함초롬돋움", "함초롬바탕", "Wingdings"}) chain.emplace_back(name);
+            }
+            const bool drawn = std::any_of(chain.begin(), chain.end(),
+                                           [&](const std::string& name) { return faceHasGlyph(name, cp); });
+            if (!drawn) out.push_back(MissingGlyph{face, cp});
+        }
+    }
+    return out;
+}
+
 }  // namespace chwp::layout

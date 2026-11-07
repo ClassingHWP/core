@@ -31,6 +31,14 @@ std::vector<std::string> documentFontFaces(const model::Document& doc);
 // 아직 올라오지 않은 이름. 받은 글꼴로만 판단하고 파일을 새로 열지 않는다. 비면 더 받을 것이 없다.
 std::vector<std::string> documentFontGaps(const model::Document& doc);
 
+// 지금 올라온 글꼴로는 그리지 못하는 문서 글자. 그 글꼴(파일이 없거나 폭만 있으면 대신 그리는 함초롬바탕)과
+// fontWithGlyph 의 대체 차례 어디에도 그 글자가 없다. 글꼴 차례, 그 안은 글자 차례다.
+struct MissingGlyph {
+    std::string face;
+    char32_t codePoint = 0;
+};
+std::vector<MissingGlyph> documentMissingGlyphs(const model::Document& doc);
+
 // 이름을 셸에 알려 받게 한다. 편집을 시작할 때 처음 치는 글자의 대체 글꼴을 미리 받는 데 쓴다.
 void requestFontFaces(const std::vector<std::string>& faces);
 

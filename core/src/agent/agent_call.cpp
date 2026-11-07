@@ -311,7 +311,14 @@ Status readRange(const Json* v, Range& out) {
 
 Status readPage(const Json* v, PageRef& out) {
     if (v && v->type == Json::Type::Number) return readInt(v, "page", out.page);
-    if (!v || v->type != Json::Type::Object) return bad("page 가 없습니다. 쪽 번호 또는 {page, section, nth} 를 주세요.");
+    if (!v || v->type != Json::Type::Object) {
+        return bad("page 가 없습니다. 쪽 번호, {page, section, nth} 또는 {order} 를 주세요.");
+    }
+    if (Status s = readOptionalInt(*v, "order", out.order); !s.ok()) return s;
+    if (v->get("order")) {
+        if (out.order < 1) return bad("order 는 1 이상이어야 합니다.");
+        return {};
+    }
     if (Status s = readInt(v->get("page"), "page", out.page); !s.ok()) return s;
     if (Status s = readOptionalInt(*v, "section", out.section); !s.ok()) return s;
     return readOptionalInt(*v, "nth", out.nth);
@@ -509,6 +516,21 @@ Status callInfo(Call& c) {
     c.w.beginArray();
     for (const std::string& face : c.doc.missingFonts()) c.w.value(face);
     c.w.endArray();
+    // 어느 글꼴에도 없어 그리지 못하는 글자. 그림에서 비어 나온다. 많으면 앞의 kMaxMissingGlyphs 개만 낸다.
+    constexpr std::size_t kMaxMissingGlyphs = 100;
+    const std::vector<std::pair<std::string, char32_t>> glyphs = c.doc.missingGlyphs();
+    c.w.key("missingGlyphs");
+    c.w.beginArray();
+    for (std::size_t i = 0; i < glyphs.size() && i < kMaxMissingGlyphs; ++i) {
+        char code[16];
+        std::snprintf(code, sizeof(code), "U+%04X", static_cast<unsigned>(glyphs[i].second));
+        c.w.beginObject();
+        c.w.field("font", glyphs[i].first);
+        c.w.field("code", std::string(code));
+        c.w.endObject();
+    }
+    c.w.endArray();
+    c.w.field("missingGlyphCount", static_cast<int>(glyphs.size()));
     return {};
 }
 
@@ -564,6 +586,7 @@ Status callParagraph(Call& c) {
     c.w.field("indent", p.indent);
     c.w.field("spacingPrev", p.spacingPrev);
     c.w.field("spacingNext", p.spacingNext);
+    if (p.pageOrder > 0) c.w.field("pageOrder", p.pageOrder);
     c.w.key("runs");
     c.w.beginArray();
     for (const FormatRun& run : p.runs) {
@@ -631,6 +654,7 @@ Status callText(Call& c) {
             c.w.beginObject();
             c.w.field("paragraph", p);
             c.w.field("text", info.value.text);
+            if (info.value.pageOrder > 0) c.w.field("pageOrder", info.value.pageOrder);
             if (!info.value.objects.empty()) writeObjects(c.w, info.value.objects, false);
             c.w.endObject();
         }
@@ -787,6 +811,44 @@ void writeError(JsonWriter& w, const Status& status) {
     w.endObject();
 }
 
+// 바른 UTF-8 인지. 요청 글(이름·경로·넣을 글)은 모두 UTF-8 로 받는다.
+bool validUtf8(std::string_view text) {
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const auto c = static_cast<unsigned char>(text[i]);
+        int extra = 0;
+        char32_t cp = 0;
+        if (c < 0x80) {
+            ++i;
+            continue;
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            extra = 1;
+            cp = c & 0x1F;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            extra = 2;
+            cp = c & 0x0F;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            extra = 3;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        if (i + static_cast<std::size_t>(extra) >= text.size()) return false;
+        for (int k = 1; k <= extra; ++k) {
+            const auto next = static_cast<unsigned char>(text[i + k]);
+            if ((next & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (next & 0x3F);
+        }
+        // 짧게 쓸 수 있는 글자를 길게 쓴 것, 대리 영역, U+10FFFF 너머는 받지 않는다.
+        if ((extra == 2 && cp < 0x800) || (extra == 3 && (cp < 0x10000 || cp > 0x10FFFF)) ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return false;
+        }
+        i += static_cast<std::size_t>(extra) + 1;
+    }
+    return true;
+}
+
 }  // namespace
 
 std::string statusJson(const Status& status) {
@@ -804,6 +866,12 @@ CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_v
     std::string error;
     JsonWriter w(false);
     w.beginObject();
+    if (!validUtf8(request)) {
+        writeError(w, bad("요청이 UTF-8 이 아닙니다. 요청 파일과 글을 UTF-8 로 쓰세요."));
+        w.endObject();
+        out.json = w.take();
+        return out;
+    }
     if (!JsonReader(request).read(json, error) || json.type != Json::Type::Object) {
         writeError(w, bad(error.empty() ? "요청은 JSON 객체여야 합니다." : error));
         w.endObject();

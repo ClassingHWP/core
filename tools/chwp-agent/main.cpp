@@ -1,13 +1,13 @@
 // chwp-agent: 에이전트 API(chwp::agent::agentCall)를 감싸는 CLI. Agent Skill 이 부른다.
 //
 //   chwp-agent <문서.hwp|.hwpx> [요청.jsonl | -] [-c JSON]... [--save 경로] [--out-dir 폴더]
-//              [--font-dir 글꼴캐시] [--font-plan] [--tex-res 수식리소스]
+//              [--font-dir 글꼴캐시] [--font-plan] [--verbose]
 //
 // 요청은 한 줄에 JSON 하나(JSON Lines)다. 파일, 표준 입력(-), -c 순서로 같은 세션에서 차례로 부른다.
 // --save 는 마지막에 {"call":"save","path":경로} 를 하나 더 부른다. 응답도 한 줄에 하나씩 표준 출력에 쓴다.
 // --font-dir 는 글꼴 서버와 같은 모양의 캐시 폴더다(index.json, license-swap.json, replace.json, 폴더/파일).
 // --font-plan 은 요청을 부르지 않고, 캐시에 아직 없어 받아야 할 파일을 {"ok":true,"need":[경로...]} 한 줄로 쓴다.
-// --tex-res 는 수식을 그릴 MicroTeX 리소스 폴더다. 실행 파일을 빌드한 곳이 아닌 데서 쓸 때 준다.
+// --verbose 는 core 진단 기록(글꼴 받기·대체 등)을 stderr 로 낸다. 주지 않으면 버린다.
 // 이 프로그램은 파일을 읽고 쓰기만 한다. 무엇을 받을지, 무엇을 할지는 모두 core 가 정한다.
 //
 // 끝 코드: 0 모두 성공, 1 실패한 요청이 있음, 2 사용법이 틀렸거나 문서를 열지 못함.
@@ -26,6 +26,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -45,13 +46,18 @@ bool readFile(const std::string& path, chwp::Bytes& out) {
 }
 
 bool writeFile(const std::string& path, const chwp::Bytes& bytes) {
-    const std::filesystem::path target = pathOf(path);
-    std::error_code error;
-    if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path(), error);
-    std::ofstream file(target, std::ios::binary | std::ios::trunc);
-    if (!file) return false;
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return static_cast<bool>(file);
+    // 경로를 바꾸지 못하면(바르지 않은 글) 실행을 멈추지 않고 쓰기 실패로 답한다.
+    try {
+        const std::filesystem::path target = pathOf(path);
+        std::error_code error;
+        if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path(), error);
+        std::ofstream file(target, std::ios::binary | std::ios::trunc);
+        if (!file) return false;
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return static_cast<bool>(file);
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 void readLines(std::istream& in, std::vector<std::string>& out) {
@@ -63,18 +69,26 @@ void readLines(std::istream& in, std::vector<std::string>& out) {
     }
 }
 
-// core 의 진단 기록(글꼴 시간 등)은 stdout 에 찍힌다. 응답 줄만 stdout 에 남도록 기록은 stderr 로 돌리고,
-// 응답은 원래 stdout 을 복제한 흐름에 쓴다.
-FILE* takeStdoutForReplies() {
+// core 의 진단 기록(글꼴 시간 등)은 stdout 에 찍힌다. 응답 줄만 stdout 에 남도록 기록은 stderr(verbose)나
+// 버리는 곳으로 돌리고, 응답은 원래 stdout 을 복제한 흐름에 쓴다.
+FILE* takeStdoutForReplies(bool verbose) {
     std::fflush(stdout);
 #ifdef _WIN32
     const int reply = _dup(_fileno(stdout));
-    _dup2(_fileno(stderr), _fileno(stdout));
+    const int sink = verbose ? _dup(_fileno(stderr)) : _open("NUL", _O_WRONLY);
+    if (sink >= 0) {
+        _dup2(sink, _fileno(stdout));
+        _close(sink);
+    }
     _setmode(reply, _O_BINARY);
     return _fdopen(reply, "wb");
 #else
     const int reply = dup(fileno(stdout));
-    dup2(fileno(stderr), fileno(stdout));
+    const int sink = verbose ? dup(fileno(stderr)) : open("/dev/null", O_WRONLY);
+    if (sink >= 0) {
+        dup2(sink, fileno(stdout));
+        close(sink);
+    }
     return fdopen(reply, "w");
 #endif
 }
@@ -126,7 +140,7 @@ std::vector<std::string> loadFonts(chwp::agent::AgentDocument& doc, const std::s
 
 int usage() {
     std::cerr << "사용법: chwp-agent <문서.hwp|.hwpx> [요청.jsonl | -] [-c JSON]... [--save 경로] [--out-dir 폴더]\n"
-                 "                  [--font-dir 글꼴캐시] [--font-plan] [--tex-res 수식리소스]\n";
+                 "                  [--font-dir 글꼴캐시] [--font-plan] [--verbose]\n";
     return 2;
 }
 
@@ -136,7 +150,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    FILE* const out = takeStdoutForReplies();
+    const bool verbose =
+        std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::string(arg) == "--verbose"; });
+    FILE* const out = takeStdoutForReplies(verbose);
     if (!out) return 2;
     std::string document;
     std::string outDir = ".";

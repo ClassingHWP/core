@@ -19,7 +19,8 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
 
 - 한 번 실행이 한 세션이다. 요청은 파일 → 표준 입력(`-`) → `-c` 차례로 같은 문서에 이어서 부른다.
 - 응답은 요청마다 stdout 한 줄: `{"ok":true,...}` 또는 `{"ok":false,"error":{"code","message"}}`.
-  core 진단 기록은 stderr 로 나오니 `2>/dev/null` 로 버려도 된다.
+  실패 까닭은 늘 이 응답의 `error.message` 에 있다. stderr 는 글꼴 받기·GPU 같은 진단 글이라 `2>/dev/null` 로
+  버려도 된다(core 의 자세한 글꼴 기록은 `--verbose` 를 줄 때만 나오고, 고장 찾기에만 쓴다).
 - **문서 상태는 파일로 넘긴다.** 다음 실행에서 고친 결과를 이어 쓰려면 `--save` 로 저장한 파일을 다시 연다.
   원본을 덮어쓰지 말고 새 경로에 저장하고, 사용자가 원할 때만 원본 자리에 쓴다.
 - 그림(`render`)은 `--out-dir` 폴더에 쓰고 응답의 `file` 에 경로를 준다. 그 PNG 를 Read 로 열어 눈으로 확인한다.
@@ -32,10 +33,57 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
   바뀌었는지만 묻는다. 고친 목록을 쓰려면 `CHWP_FONT_INDEX`·`CHWP_FONT_LICENSE_SWAP`·`CHWP_FONT_REPLACE` 에 파일 경로나
   주소를 준다(reference.md 의 글꼴). 네트워크가 막힌 곳에서는 `--no-font-fetch` 로 캐시만 쓴다.
 - `{"call":"info"}` 의 `missingFonts` 가 비어 있지 않으면 그 글꼴은 대체 글꼴로 재고 그렸다. 줄 나눔·그림이 한글과
-  다를 수 있다고 사용자에게 알린다.
+  다를 수 있다고 사용자에게 알린다. `missingGlyphs` 가 비어 있지 않으면 그 글자(글머리표·기호 등)는 그림에서 비어
+  나온다. 그림을 줄 때 어느 글자가 빠질 수 있는지 함께 알린다.
 - 라이선스로 막힌 글꼴(서버에 폭만 있는 글꼴)이 든 문서를 고치면, 편집기와 같이 편집 앞에 대역 원본 글꼴로 바꾼다.
   apply 응답의 `fontSwaps`(`{from,to}`)에 나오니 **반드시 사용자에게 어떤 글꼴이 바뀌었는지 알린다.**
 - 한글 글은 `-c` 보다 요청 파일(UTF-8, JSON Lines)에 써서 넘기는 편이 따옴표 문제가 적다.
+
+## 자주 하는 일
+
+### 문서 분석(요약·질문 답하기)
+
+글과 쪽 그림을 함께 본다. **내용·숫자·날짜·인용은 글에서, 짜임(표의 머리·병합, 그림, 서식 칸, 강조)은 그림에서** 얻는다.
+
+1. **훑기**: `{"call":"info"}` 로 쪽 수, `missingFonts`, `missingGlyphs` 를 본다.
+2. **글 읽기**: 글 전체를 평문으로 받는다. 이 글이 답의 근거다.
+
+   ```bash
+   python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_text.py "문서.hwp" > text.txt 2>/dev/null
+   ```
+
+   `scripts/chwp_text.py` 는 글 전체를 읽는 차례대로 쓴다. 쪽이 바뀌는 자리에 `=== 03_2쪽 ===`(물리 순서_쪽 번호)
+   경계가 있고, 아래 쪽 그림 파일 이름과 같다. 표는 본문 제자리에 행마다 `| 칸 | 칸 |` 로 들어가고, 머리말·각주
+   등은 끝에 `[owner]` 머리로 붙는다. 바탕쪽 글은 빠진다(`--master` 로 넣음).
+3. **쪽 그림 훑기**: 아래 「모든 쪽 그림으로 만들기」로 **96dpi**(30쪽이 넘으면 72dpi) 그림을 만들고, Read 로 훑어
+   짜임을 잡는다. 여러 장은 한 번에 나란히 Read 한다. 96dpi 그림의 작은 글자·숫자는 읽지 않는다.
+4. **맞춰 보기**: 글만으로 헷갈리는 표(병합 칸, 여러 줄 머리)는 그림의 칸 모양대로 해석한다. 그림·도형·스캔 안에만
+   있는 글(text 에는 `￼` 만 있음)이 필요하면 그 쪽을 150dpi 로 다시 그려 읽는다.
+5. **답하기**: 쪽은 `=== 03_2쪽 ===` 의 쪽 번호(2쪽)로 말한다. 그림으로만 읽은 내용은 그렇다고 밝힌다.
+
+고칠 자리(위치)가 필요할 때는 이 평문 말고 아래 `text`·`find` 응답을 직접 읽는다.
+
+### 모든 쪽 그림으로 만들기
+
+쪽 번호는 겹칠 수 있다(표지와 본문 첫 쪽이 둘 다 1쪽 등). **먼저 `pages` 를 부르고, 쪽마다 `order` 로 그린다.**
+`order` 는 문서 안 물리 순서라 겹치지 않는다. 쪽 수를 짐작해 번호를 더듬지 않는다. `DPI` 는 쓰임에 맞게 고른다
+(훑기 96, 쪽 수 많으면 72, 사용자에게 건넬 그림·그림 속 글 읽기 150).
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "문서.hwp" -c '{"call":"pages"}' 2>/dev/null > pages.jsonl
+DPI=96 python3 -c "
+import json, os
+pages = json.loads(open('pages.jsonl', encoding='utf-8').readline())['pages']
+with open('render.jsonl', 'w', encoding='utf-8') as out:
+    for p in pages:
+        name = '%02d_%s쪽' % (p['order'], p['label'])
+        out.write(json.dumps({'call': 'render', 'page': {'order': p['order']}, 'dpi': int(os.environ['DPI']), 'name': name}, ensure_ascii=False) + '\n')
+"
+python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "문서.hwp" render.jsonl --out-dir pages 2>/dev/null
+```
+
+`--out-dir` 폴더는 없으면 만든다. 응답 한 줄이 한 쪽이고, 실패한 쪽은 `error.message` 에 까닭이 있다.
+사용자에게 그림을 건넬 때는 `info` 의 `missingGlyphs` 도 같이 보고, 몇 장은 Read 로 열어 눈으로 확인한 뒤 건넨다.
 
 ## 일하는 차례
 
@@ -67,7 +115,8 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "원본.hwp" req.jsonl --out-d
 
 - 글에서 U+FFFC(￼)는 글자처럼 놓인 개체(표·그림·수식) 한 글자다. 지우면 그 개체가 지워진다.
 - 한글 전용 기호는 사용자 영역 글자(U+E000~U+F8FF)로 들어 있어 터미널에 안 보일 수 있다. 순번을 셀 때 빠뜨리지 않는다.
-- 쪽은 물리 순서가 아니라 쪽 번호 + 구역으로 가리킨다. `AmbiguousPage` 가 오면 `candidates` 에서 골라 다시 부른다.
+- 쪽은 쪽 번호 + 구역으로 가리키거나, `{"order":N}` 으로 물리 순서를 가리킨다. `AmbiguousPage` 가 오면
+  `candidates` 에서 골라 다시 부르거나 `pages` 의 `order` 를 쓴다.
 - 머리말·꼬리말·바탕쪽처럼 쪽에 놓이지 않는 글은 `NotEditable` 이 날 수 있다.
 - 글자 서식은 빈 구간에 주면 효과가 없다. 문단 서식(정렬·줄 간격 등)은 빈 구간이어도 그 문단에 들어간다.
 - 아직 없는 것: 그림·수식 넣기, 좌표로 찾기(hitTest), 쪽 일부만 그리기.

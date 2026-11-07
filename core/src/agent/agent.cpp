@@ -545,6 +545,17 @@ Result<int> AgentDocument::resolvePage(const PageRef& ref) const {
         out.status = fail(Code::BadArgument, "nth 는 1 이상이어야 합니다.");
         return out;
     }
+    // 물리 순서로 고르면 번호가 겹쳐도 하나로 정해진다.
+    if (ref.order != 0) {
+        const int count = static_cast<int>(impl_->pageInfos.size());
+        if (ref.order < 1 || ref.order > count) {
+            out.status = fail(Code::PageNotFound, std::to_string(ref.order) + "번째 쪽은 없습니다. 쪽은 1~" +
+                                                      std::to_string(count) + "번째까지 있습니다.");
+            return out;
+        }
+        out.value = ref.order - 1;
+        return out;
+    }
     std::vector<int> hits;
     for (std::size_t i = 0; i < impl_->pageInfos.size(); ++i) {
         const PageRef& have = impl_->pageInfos[i].ref;
@@ -723,6 +734,13 @@ Result<ParagraphInfo> AgentDocument::paragraph(int story, int paragraph) const {
     }
     // 글자 수는 편집기가 캐럿 번호에 쓰는 셈(paragraphCharCount) 하나로 낸다.
     info.length = render::paint_detail::paragraphCharCount(para);
+    // 첫 글자가 놓인 쪽. find 와 같이 캐럿 자리로 고른다.
+    const int offset = render::paint_detail::charIndexToOffset(doc, impl_->pages, story, paragraph, 0);
+    const render::CaretPlace place =
+        render::caretForCursor(doc, impl_->pages, model::CursorPos{story, paragraph, offset});
+    if (place.hit && place.page >= 0 && place.page < static_cast<int>(impl_->pageInfos.size())) {
+        info.pageOrder = impl_->pageInfos[static_cast<std::size_t>(place.page)].order;
+    }
     return out;
 }
 
@@ -782,13 +800,17 @@ Result<Image> AgentDocument::renderPage(const PageRef& page, const RenderOptions
     const render::Node& paper = impl_->pages[static_cast<std::size_t>(index.value)];
     int pixelHeight = options.pixelHeight;
     if (pixelHeight <= 0) pixelHeight = static_cast<int>(std::lround(paper.height * options.dpi / 7200.0));
-    pixelHeight = std::clamp(pixelHeight, 20, 8000);
+    // 쪽 그리기는 세로 32px 보다 작은 그림을 만들지 않는다. 그보다 작게 물으면 32px 로 그린다.
+    pixelHeight = std::clamp(pixelHeight, 32, 8000);
     // 편집기와 같은 쪽 그림(GPU 먼저, 못 쓰면 CPU). 칸 캐시는 이 그림에만 쓴다.
     impl_->frames.clear();
     render::PageImage image = impl_->session.renderPage(index.value, pixelHeight, impl_->frames);
     impl_->frames.clear();
     if (image.png.empty()) {
-        out.status = fail(Code::RenderFailed, "쪽을 그리지 못했습니다.");
+        // 파일 쓰기와는 상관없다(쓰기 실패는 SaveFailed). 어느 쪽을 어떤 크기로 그리다 멈췄는지 적는다.
+        out.status = fail(Code::RenderFailed, std::to_string(index.value + 1) + "번째 쪽을 세로 " +
+                                                  std::to_string(pixelHeight) +
+                                                  "px 로 그리지 못했습니다. 그리기가 빈 그림을 돌려줬습니다.");
         return out;
     }
     out.value.page = impl_->pageInfos[static_cast<std::size_t>(index.value)].ref;
@@ -914,6 +936,14 @@ void AgentDocument::fontsDone() {
 
 // 편집기와 같은 DocSession 판단이다.
 std::vector<std::string> AgentDocument::missingFonts() const { return impl_->session.missingFonts(); }
+
+std::vector<std::pair<std::string, char32_t>> AgentDocument::missingGlyphs() const {
+    std::vector<std::pair<std::string, char32_t>> out;
+    for (layout::MissingGlyph& glyph : layout::documentMissingGlyphs(impl_->doc)) {
+        out.emplace_back(std::move(glyph.face), glyph.codePoint);
+    }
+    return out;
+}
 
 const model::Document& AgentDocument::model() const { return impl_->doc; }
 

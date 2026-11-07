@@ -84,13 +84,14 @@ struct PageRef {
     int page = 0;     // 인쇄 쪽 번호. 그 쪽에 번호를 감췄어도 한글이 매긴 번호다
     int section = 0;  // 구역. 1부터. 0이면 생략(번호가 문서 전체에서 하나일 때만 된다)
     int nth = 0;      // 한 구역 안에서 「새 번호로 시작」으로 번호가 겹칠 때 몇 번째인지. 1부터. 0이면 생략
+    int order = 0;    // 입력 전용. 문서 안 물리 순서(1부터, PageInfo::order). 주면 page·section·nth 는 보지 않는다
 };
 
 struct PageInfo {
     PageRef ref;                // 출력에서는 page·section 을 늘 채운다. nth 는 번호가 겹칠 때만 채운다
     std::string label;          // 쪽 번호 형식대로 쓴 글. "79", "iv", "Ⅳ", "라"
     bool numberHidden = false;  // 「쪽 번호 감추기」로 이 쪽에 번호가 찍히지 않는다
-    int order = 0;              // 문서 안 물리 순서. 1부터. 출력 전용이고 입력으로는 받지 않는다
+    int order = 0;              // 문서 안 물리 순서. 1부터. 쪽을 고를 때 PageRef::order 로 그대로 넘길 수 있다
     std::int32_t width = 0;     // 종이 크기(HU). 가로 문서면 이미 긴 변이 width 다
     std::int32_t height = 0;
     bool landscape = false;
@@ -161,6 +162,7 @@ struct ParagraphInfo {
     std::int32_t indent = 0;        // 첫 줄. 양수 들여쓰기, 음수 내어쓰기(HU)
     std::int32_t spacingPrev = 0;   // 문단 위·아래 간격(HU)
     std::int32_t spacingNext = 0;
+    int pageOrder = 0;  // 첫 글자가 놓인 쪽의 물리 순서(PageInfo::order). 쪽에 놓이지 않는 글(바탕쪽 등)이면 0
     std::vector<FormatRun> runs;
     std::vector<ObjectInfo> objects;
 };
@@ -304,7 +306,7 @@ public:
     // 실패: BadArgument(빈 글), PositionOutOfRange(없는 story).
     Result<std::vector<Match>> find(const FindQuery& query) const;
 
-    // 쪽 한 장을 PNG 로. 화면과 같은 조판·그리기(크로스플랫폼 CPU 경로)다. 세로 픽셀은 20~8000 으로 자른다.
+    // 쪽 한 장을 PNG 로. 화면과 같은 조판·그리기(크로스플랫폼 CPU 경로)다. 세로 픽셀은 32~8000 으로 자른다.
     // 실패: resolvePage 의 실패, RenderFailed.
     Result<Image> renderPage(const PageRef& page, const RenderOptions& options) const;
 
@@ -328,6 +330,8 @@ public:
     void fontsDone();
     // 받지 못해 대체 글꼴로 재고 그리는 글꼴 이름.
     std::vector<std::string> missingFonts() const;
+    // 들어온 글꼴과 그 대체 어디에도 없어 그리지 못하는 글자(글꼴 이름, 코드 포인트). 그림에서 비거나 네모로 나온다.
+    std::vector<std::pair<std::string, char32_t>> missingGlyphs() const;
 
     // 고급 사용. 이 API 가 아직 감싸지 않은 기능을 쓸 때만 읽는다. 바꾸지 않는다.
     const model::Document& model() const;
