@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(ClassingHWP
-    VERSION 0.2.2
+    VERSION 0.2.3
     DESCRIPTION "ClassingHWP - Korean word processor"
     LANGUAGES C CXX)
 
