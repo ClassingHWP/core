@@ -37,6 +37,8 @@ bool canIncrementalRelayoutParagraph(const Document& doc, const Paragraph& para,
             if (item.control.kind == ControlKind::Footnote || item.control.kind == ControlKind::Endnote) {
                 return false;
             }
+            // 덧말·글자 겹치기는 글자 칸 개체다. 줄을 통째로 다시 짠다.
+            if (glyphGroupControl(item.control)) return false;
             if (!sameParagraphEdit &&
                 (item.control.kind == ControlKind::ColumnDef || item.control.kind == ControlKind::SectionDef)) {
                 return false;
@@ -417,7 +419,7 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
                 child.x = pen;
                 return anchored(std::move(child), atom);
             }
-            Node built = makeObject(*atom.control, pen, 0, doc, depth, defaultTab, useStoredLineHeight);
+            Node built = atomObject(atom, pen, doc, depth, defaultTab, useStoredLineHeight);
             return anchored(direction != 0 ? uprightObject(std::move(built)) : std::move(built), atom);
         });
     std::size_t guardCursor = cursor;
@@ -433,7 +435,7 @@ SingleParaLayoutResult layoutSingleParagraphIncremental(const Document& doc, con
             if (!atom.hard) {
                 Node object;
                 if (atom.control) {
-                    object = makeObject(*atom.control, 0, 0, doc, depth, defaultTab, useStoredLineHeight);
+                    object = atomObject(atom, 0, doc, depth, defaultTab, useStoredLineHeight);
                     if (direction != 0) object = uprightObject(std::move(object));
                     object = anchored(std::move(object), atom);
                 }
@@ -1038,8 +1040,9 @@ int placeSameSizeGlyph(const Document& doc, const Paragraph& para, const EditRel
                         }
                         ++pos;
                     }
-                } else if (visualObject(item.control) && item.control.placement &&
-                           item.control.placement->treatAsChar) {
+                } else if ((visualObject(item.control) && item.control.placement &&
+                            item.control.placement->treatAsChar) ||
+                           (item.type == InlineItem::Type::Control && glyphGroupControl(item.control))) {
                     if (pos >= spec.editStartOff && pos < spec.editNewEndOff) return 0;
                     ++pos;
                 } else if (item.type == InlineItem::Type::Control) {
@@ -1228,8 +1231,9 @@ bool spliceEditedLine(const Document& doc, const Paragraph& para, const EditRela
                         }
                         ++pos;
                     }
-                } else if (visualObject(item.control) && item.control.placement &&
-                           item.control.placement->treatAsChar) {
+                } else if ((visualObject(item.control) && item.control.placement &&
+                            item.control.placement->treatAsChar) ||
+                           (item.type == InlineItem::Type::Control && glyphGroupControl(item.control))) {
                     if (pos >= spec.editStartOff && pos < spec.editNewEndOff) return false;
                     ++pos;
                 } else if (item.type == InlineItem::Type::Control && occupiesBodyLine(item.control)) {
@@ -1551,8 +1555,9 @@ bool tryUpdateSingleLineInPlace(const Document& doc, const Paragraph& para, cons
                     pen += atom.width;
                     lastTrail = atom.trail;
                 }
-            } else if (visualObject(item.control) && item.control.placement &&
-                       item.control.placement->treatAsChar) {
+            } else if ((visualObject(item.control) && item.control.placement &&
+                        item.control.placement->treatAsChar) ||
+                       (item.type == InlineItem::Type::Control && glyphGroupControl(item.control))) {
                 const int curPos = pos++;
                 if (curPos >= targetLine.start && curPos < newLineEnd) return false;
             } else if (item.type == InlineItem::Type::Control && occupiesBodyLine(item.control)) {

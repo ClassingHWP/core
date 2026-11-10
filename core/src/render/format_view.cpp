@@ -483,6 +483,14 @@ FormatView textView(const FormatFields& fields) {
     view.specs.push_back(numberSpec("charOffset", "%", -100, 100, 1, 0));
     view.specs.push_back(numberSpec("ratio", "%", 50, 200, 1, 0));
     view.specs.push_back(numberSpec("spacing", "%", -50, 50, 1, 0));
+    // 언어별 값(언어 고르기). 이름은 "ratio.LATIN" 처럼 언어를 붙인다.
+    for (std::size_t i = 0; i < model::kLangCount; ++i) {
+        const std::string lang = std::string(".") + model::langName(static_cast<model::Lang>(i));
+        view.specs.push_back(numberSpec("relSize" + lang, "%", 10, 250, 1, 0));
+        view.specs.push_back(numberSpec("charOffset" + lang, "%", -100, 100, 1, 0));
+        view.specs.push_back(numberSpec("ratio" + lang, "%", 50, 200, 1, 0));
+        view.specs.push_back(numberSpec("spacing" + lang, "%", -50, 50, 1, 0));
+    }
     view.specs.push_back(numberSpec("shadowOffsetX", "%", -100, 100, 1, 0));
     view.specs.push_back(numberSpec("shadowOffsetY", "%", -100, 100, 1, 0));
     view.specs.push_back(choiceSpec("shadow", ids({"0", "1", "2"})));
@@ -614,9 +622,50 @@ FormatView pageView(const model::Document& doc, const ValueMap& values) {
 
 }  // namespace
 
+namespace {
+
+// 쪽 테두리/배경: 고른 종류(which)의 값에 패치를 얹는다. 종류를 바꾸면 그 종류의 값을 새로 읽는다.
+ValueMap resolvePageBorder(const model::Document& doc, const FormatFields& patch) {
+    std::string which = "BOTH";
+    for (const auto& [key, value] : patch) {
+        if (key == "which") {
+            if (const std::string* t = std::get_if<std::string>(&value)) which = *t;
+        }
+    }
+    ValueMap values = mapOf(pageBorderValues(doc, which));
+    for (const auto& [key, value] : patch) {
+        if (key == "which") continue;
+        values[key] = value;
+    }
+    return values;
+}
+
+FormatView pageBorderView(const ValueMap& values) {
+    FormatView view;
+    for (const auto& [key, value] : values) view.values.emplace_back(key, value);
+    addFillView("page.", values, view);
+    view.specs.push_back(choiceSpec("which", {{"BOTH", "양쪽"}, {"ODD", "홀수 쪽"}, {"EVEN", "짝수 쪽"}}));
+    view.specs.push_back(choiceSpec("basis", {{"PAPER", "종이 기준"}, {"PAGE", "쪽 기준"}}));
+    view.specs.push_back(choiceSpec("fillArea", {{"PAPER", "종이"}, {"PAGE", "쪽"}, {"BORDER", "테두리"}}));
+    view.specs.push_back(choiceSpec("applyPages", {{"ALL", "모두"}, {"EXCEPT_FIRST", "첫 쪽 제외"}, {"FIRST_ONLY", "첫 쪽만"}}));
+    for (const char* side : {"offsetLeft", "offsetTop", "offsetRight", "offsetBottom"}) {
+        view.specs.push_back(numberSpec(side, "mm", 0, 100, 0.1, 1));
+    }
+    const double sections = std::max(1.0, numberIn(values, "sectionCount", 1));
+    view.specs.push_back(sections > 1 ? choiceSpec("scope", ids({"section", "document"}))
+                                      : choiceSpec("scope", ids({"document"})));
+    return view;
+}
+
+}  // namespace
+
 FormatFields resolveFormatView(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
                                const FormatFields& viewPatch) {
     FormatFields out;
+    if (kind == FormatViewKind::PageBorder) {
+        for (const auto& [key, value] : resolvePageBorder(doc, viewPatch)) out.emplace_back(key, value);
+        return out;
+    }
     if (kind == FormatViewKind::Page) {
         for (const auto& [key, value] : resolvePage(mapOf(pageSetupAtCursor(doc)), viewPatch)) out.emplace_back(key, value);
         return out;
@@ -635,6 +684,7 @@ FormatView formatView(const model::Document& doc, const std::vector<Node>& pages
         view.specs = {numberSpec("rows", "", 1, kTableMaxRows, 1, 0), numberSpec("cols", "", 1, kTableMaxCols, 1, 0)};
         return view;
     }
+    if (kind == FormatViewKind::PageBorder) return pageBorderView(resolvePageBorder(doc, viewPatch));
     if (kind == FormatViewKind::Page) {
         ValueMap values = mapOf(pageSetupAtCursor(doc));
         for (const auto& [key, value] : resolvePage(values, viewPatch)) values[key] = value;
@@ -646,7 +696,10 @@ FormatView formatView(const model::Document& doc, const std::vector<Node>& pages
 
 PageBitmap renderFormatPreview(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
                                const FormatFields& viewPatch, int width, int height) {
-    if (kind == FormatViewKind::Page || kind == FormatViewKind::Table || width <= 0 || height < 32) return {};
+    if (kind == FormatViewKind::Page || kind == FormatViewKind::Table || kind == FormatViewKind::PageBorder || width <= 0 ||
+        height < 32) {
+        return {};
+    }
     Derived d = derive(doc, pages, resolveFormatView(doc, pages, kind, viewPatch));
     model::Document& sample = d.scratch;
 

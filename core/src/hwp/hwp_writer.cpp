@@ -1,3 +1,5 @@
+#include "chwp/model/memo.hpp"
+#include "chwp/model/proofreading.hpp"
 #include "chwp/hwp/hwp_writer.hpp"
 
 #include <algorithm>
@@ -35,6 +37,30 @@ void appendRecord(ByteWriter& stream, std::uint16_t tagId, std::uint16_t level, 
     stream.bytes(payload);
 }
 
+// 주석 번호 모양 번호(HWP). 이름은 읽기(numberShapeName)와 같다.
+std::uint32_t noteNumberShapeCode(const std::string& name) {
+    static const char* const kNames[] = {"DIGIT", "CIRCLED_DIGIT", "ROMAN_CAPITAL", "ROMAN_SMALL", "LATIN_CAPITAL",
+                                         "LATIN_SMALL", "CIRCLED_LATIN_CAPITAL", "CIRCLED_LATIN_SMALL",
+                                         "HANGUL_SYLLABLE", "CIRCLED_HANGUL_SYLLABLE", "HANGUL_JAMO",
+                                         "CIRCLED_HANGUL_JAMO", "HANGUL_PHONETIC", "IDEOGRAPH", "CIRCLED_IDEOGRAPH",
+                                         "DECAGON", "DECAGON_HANJA"};
+    for (std::uint32_t i = 0; i < std::size(kNames); ++i) {
+        if (name == kNames[i]) return i;
+    }
+    if (name == "DECAGON_CIRCLE") return 15;
+    if (name == "DECAGON_CIRCLE_HANJA") return 16;
+    if (name == "SYMBOL") return 0x80;
+    if (name == "USER_CHAR") return 0x81;
+    return 0;
+}
+
+// 글의 첫 글자(UTF-16 한 칸). 없으면 0.
+std::uint16_t firstWchar(const std::string& text) {
+    if (text.empty()) return 0;
+    const std::u16string wide = utf8ToUtf16(text);
+    return wide.empty() ? 0 : static_cast<std::uint16_t>(wide.front());
+}
+
 std::uint32_t toColorRef(Color c, std::uint32_t defaultVal = 0x00000000u) {
     if (!c) return defaultVal;
     const std::uint32_t rgb = *c & 0xFFFFFFu;
@@ -43,6 +69,14 @@ std::uint32_t toColorRef(Color c, std::uint32_t defaultVal = 0x00000000u) {
     const std::uint32_t b = rgb & 0xFFu;
     return (b << 16) | (g << 8) | r;
 }
+
+// 메모 쓰기 문맥(write 가 처음에 매긴다). 메모 번호는 문서 차례로 1 부터, 필드 고유 id 는 있던 것을 쓰고 없으면 새로 매긴다.
+struct MemoWriteContext {
+    std::vector<const Control*> order;
+    std::unordered_map<const Control*, std::uint32_t> number;
+    std::unordered_map<const Control*, std::uint32_t> id;
+};
+thread_local MemoWriteContext gMemos;
 
 std::uint32_t hexToColorRef(std::string_view s, std::uint32_t defaultVal = 0x00000000u) {
     if (s.empty() || s == "none") return defaultVal;
@@ -273,7 +307,7 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
             return count;
         };
         // 메모 모양, 변경 추적 내용, 변경 추적 작성자 개수. 문서 수준 변경 추적(TrackChange)은 세지 않는다.
-        w.i32(keptCount(tag::MemoShape));
+        w.i32(static_cast<std::int32_t>(h.memoShapes.size()));
         w.i32(keptCount(tag::TrackChangeContent));
         w.i32(keptCount(tag::TrackChangeAuthor));
         appendRecord(stream, tag::IdMappings, 0, w.view());
@@ -592,6 +626,7 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         else if (ps.lineWrap == "KEEP") attr2 |= 2u;
         if (ps.autoSpacingEng) attr2 |= (1u << 4);
         if (ps.autoSpacingNum) attr2 |= (1u << 5);
+        if (ps.suppressLineNumbers) attr2 |= (1u << 6);
         w.u32(attr2);
         w.u32(lsType);
         w.u32(static_cast<std::uint32_t>(lsValue));
@@ -614,6 +649,19 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         appendRecord(stream, tag::Style, 1, w.view());
     }
 
+    // 메모 모양(22바이트)은 스타일 뒤에 온다.
+    for (const MemoShape& m : h.memoShapes) {
+        ByteWriter w;
+        w.u32(m.width);
+        w.u8(m.lineType);
+        w.u8(m.lineWidth);
+        w.u32(hexToColorRef(m.lineColor, 0x00AED7B6u));
+        w.u32(hexToColorRef(m.fillColor, 0x00E9FFF0u));
+        w.u32(hexToColorRef(m.activeColor, 0x00C7F1CFu));
+        w.u32(m.memoType);
+        appendRecord(stream, tag::MemoShape, 1, w.view());
+    }
+
     auto writeKept = [&](std::uint16_t tagId, int level) {
         bool wrote = false;
         for (const KeptRecord& rec : h.kept) {
@@ -624,7 +672,10 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         return wrote;
     };
     for (const KeptRecord& rec : h.kept) {
-        if (rec.tag == tag::CompatibleDocument || rec.tag == tag::LayoutCompatibility || rec.tag == tag::TrackChange) continue;
+        if (rec.tag == tag::CompatibleDocument || rec.tag == tag::LayoutCompatibility || rec.tag == tag::TrackChange ||
+            rec.tag == tag::MemoShape) {
+            continue;
+        }
         appendRecord(stream, rec.tag, 1, ByteView(rec.data));
     }
     // 12. CompatibleDocument(단계 0)와 그 아래 LayoutCompatibility(단계 1), 그 뒤 변경 추적(단계 1).
@@ -694,6 +745,7 @@ std::uint32_t resolveCtrlId(const Control& ctrl) {
                 return makeCtrlId(ctrl.ctrlId[0], ctrl.ctrlId[1], ctrl.ctrlId[2], ctrl.ctrlId[3]);
             }
             return kCtrlGso;
+        case ControlKind::FieldEnd: return 0;
     }
     return kCtrlGso;
 }
@@ -721,6 +773,7 @@ std::uint16_t extendedCharForControl(const Control& ctrl) {
         case ControlKind::PageHiding:
         case ControlKind::PageNumPos: return 21;
         case ControlKind::Field: return 3;
+        case ControlKind::FieldEnd: return 4;
         case ControlKind::Unknown: return 11;
     }
     return 11;
@@ -818,6 +871,37 @@ void writeSubListParagraphs(ByteWriter& stream, const std::vector<Paragraph>& pa
                                   i + 1 == paragraphs.size());
         }
     }
+}
+
+// 바탕쪽 리스트 머리(34바이트)와 문단. 한글 2024 가 저장한 바이트와 같다: 문단 수, 속성(세로 정렬), 글 너비·높이,
+// u16 0, u32 종류(0 양쪽·홀수·짝수, 3 마지막 쪽, 3+n 임의 n 쪽), u32 비트(1 겹치게 하기, 2 인쇄 시 맨 위), 0 여덟 바이트.
+void writeMasterList(ByteWriter& stream, const MasterPage& mp, const PageDef& pd, std::uint16_t level,
+                     const HwpBinRegistry& bins) {
+    ByteWriter w;
+    w.u32(static_cast<std::uint32_t>(std::max<std::size_t>(1, mp.content.paragraphs.size())));
+    w.u32(listAttrFromVertAlign(mp.content.vertAlign, 0));
+    const std::int64_t textW = static_cast<std::int64_t>(pd.width) - pd.marginLeft - pd.marginRight;
+    const std::int64_t textH = static_cast<std::int64_t>(pd.height) - pd.marginTop - pd.marginBottom - pd.marginHeader -
+                               pd.marginFooter;
+    w.u32(mp.content.textWidth > 0 ? mp.content.textWidth : static_cast<std::uint32_t>(std::max<std::int64_t>(0, textW)));
+    w.u32(mp.content.textHeight > 0 ? mp.content.textHeight : static_cast<std::uint32_t>(std::max<std::int64_t>(0, textH)));
+    w.u16(0);
+    std::uint32_t code = 0;
+    if (mp.applyPageType == "LAST_PAGE") code = 3;
+    else if (mp.applyPageType == "OPTIONAL_PAGE") code = 3 + std::max<std::uint32_t>(1, mp.pageNumber);
+    w.u32(code);
+    w.u32((mp.duplicate ? 1u : 0u) | (mp.printOnTop ? 2u : 0u));
+    w.zeros(8);
+    appendRecord(stream, tag::ListHeader, level, w.view());
+    writeSubListParagraphs(stream, mp.content.paragraphs, static_cast<std::uint16_t>(level), bins);
+}
+
+std::size_t extMasterCount(const Section& sec) {
+    std::size_t n = 0;
+    for (const auto& mp : sec.masterPages) {
+        if (mp.applyPageType == "LAST_PAGE" || mp.applyPageType == "OPTIONAL_PAGE") ++n;
+    }
+    return n;
 }
 
 void writeCaptionRecords(ByteWriter& stream, const Caption& cap, std::uint16_t level,
@@ -1180,14 +1264,19 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             if (ctrl.page) pd = *ctrl.page;
             else if (firstParaSec && firstParaSec->page) pd = *firstParaSec->page;
 
-            const bool hideHeader =
-                ctrl.hideHeader || (firstParaSec && firstParaSec->hideHeader);
-            const bool hideFooter =
-                ctrl.hideFooter || (firstParaSec && firstParaSec->hideFooter);
-            const bool hideMaster =
-                ctrl.hideMaster || (firstParaSec && firstParaSec->hideMaster);
-            const bool hidePageNum =
-                ctrl.hidePageNum || (firstParaSec && firstParaSec->hidePageNum);
+            // 구역 설정은 구역 값이 기준이다(편집은 구역과 구역 정의를 같이 고친다). 구역이 없으면 컨트롤 값이다.
+            const bool hideHeader = firstParaSec ? firstParaSec->hideFirstHeader : ctrl.hideFirstHeader;
+            const bool hideFooter = firstParaSec ? firstParaSec->hideFirstFooter : ctrl.hideFirstFooter;
+            const bool hideMaster = firstParaSec ? firstParaSec->hideFirstMaster : ctrl.hideFirstMaster;
+            const bool hidePageNum = firstParaSec ? firstParaSec->hideFirstPageNum : ctrl.hideFirstPageNum;
+            const std::string& borderShow = firstParaSec ? firstParaSec->borderShow : ctrl.borderShow;
+            const std::string& fillShow = firstParaSec ? firstParaSec->fillShow : ctrl.fillShow;
+            const bool hideEmptyLine = firstParaSec ? firstParaSec->hideFirstEmptyLine : ctrl.hideFirstEmptyLine;
+            const LineNumberShape lineNumbers = firstParaSec ? firstParaSec->lineNumbers : ctrl.lineNumbers;
+            const std::uint32_t startsOn = firstParaSec ? firstParaSec->startsOn : ctrl.startsOn;
+            const std::uint16_t pictureStart = firstParaSec ? firstParaSec->pictureStart : ctrl.pictureStart;
+            const std::uint16_t tableStart = firstParaSec ? firstParaSec->tableStart : ctrl.tableStart;
+            const std::uint16_t equationStart = firstParaSec ? firstParaSec->equationStart : ctrl.equationStart;
             const std::int32_t colRegionGap =
                 ctrl.columnRegionGap > 0
                     ? ctrl.columnRegionGap
@@ -1218,8 +1307,23 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 if (hideFooter) attr |= 0x02u;
                 if (hideMaster) attr |= 0x04u;
                 if (hidePageNum) attr |= 0x20u;
+                if (borderShow == "HIDE_FIRST") attr |= 0x08u;
+                if (borderShow == "SHOW_FIRST") attr |= 0x100u;
+                if (fillShow == "HIDE_FIRST") attr |= 0x10u;
+                if (fillShow == "SHOW_FIRST") attr |= 0x200u;
+                if (hideEmptyLine) attr |= 1u << 19;
+                if (lineNumbers.show) attr |= 1u << 24;
+                // 사용자 시작 번호는 종류 3 이다(한글 2024). 옛 모델은 번호만 있었다.
+                attr |= (std::min<std::uint32_t>(pageStart > 0 && startsOn == 0 ? 3u : startsOn, 3u) & 0x3u) << 20;
                 if (wongoji) attr |= 1u << 22;
-                if (firstParaSec && !firstParaSec->masterPages.empty()) attr |= 1u << 29;
+                // 양쪽·짝수·홀수 바탕쪽이 있으면 비트 29·30·31 이다(한글 2024). 마지막 쪽·임의 쪽은 아래 확장 수다.
+                if (firstParaSec) {
+                    for (const auto& mp : firstParaSec->masterPages) {
+                        if (mp.applyPageType == "EVEN") attr |= 1u << 30;
+                        else if (mp.applyPageType == "ODD") attr |= 1u << 31;
+                        else if (mp.applyPageType != "LAST_PAGE" && mp.applyPageType != "OPTIONAL_PAGE") attr |= 1u << 29;
+                    }
+                }
                 // 글자 방향은 한글 2024 처럼 속성 비트 16–18 이 아니라 아래 36번째 바이트에만 쓴다.
                 w.u32(attr);
                 w.u16(static_cast<std::uint16_t>(colRegionGap));
@@ -1228,14 +1332,23 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 w.u32(static_cast<std::uint32_t>(defaultTab * 2));
                 w.u16(1);
                 w.u16(static_cast<std::uint16_t>(pageStart));
+                w.u16(pictureStart);
+                w.u16(tableStart);
+                w.u16(equationStart);
+                // 한글 2024 처럼 47바이트로 쓴다. 대표 언어 2바이트 뒤 확장 바탕쪽(마지막 쪽·임의 쪽) 수 2바이트,
+                // 4바이트를 비우고, 36번째 바이트에 글자 방향 × 2 를 둔다.
                 w.u16(0);
+                w.u16(static_cast<std::uint16_t>(firstParaSec ? extMasterCount(*firstParaSec) : 0));
                 w.u16(0);
-                w.u16(0);
-                // 한글 2024 처럼 47바이트로 쓴다. 대표 언어 2바이트 뒤 6바이트를 비우고, 36번째 바이트에 글자 방향 × 2 를 둔다.
-                w.u16(0);
-                for (int i = 0; i < 6; ++i) w.u8(0);
+                // 34번째 바이트: 구역 메모 모양 번호(1 부터, 0 기본).
+                w.u16(firstParaSec ? firstParaSec->memoShapeId : ctrl.memoShapeId);
                 w.u8(static_cast<std::uint8_t>((std::min<std::uint32_t>(textDirection, 2) & 0x3u) << 1));
-                for (int i = 0; i < 10; ++i) w.u8(0);
+                // 줄 번호(38번째 바이트부터): restart, countBy, distance, start. 보이지 않아도 값은 남긴다(한글 2024).
+                w.u8(0);
+                w.u8(lineNumbers.restart);
+                w.u16(lineNumbers.countBy);
+                w.u32(lineNumbers.distance);
+                w.u16(lineNumbers.start);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
             {
@@ -1252,20 +1365,29 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 w.u32((pd.landscape ? 1u : 0u) | (static_cast<std::uint32_t>(std::min<int>(pd.gutterType, 2)) << 1));
                 appendRecord(stream, tag::PageDef, ctrlLevel + 1, w.view());
             }
+            // 각주·미주 모양. 한글 2024 레코드 28바이트: 속성, 사용자 기호·앞 장식·뒤 장식(WCHAR), 시작 번호,
+            // 구분선 길이(INT32), 구분선 위·아래·주 사이, 선 종류·굵기, 선 색.
             for (int fn = 0; fn < 2; ++fn) {
+                const NoteShape& shape = firstParaSec ? (fn == 0 ? firstParaSec->footnote : firstParaSec->endnote)
+                                                      : (fn == 0 ? ctrl.footnoteShape : ctrl.endnoteShape);
                 ByteWriter w;
-                w.u32(0);
-                w.u16(0);
-                w.u16(u')');
-                w.u16(1);
-                w.i16(-1);
-                w.u16(850);
-                w.u16(567);
-                w.u16(283);
-                w.u8(1);
-                w.u8(1);
-                w.u32(0x00000000u);
-                w.u32(0);
+                std::uint32_t attr = noteNumberShapeCode(shape.numFormat);
+                attr |= (static_cast<std::uint32_t>(std::clamp(shape.place, 0, 3)) & 0x3u) << 8;
+                attr |= (static_cast<std::uint32_t>(std::clamp(shape.numbering, 0, 3)) & 0x3u) << 10;
+                if (shape.contentSuperscript) attr |= 0x1000u;
+                if (shape.beneathText) attr |= 0x2000u;
+                w.u32(attr);
+                w.u16(firstWchar(shape.userChar));
+                w.u16(firstWchar(shape.prefix));
+                w.u16(firstWchar(shape.suffix));
+                w.u16(shape.startNumber);
+                w.u32(static_cast<std::uint32_t>(shape.lineLength));
+                w.u16(static_cast<std::uint16_t>(std::clamp(shape.above, 0, 0xFFFF)));
+                w.u16(static_cast<std::uint16_t>(std::clamp(shape.below, 0, 0xFFFF)));
+                w.u16(static_cast<std::uint16_t>(std::clamp(shape.between, 0, 0xFFFF)));
+                w.u8(shape.lineType.empty() || shape.lineType == "NONE" ? 0 : toHwpBorderKind(shape.lineType));
+                w.u8(toHwpBorderThick(shape.lineWidth));
+                w.u32(hexToColorRef(shape.lineColor));
                 appendRecord(stream, tag::FootnoteShape, ctrlLevel + 1, w.view());
             }
             const auto& pageBorders = firstParaSec ? firstParaSec->pageBorders : ctrl.pageBorders;
@@ -1284,20 +1406,16 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 w.u16(border.borderFillId);
                 appendRecord(stream, tag::PageBorderFill, ctrlLevel + 1, w.view());
             }
+            // 양쪽·짝수·홀수 바탕쪽을 그 차례로 구역 정의 아래에 쓴다(비트 29·30·31 차례).
             if (firstParaSec) {
-                for (const auto& mp : firstParaSec->masterPages) {
-                    ByteWriter w;
-                    const std::uint32_t pCount = static_cast<std::uint32_t>(
-                        std::max<std::size_t>(1, mp.content.paragraphs.size()));
-                    w.u32(pCount);
-                    std::uint32_t pageBits = 0;
-                    if (mp.applyPageType == "EVEN") pageBits = 1;
-                    else if (mp.applyPageType == "ODD") pageBits = 2;
-                    w.u32(listAttrFromVertAlign(mp.content.vertAlign, pageBits));
-                    w.u32(mp.content.textWidth > 0 ? mp.content.textWidth : pd.width);
-                    w.u32(mp.content.textHeight > 0 ? mp.content.textHeight : pd.height);
-                    appendRecord(stream, tag::ListHeader, ctrlLevel + 1, w.view());
-                    writeSubListParagraphs(stream, mp.content.paragraphs, ctrlLevel + 1, bins);
+                for (const char* kind : {"BOTH", "EVEN", "ODD"}) {
+                    for (const auto& mp : firstParaSec->masterPages) {
+                        const bool both = mp.applyPageType != "EVEN" && mp.applyPageType != "ODD" &&
+                                          mp.applyPageType != "LAST_PAGE" && mp.applyPageType != "OPTIONAL_PAGE";
+                        if (both ? std::string_view(kind) != "BOTH" : mp.applyPageType != kind) continue;
+                        writeMasterList(stream, mp, pd, ctrlLevel + 1, bins);
+                        break;
+                    }
                 }
             }
             break;
@@ -1307,7 +1425,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             w.u32(kCtrlCold);
             std::uint16_t attr = 0;
             if (ctrl.columnType == "PARALLEL") attr |= 2u;
-            else if (ctrl.columnType == "NEWSPAPER") attr |= 1u;
+            else if (ctrl.columnType == "BALANCED_NEWSPAPER") attr |= 1u;
             const std::uint16_t cnt =
                 static_cast<std::uint16_t>(std::clamp<std::uint32_t>(ctrl.columnCount, 1, 255));
             attr |= static_cast<std::uint16_t>((cnt & 0xFFu) << 2);
@@ -1397,8 +1515,21 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 w.i16(static_cast<std::int16_t>(c.marginBottom));
                 w.u16(static_cast<std::uint16_t>(c.borderFillId > 0 ? c.borderFillId : 1));
                 w.u32(c.width);
-                w.u8(0);
-                w.hwpString("");
+                if (c.name.empty()) {
+                    w.u8(0);
+                    w.hwpString("");
+                } else {
+                    // 셀 필드 이름: 0xff, 파라미터 셋(ID 0x021b, 아이템 0x4000 문자열), 0 여덟 바이트
+                    // (숨긴 한글 2024 가 저장한 바이트와 같다).
+                    w.u8(0xff);
+                    w.u16(0x021b);
+                    w.u16(1);
+                    w.u16(0);
+                    w.u16(0x4000);
+                    w.u16(1);
+                    w.hwpString(c.name);
+                    w.zeros(8);
+                }
                 appendRecord(stream, tag::ListHeader, ctrlLevel + 1, w.view());
                 writeSubListParagraphs(stream, c.content.paragraphs, ctrlLevel + 1, bins);
             }
@@ -1518,6 +1649,8 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             if (ctrl.hideHeader) attr |= 0x01u;
             if (ctrl.hideFooter) attr |= 0x02u;
             if (ctrl.hideMaster) attr |= 0x04u;
+            if (ctrl.hideBorder) attr |= 0x08u;
+            if (ctrl.hideFill) attr |= 0x10u;
             if (ctrl.hidePageNum) attr |= 0x20u;
             w.u32(attr);
             appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
@@ -1540,9 +1673,11 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             const std::uint32_t attr =
                 (toHwpNumFormat(ctrl.numFormat) & 0xFFu) | ((place & 0xFu) << 8);
             w.u32(attr);
+            // 한글 2024 처럼 사용자 기호·앞·뒤 장식 문자는 0 이고, 줄표(sideChar)는 넷째 글자다.
+            w.u16(0);
+            w.u16(0);
             w.u16(0);
             w.u16(static_cast<std::uint16_t>(firstUtf16Char(ctrl.prefix)));
-            w.u16(static_cast<std::uint16_t>(firstUtf16Char(ctrl.suffix)));
             appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             break;
         }
@@ -1555,11 +1690,29 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
         }
         case ControlKind::Field: {
             ByteWriter w;
-            w.u32(id);
-            w.u32(0);
-            w.u8(0);
+            if (isMemoField(ctrl)) {
+                // 한글은 메모 필드의 CTRL_HEADER 를 %unk 로 쓰고 글 쪽 확장 문자에 %%me 를 둔다(한글 2024 와 같다).
+                // 명령 안 메모 번호와 꼬리의 메모 번호는 문서 차례로 다시 매긴 값이다.
+                const std::uint32_t number = gMemos.number.count(&ctrl) ? gMemos.number[&ctrl] : 1u;
+                MemoCommand cmd = parseMemoCommand(ctrl.command);
+                cmd.number = number;
+                w.u32(makeCtrlId('%', 'u', 'n', 'k'));
+                w.u32(ctrl.fieldProps);
+                w.u8(ctrl.fieldExtra);
+                w.hwpString(memoCommandText(cmd));
+                w.u32(gMemos.id.count(&ctrl) ? gMemos.id[&ctrl] : ctrl.fieldId);
+                w.u32(number);
+                appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
+                break;
+            }
+            const bool proof = proofKindOf(ctrl) != ProofKind::None;
+            // 한글 2024 는 교정 부호(HWP 5.0 뒤에 생긴 필드)의 CTRL_HEADER 를 %unk 로 쓰고 글 쪽에 진짜 id 를 둔다.
+            w.u32(proof ? makeCtrlId('%', 'u', 'n', 'k') : id);
+            w.u32(ctrl.fieldProps);
+            w.u8(ctrl.fieldExtra);
             w.hwpString(ctrl.command);
-            w.u32(0);
+            w.u32(ctrl.fieldId);
+            if (proof) w.u32(ctrl.memoNumber);
             appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             if (!ctrl.name.empty()) {
                 writeParameterSetString(stream, ctrlLevel + 1, 0x4000, ctrl.name);
@@ -1589,6 +1742,11 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             w.u32(kCtrlDutmal);
             w.hwpString(ctrl.text);
             w.hwpString(ctrl.subText);
+            w.u32(dutmalPosCode(ctrl.dutmalPos));
+            w.u32(ctrl.dutmalSizeRatio);
+            w.u32(ctrl.dutmalOption);
+            w.u32(ctrl.dutmalStyle);
+            w.u32(dutmalAlignCode(ctrl.dutmalAlign));
             appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             break;
         }
@@ -1596,6 +1754,14 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
             ByteWriter w;
             w.u32(kCtrlCompose);
             w.hwpString(ctrl.text);
+            w.u8(static_cast<std::uint8_t>(composeCircleCode(ctrl.composeCircle)));
+            w.u8(static_cast<std::uint8_t>(ctrl.composeCharSize));
+            w.u8(ctrl.composeType == "SPREAD" ? 0 : 1);
+            // 한글은 글자 모양을 늘 10 칸 쓰고 남는 칸은 0xFFFFFFFF 다.
+            std::vector<std::uint32_t> shapes = ctrl.composeCharShapes;
+            if (shapes.size() < 10) shapes.resize(10, 0xFFFFFFFFu);
+            w.u8(static_cast<std::uint8_t>(std::min<std::size_t>(shapes.size(), 255)));
+            for (std::size_t i = 0; i < shapes.size() && i < 255; ++i) w.u32(shapes[i]);
             appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             break;
         }
@@ -1634,6 +1800,9 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
         wcharPos += 8;
     };
 
+    std::uint32_t openFieldId = makeCtrlId('%', 'h', 'l', 'k');
+    // 열린 필드(안쪽이 뒤). 메모 필드 끝은 그 메모 번호를 둔다(한글 2024: 끝 문자 셋째 u32, 답글이 겹치면 안쪽부터).
+    std::vector<const Control*> openFields;
     auto emitInlineCtrlChar = [&](std::uint16_t chCode) {
         ctrlMask |= (1u << chCode);
         textWriter.u16(chCode);
@@ -1705,8 +1874,31 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
                         ++wcharPos;
                     }
                 }
+            } else if (item.control.kind == ControlKind::FieldEnd) {
+                // 한글 2024: 필드 끝은 인라인 문자 4 에 시작 컨트롤 ID 의 아래 세 바이트를 둔다(%hlk → "klh\0").
+                ctrlMask |= (1u << 4);
+                textWriter.u16(4);
+                const Control* closing = openFields.empty() ? nullptr : openFields.back();
+                if (!openFields.empty()) openFields.pop_back();
+                const std::uint32_t closingId = closing ? resolveCtrlId(*closing) : openFieldId;
+                textWriter.u32(closingId & 0x00FFFFFFu);
+                if (closing && isMemoField(*closing)) {
+                    textWriter.u32(0x00FFFF01u);
+                    textWriter.u32(gMemos.number.count(closing) ? gMemos.number[closing] : 0u);
+                } else if (closing && proofKindOf(*closing) != ProofKind::None) {
+                    textWriter.u32(0);
+                    textWriter.u32(closing->memoNumber);
+                } else {
+                    for (int k = 0; k < 4; ++k) textWriter.u16(0);
+                }
+                textWriter.u16(4);
+                wcharPos += 8;
             } else if (item.control.kind != ControlKind::Unknown) {
                 const std::uint16_t chCode = extendedCharForControl(item.control);
+                if (item.control.kind == ControlKind::Field) {
+                    openFieldId = resolveCtrlId(item.control);
+                    openFields.push_back(&item.control);
+                }
                 const std::uint32_t ctrlId = resolveCtrlId(item.control);
                 emitExtendedCtrlChar(chCode, ctrlId);
                 PendingControl pc;
@@ -1819,7 +2011,7 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
     }
 }
 
-Bytes buildSectionStream(const Section& sec, const HwpBinRegistry& bins) {
+Bytes buildSectionStream(const Section& sec, const HwpBinRegistry& bins, bool lastSection) {
     ByteWriter stream;
     if (sec.paragraphs.empty()) {
         Paragraph empty;
@@ -1829,6 +2021,32 @@ Bytes buildSectionStream(const Section& sec, const HwpBinRegistry& bins) {
             writeParagraphRecords(stream, sec.paragraphs[i], 0, bins,
                                   i == 0 ? &sec : nullptr,
                                   i + 1 == sec.paragraphs.size());
+        }
+    }
+    // 마지막 쪽·임의 쪽 바탕쪽은 마지막 문단의 자식(레벨 1)으로, 마지막 쪽 다음 임의 쪽 차례다(한글 2024).
+    const PageDef pd = sec.page.value_or(PageDef{});
+    for (const char* kind : {"LAST_PAGE", "OPTIONAL_PAGE"}) {
+        for (const auto& mp : sec.masterPages) {
+            if (mp.applyPageType == kind) writeMasterList(stream, mp, pd, 1, bins);
+        }
+    }
+    // 메모 글: 마지막 구역 마지막 문단의 자식(레벨 1)으로 메모마다 MEMO_LIST(번호), LIST_HEADER(16바이트), 문단을 둔다.
+    if (lastSection) {
+        for (const Control* memo : gMemos.order) {
+            {
+                ByteWriter w;
+                w.u32(gMemos.number[memo]);
+                appendRecord(stream, tag::MemoList, 1, w.view());
+            }
+            const std::vector<Paragraph> empty(1);
+            const std::vector<Paragraph>& paras =
+                memo->subLists.empty() || memo->subLists.front().paragraphs.empty() ? empty : memo->subLists.front().paragraphs;
+            ByteWriter w;
+            w.u32(static_cast<std::uint32_t>(paras.size()));
+            w.u32(0);
+            w.zeros(8);
+            appendRecord(stream, tag::ListHeader, 1, w.view());
+            writeSubListParagraphs(stream, paras, 1, bins);
         }
     }
     return stream.take();
@@ -1950,6 +2168,19 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
 
     const HwpBinRegistry bins = buildHwpBinRegistry(doc, options.sourceData);
 
+    // 메모 번호·필드 id 를 매긴다.
+    gMemos = MemoWriteContext{};
+    gMemos.order = collectMemos(doc);
+    {
+        std::uint32_t maxId = 0;
+        for (const Control* m : gMemos.order) maxId = std::max(maxId, m->fieldId);
+        std::uint32_t nextId = std::max<std::uint32_t>(maxId + 1, 0x40000000u);
+        for (std::size_t i = 0; i < gMemos.order.size(); ++i) {
+            gMemos.number[gMemos.order[i]] = static_cast<std::uint32_t>(i + 1);
+            gMemos.id[gMemos.order[i]] = gMemos.order[i]->fieldId != 0 ? gMemos.order[i]->fieldId : nextId++;
+        }
+    }
+
     // 2. DocInfo
     {
         const Bytes rawDocInfo = buildDocInfoStream(doc, bins, options.compress);
@@ -1966,7 +2197,7 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
         sectionsPtr = &fallbackSections;
     }
     for (std::size_t i = 0; i < sectionsPtr->size(); ++i) {
-        const Bytes rawSec = buildSectionStream((*sectionsPtr)[i], bins);
+        const Bytes rawSec = buildSectionStream((*sectionsPtr)[i], bins, i + 1 == sectionsPtr->size());
         Bytes storedSec;
         if (!maybeCompress(rawSec, options.compress, storedSec, error)) return false;
         cfb.addStream("BodyText/Section" + std::to_string(i), std::move(storedSec));
@@ -1978,6 +2209,26 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
             Bytes storedBin;
             if (!maybeCompress(b.rawData, options.compress, storedBin, error)) return false;
             cfb.addStream(b.streamPath, std::move(storedBin));
+        }
+    }
+
+    // 답글 관계(MemoExtended): 레코드 태그 101 하나에 개수와 (답글 필드 id, 원 메모 필드 id) 쌍. 답글이 없으면 쓰지 않는다.
+    {
+        ByteWriter w;
+        std::uint32_t count = 0;
+        for (const Control* m : gMemos.order) count += m->memoParentId != 0 ? 1 : 0;
+        if (count > 0) {
+            w.u32(count);
+            for (const Control* m : gMemos.order) {
+                if (m->memoParentId == 0) continue;
+                w.u32(gMemos.id[m]);
+                w.u32(m->memoParentId);
+            }
+            ByteWriter stream;
+            appendRecord(stream, 101, 0, w.view());
+            Bytes stored;
+            if (!maybeCompress(stream.take(), options.compress, stored, error)) return false;
+            cfb.addStream("MemoExtended", std::move(stored));
         }
     }
 

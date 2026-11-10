@@ -233,7 +233,8 @@ int main(int argc, char** argv) {
 
     int failed = 0;
     for (const std::string& request : requests) {
-        chwp::agent::CallResult result = chwp::agent::agentCall(doc, request, outDir);
+        chwp::agent::CallResult result = chwp::agent::agentCall(
+            doc, request, outDir, [](const std::string& path, chwp::Bytes& out) { return readFile(path, out); });
         // 편집이 새 글꼴을 쓰게 했을 수 있다. 무엇이 필요한지는 core(fontPlan)가 정한다.
         if (!fontDir.empty()) {
             for (std::string& path : loadFonts(doc, fontDir)) need.push_back(std::move(path));

@@ -324,6 +324,90 @@ Status readPage(const Json* v, PageRef& out) {
     return readOptionalInt(*v, "nth", out.nth);
 }
 
+// set {이름: 값}. 값은 참거짓·숫자·글.
+Status readSet(const Json* set, const std::string& what, Fields& out) {
+    if (!set || set->type != Json::Type::Object) return bad(what + " 에는 set {이름: 값} 이 있어야 합니다.");
+    for (const auto& [key, value] : set->fields) {
+        switch (value.type) {
+            case Json::Type::Bool: out.emplace_back(key, value.boolean); break;
+            case Json::Type::Number: out.emplace_back(key, value.number); break;
+            case Json::Type::String: out.emplace_back(key, value.text); break;
+            default: return bad("값 " + key + " 은 참거짓·숫자·글이어야 합니다.");
+        }
+    }
+    return {};
+}
+
+// 개체 이름. "story:문단:개체" 또는 {story, paragraph, index}.
+Status readObject(const Json* v, ObjectRef& out) {
+    if (v && v->type == Json::Type::String) {
+        Position p;
+        if (parseColonPosition(v->text, p)) {
+            out = ObjectRef{p.story, p.paragraph, p.index};
+            return {};
+        }
+        return bad("object 는 \"story:문단:개체\" 꼴이어야 합니다.");
+    }
+    if (!v || v->type != Json::Type::Object) return bad("object 가 없습니다. {story, paragraph, index} 를 주세요.");
+    if (Status s = readInt(v->get("story"), "story", out.story); !s.ok()) return s;
+    if (Status s = readInt(v->get("paragraph"), "paragraph", out.paragraph); !s.ok()) return s;
+    return readInt(v->get("index"), "index", out.index);
+}
+
+// 편집기 명령 op. 자리(at·range·object·story·section·page)와 set 을 빼고 남은 글·수·참거짓은 명령 인자다.
+// 도형 자리·크기(x·y·width·height)는 길이 글("50mm")도 받는다.
+Status readCommand(const Json& v, const std::string& name, EditOp& op) {
+    op.kind = OpKind::Command;
+    op.command = name;
+    for (const auto& [key, value] : v.fields) {
+        if (key == "op" || key == "control" || key == "call" || key == "id") continue;
+        if (key == "at") {
+            if (Status s = readPosition(&value, "at", op.at); !s.ok()) return s;
+            op.hasAt = true;
+        } else if (key == "range") {
+            if (Status s = readRange(&value, op.range); !s.ok()) return s;
+            op.hasRange = true;
+        } else if (key == "object") {
+            if (Status s = readObject(&value, op.object); !s.ok()) return s;
+            op.hasObject = true;
+        } else if (key == "story") {
+            if (Status s = readInt(&value, "story", op.story); !s.ok()) return s;
+        } else if (key == "section") {
+            if (Status s = readInt(&value, "section", op.section); !s.ok()) return s;
+            if (op.section < 1) return bad("section 은 1 부터입니다.");
+        } else if (key == "page") {
+            if (Status s = readPage(&value, op.page); !s.ok()) return s;
+        } else if (key == "set") {
+            if (Status s = readSet(&value, name, op.format); !s.ok()) return s;
+        } else if ((key == "x" || key == "y" || key == "width" || key == "height") && value.type == Json::Type::String) {
+            const Result<std::int32_t> length = parseLength(value.text);
+            if (!length.ok()) return bad(key + ": " + length.status.message);
+            op.args.emplace_back(key, static_cast<double>(length.value));
+        } else {
+            switch (value.type) {
+                case Json::Type::Bool: op.args.emplace_back(key, value.boolean); break;
+                case Json::Type::Number: op.args.emplace_back(key, value.number); break;
+                case Json::Type::String: op.args.emplace_back(key, value.text); break;
+                default: return bad(name + " 의 " + key + " 은 참거짓·숫자·글이어야 합니다.");
+            }
+        }
+    }
+    return {};
+}
+
+// 명령 이름(op 또는 pageControl 의 control). 명령이 아니면 빈 글.
+std::string commandOf(const Json& v, const std::string& name) {
+    std::string command = name;
+    if (name == "pageControl") {
+        const Json* control = v.get("control");
+        command = control && control->type == Json::Type::String ? control->text : std::string();
+    }
+    for (const std::string& known : commandNames()) {
+        if (known == command) return command;
+    }
+    return {};
+}
+
 Status readOp(const Json& v, EditOp& op) {
     if (v.type != Json::Type::Object) return bad("ops 의 항목은 객체여야 합니다.");
     std::string name;
@@ -380,12 +464,130 @@ Status readOp(const Json& v, EditOp& op) {
         }
         return {};
     }
+    if (name == "insertPicture") {
+        op.kind = OpKind::InsertPicture;
+        if (Status s = readPosition(v.get("at"), "at", op.at); !s.ok()) return s;
+        int width = 0;
+        int height = 0;
+        if (Status s = readOptionalInt(v, "width", width); !s.ok()) return s;
+        if (Status s = readOptionalInt(v, "height", height); !s.ok()) return s;
+        op.width = width;
+        op.height = height;
+        // 그림은 base64(또는 data URL) 글이나 file 경로다. 경로는 셸이 읽어 준다(callApply).
+        const Json* data = v.get("base64");
+        const Json* file = v.get("file");
+        if (data && file) return bad("insertPicture 는 base64 와 file 가운데 하나만 줍니다.");
+        if (data) {
+            if (data->type != Json::Type::String) return bad("base64 는 글이어야 합니다.");
+            if (!decodeBase64(data->text, op.image)) return bad("base64 를 풀지 못했습니다.");
+            return {};
+        }
+        if (file) return readText(file, "file", op.text);
+        return bad("insertPicture 에 base64 나 file 이 없습니다.");
+    }
     if (name == "setText") {
         op.kind = OpKind::SetText;
         if (Status s = readInt(v.get("story"), "story", op.story); !s.ok()) return s;
         return readText(v.get("text"), "text", op.text);
     }
-    return bad("op " + name + " 은 모릅니다. insertText, delete, replace, format, insertTable, setText 중 하나입니다.");
+    // 표 구조. story 는 표 칸이다.
+    const auto tableOp = [&](OpKind kind) -> Status {
+        op.kind = kind;
+        if (Status s = readInt(v.get("story"), "story", op.story); !s.ok()) return s;
+        if (const Json* to = v.get("toStory")) {
+            if (Status s = readInt(to, "toStory", op.toStory); !s.ok()) return s;
+        }
+        return {};
+    };
+    const auto readSide = [&](const char* afterName, const char* beforeName) -> Status {
+        if (const Json* side = v.get("side")) {
+            if (side->type != Json::Type::String || (side->text != afterName && side->text != beforeName)) {
+                return bad(std::string("side 는 \"") + afterName + "\" 또는 \"" + beforeName + "\" 입니다.");
+            }
+            op.after = side->text == afterName;
+        }
+        if (Status s = readOptionalInt(v, "count", op.count); !s.ok()) return s;
+        return {};
+    };
+    if (name == "insertRows") {
+        if (Status s = tableOp(OpKind::InsertRows); !s.ok()) return s;
+        return readSide("below", "above");
+    }
+    if (name == "insertColumns") {
+        if (Status s = tableOp(OpKind::InsertColumns); !s.ok()) return s;
+        return readSide("right", "left");
+    }
+    if (name == "insertBreak") {
+        op.kind = OpKind::InsertBreak;
+        if (Status s = readPosition(v.get("at"), "at", op.at); !s.ok()) return s;
+        if (const Json* kind = v.get("kind")) return readText(kind, "kind", op.breakKind);
+        return {};
+    }
+    if (name == "pageSetup") {
+        op.kind = OpKind::PageSetup;
+        if (Status s = readInt(v.get("section"), "section", op.section); !s.ok()) return s;
+        if (const Json* whole = v.get("whole")) {
+            if (whole->type != Json::Type::Bool) return bad("whole 은 참거짓이어야 합니다.");
+            op.whole = whole->boolean;
+        }
+        const Json* set = v.get("set");
+        if (!set || set->type != Json::Type::Object) return bad("pageSetup 에는 set {이름: 값} 이 있어야 합니다.");
+        for (const auto& [key, value] : set->fields) {
+            switch (value.type) {
+                case Json::Type::Bool: op.format.emplace_back(key, value.boolean); break;
+                case Json::Type::Number: op.format.emplace_back(key, value.number); break;
+                case Json::Type::String: op.format.emplace_back(key, value.text); break;
+                default: return bad("값 " + key + " 은 참거짓·숫자·글이어야 합니다.");
+            }
+        }
+        return {};
+    }
+    if (name == "replaceAll") {
+        op.kind = OpKind::ReplaceAll;
+        if (Status s = readText(v.get("find"), "find", op.find); !s.ok()) return s;
+        if (Status s = readText(v.get("text"), "text", op.text); !s.ok()) return s;
+        if (const Json* m = v.get("matchCase")) {
+            if (m->type != Json::Type::Bool) return bad("matchCase 는 참거짓이어야 합니다.");
+            op.matchCase = m->boolean;
+        }
+        return {};
+    }
+    if (name == "cellBorder") {
+        if (Status s = tableOp(OpKind::CellBorder); !s.ok()) return s;
+        if (Status s = readText(v.get("border"), "border", op.border); !s.ok()) return s;
+        if (const Json* t = v.get("lineType")) {
+            if (Status s = readText(t, "lineType", op.lineType); !s.ok()) return s;
+        }
+        if (Status s = readOptionalInt(v, "lineWidth", op.lineWidth); !s.ok()) return s;
+        if (const Json* col = v.get("lineColor")) return readText(col, "lineColor", op.lineColor);
+        return {};
+    }
+    if (name == "cellFill") {
+        if (Status s = tableOp(OpKind::CellFill); !s.ok()) return s;
+        return readText(v.get("color"), "color", op.color);
+    }
+    if (name == "equalWidth") return tableOp(OpKind::EqualWidth);
+    if (name == "equalHeight") return tableOp(OpKind::EqualHeight);
+    if (name == "deleteRows") return tableOp(OpKind::DeleteRows);
+    if (name == "deleteColumns") return tableOp(OpKind::DeleteColumns);
+    if (name == "mergeCells") {
+        if (Status s = tableOp(OpKind::MergeCells); !s.ok()) return s;
+        if (op.toStory < 0) return bad("mergeCells 에는 toStory(범위의 다른 끝 칸)가 있어야 합니다.");
+        return {};
+    }
+    if (name == "splitCell") {
+        if (Status s = tableOp(OpKind::SplitCell); !s.ok()) return s;
+        op.rows = 1;
+        op.cols = 1;
+        if (Status s = readOptionalInt(v, "rows", op.rows); !s.ok()) return s;
+        return readOptionalInt(v, "cols", op.cols);
+    }
+    if (const std::string command = commandOf(v, name); !command.empty()) return readCommand(v, command, op);
+    std::string commands;
+    for (const std::string& known : commandNames()) commands += ", " + known;
+    return bad("op " + name + " 은 모릅니다. insertText, delete, replace, format, insertTable, setText, insertRows, "
+                              "insertColumns, deleteRows, deleteColumns, mergeCells, splitCell, cellBorder, cellFill, equalWidth, "
+                              "equalHeight, insertBreak, replaceAll, pageSetup, insertPicture" + commands + " 중 하나입니다.");
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +637,23 @@ void writeTextFormat(JsonWriter& w, const TextFormat& f) {
     w.endObject();
 }
 
+// 서식 값 묶음을 {이름: 값} 으로.
+void writeFields(JsonWriter& w, const Fields& fields) {
+    w.beginObject();
+    for (const auto& [key, value] : fields) {
+        if (const bool* b = std::get_if<bool>(&value)) {
+            w.field(key, *b);
+        } else if (const double* d = std::get_if<double>(&value)) {
+            // 정수 값은 정수로 쓴다.
+            if (std::floor(*d) == *d && std::fabs(*d) < 2e9) w.field(key, static_cast<int>(*d));
+            else w.field(key, *d);
+        } else {
+            w.field(key, std::get<std::string>(value));
+        }
+    }
+    w.endObject();
+}
+
 void writeObjects(JsonWriter& w, const std::vector<ObjectInfo>& objects, bool full) {
     w.key("objects");
     w.beginArray();
@@ -447,6 +666,10 @@ void writeObjects(JsonWriter& w, const std::vector<ObjectInfo>& objects, bool fu
             w.field("inline", o.inlineChar);
             w.field("width", o.width);
             w.field("height", o.height);
+            if (!o.placement.empty()) {
+                w.key("placement");
+                writeFields(w, o.placement);
+            }
         }
         if (!o.script.empty()) w.field("script", o.script);
         if (!o.stories.empty()) {
@@ -473,7 +696,50 @@ void writeStoryHead(JsonWriter& w, const StoryInfo& s) {
     if (s.row >= 0) {
         w.field("row", s.row);
         w.field("col", s.col);
+        if (s.rowSpan > 1) w.field("rowSpan", s.rowSpan);
+        if (s.colSpan > 1) w.field("colSpan", s.colSpan);
     }
+}
+
+// 표 칸 그림. 표를 지웠으면 rows 가 0 이고 cells 가 비어 있다.
+void writeTable(JsonWriter& w, const TableInfo& t) {
+    w.beginObject();
+    w.field("parentStory", t.parentStory);
+    w.field("parentParagraph", t.parentParagraph);
+    w.field("rows", t.rows);
+    w.field("cols", t.cols);
+    w.key("columnWidths");
+    w.beginArray();
+    for (const std::int32_t v : t.columnWidths) w.value(v);
+    w.endArray();
+    w.key("rowHeights");
+    w.beginArray();
+    for (const std::int32_t v : t.rowHeights) w.value(v);
+    w.endArray();
+    w.key("cells");
+    w.beginArray();
+    for (const TableCellInfo& c : t.cells) {
+        w.beginObject();
+        w.field("story", c.story);
+        w.field("row", c.row);
+        w.field("col", c.col);
+        if (c.rowSpan > 1) w.field("rowSpan", c.rowSpan);
+        if (c.colSpan > 1) w.field("colSpan", c.colSpan);
+        w.field("width", c.width);
+        w.field("height", c.height);
+        w.field("text", c.text);
+        w.key("format");
+        writeFields(w, c.format);
+        w.endObject();
+    }
+    w.endArray();
+    w.key("format");
+    writeFields(w, t.format);
+    if (!t.placement.empty()) {
+        w.key("placement");
+        writeFields(w, t.placement);
+    }
+    w.endObject();
 }
 
 std::string joinPath(std::string_view dir, const std::string& name) {
@@ -500,6 +766,7 @@ struct Call {
     std::string_view fileDir;
     JsonWriter& w;
     std::vector<CallFile>& files;
+    const FileReader& readFile;
 };
 
 Status callInfo(Call& c) {
@@ -572,7 +839,9 @@ Status callParagraph(Call& c) {
     int paragraph = 0;
     if (Status s = readInt(c.request.get("story"), "story", story); !s.ok()) return s;
     if (Status s = readInt(c.request.get("paragraph"), "paragraph", paragraph); !s.ok()) return s;
-    const Result<ParagraphInfo> info = c.doc.paragraph(story, paragraph);
+    const Json* detailArg = c.request.get("detail");
+    const bool detail = detailArg && detailArg->type == Json::Type::Bool && detailArg->boolean;
+    const Result<ParagraphInfo> info = c.doc.paragraph(story, paragraph, detail);
     if (!info.ok()) return info.status;
     const ParagraphInfo& p = info.value;
     c.w.field("story", p.story);
@@ -593,12 +862,25 @@ Status callParagraph(Call& c) {
         c.w.beginObject();
         c.w.field("from", run.from);
         c.w.field("to", run.to);
+        if (detail) c.w.field("charShape", static_cast<int>(run.charShapeId));
         c.w.key("format");
         writeTextFormat(c.w, run.format);
         c.w.endObject();
     }
     c.w.endArray();
     writeObjects(c.w, p.objects, true);
+    if (detail) {
+        // 문단 모양 전부와, runs 의 charShape 번호마다 글자 모양 전부. 이름은 format 의 set 과 같다.
+        c.w.key("paraFormat");
+        writeFields(c.w, p.format);
+        c.w.key("charShapes");
+        c.w.beginObject();
+        for (const auto& [id, fields] : p.charShapes) {
+            c.w.key(std::to_string(id));
+            writeFields(c.w, fields);
+        }
+        c.w.endObject();
+    }
     return {};
 }
 
@@ -709,6 +991,14 @@ Status callApply(Call& c) {
             s.message = "op " + std::to_string(i) + ": " + s.message;
             return s;
         }
+        // insertPicture 의 file 은 셸이 읽는다(파일 읽기는 플랫폼 일이다).
+        if (op.kind == OpKind::InsertPicture && op.image.empty()) {
+            if (!c.readFile) return bad("op " + std::to_string(i) + ": 이 셸은 file 을 읽지 못합니다. base64 로 주세요.");
+            if (!c.readFile(op.text, op.image)) {
+                return bad("op " + std::to_string(i) + ": 그림 파일 " + op.text + " 을 읽지 못했습니다.");
+            }
+            op.text.clear();
+        }
         ops.push_back(std::move(op));
     }
     const Result<EditReport> report = c.doc.apply(ops);
@@ -741,6 +1031,127 @@ Status callApply(Call& c) {
             }
             c.w.endArray();
         }
+        if (op.table.parentStory >= 0) {
+            c.w.key("table");
+            writeTable(c.w, op.table);
+        }
+        if (op.replaced >= 0) c.w.field("replaced", op.replaced);
+        if (op.object.story >= 0) {
+            c.w.key("object");
+            c.w.beginObject();
+            c.w.field("story", op.object.story);
+            c.w.field("paragraph", op.object.paragraph);
+            c.w.field("index", op.object.index);
+            c.w.endObject();
+        }
+        c.w.endObject();
+    }
+    c.w.endArray();
+    return {};
+}
+
+// 명령 op 가 받는 값(대화 상자 처음 값). 요청이 곧 op 다: {"call":"view","op":"noteShape","section":1}.
+Status callView(Call& c) {
+    std::string name;
+    if (Status s = readText(c.request.get("op"), "op", name); !s.ok()) return s;
+    const std::string command = commandOf(c.request, name);
+    if (command.empty()) return bad("view: " + name + " 은 명령 op 가 아닙니다.");
+    EditOp op;
+    if (Status s = readCommand(c.request, command, op); !s.ok()) return s;
+    const Result<Fields> values = c.doc.commandView(op);
+    if (!values.ok()) return values.status;
+    c.w.key("values");
+    writeFields(c.w, values.value);
+    return {};
+}
+
+Status callSection(Call& c) {
+    int section = 0;
+    if (Status s = readInt(c.request.get("section"), "section", section); !s.ok()) return s;
+    const Result<Fields> info = c.doc.section(section);
+    if (!info.ok()) return info.status;
+    c.w.field("section", section);
+    c.w.key("format");
+    writeFields(c.w, info.value);
+    return {};
+}
+
+Status callTable(Call& c) {
+    int story = 0;
+    if (Status s = readInt(c.request.get("story"), "story", story); !s.ok()) return s;
+    const Result<TableInfo> info = c.doc.table(story);
+    if (!info.ok()) return info.status;
+    c.w.key("table");
+    writeTable(c.w, info.value);
+    return {};
+}
+
+Status callLayout(Call& c) {
+    PageRef page;
+    if (Status s = readPage(c.request.get("page"), page); !s.ok()) return s;
+    const Json* textArg = c.request.get("text");
+    const bool withText = !(textArg && textArg->type == Json::Type::Bool && !textArg->boolean);
+    const Result<PageLayoutInfo> info = c.doc.layout(page, withText);
+    if (!info.ok()) return info.status;
+    const PageLayoutInfo& p = info.value;
+    c.w.key("page");
+    c.w.beginObject();
+    c.w.field("page", p.page.page);
+    c.w.field("section", p.page.section);
+    if (p.page.nth > 0) c.w.field("nth", p.page.nth);
+    c.w.endObject();
+    c.w.field("width", p.width);
+    c.w.field("height", p.height);
+    c.w.key("body");
+    c.w.beginObject();
+    c.w.field("x", p.bodyX);
+    c.w.field("y", p.bodyY);
+    c.w.field("width", p.bodyWidth);
+    c.w.field("height", p.bodyHeight);
+    c.w.endObject();
+    c.w.key("lines");
+    c.w.beginArray();
+    for (const LayoutLineInfo& l : p.lines) {
+        c.w.beginObject();
+        c.w.field("story", l.from.story);
+        c.w.field("paragraph", l.from.paragraph);
+        c.w.field("from", l.from.index);
+        c.w.field("to", l.to);
+        c.w.field("x", l.x);
+        c.w.field("y", l.y);
+        c.w.field("width", l.width);
+        c.w.field("height", l.height);
+        c.w.field("inkRight", l.inkRight);
+        if (!l.heading.empty()) c.w.field("heading", l.heading);
+        if (withText) c.w.field("text", l.text);
+        if (l.band) c.w.field("band", true);
+        if (l.master) c.w.field("master", true);
+        if (l.turned) c.w.field("turned", true);
+        if (l.overflow) c.w.field("overflow", true);
+        c.w.endObject();
+    }
+    c.w.endArray();
+    c.w.key("boxes");
+    c.w.beginArray();
+    for (const LayoutBoxInfo& b : p.boxes) {
+        c.w.beginObject();
+        c.w.field("kind", b.kind);
+        if (b.story > 0) c.w.field("story", b.story);
+        if (b.paragraph >= 0) c.w.field("paragraph", b.paragraph);
+        if (b.row >= 0) {
+            c.w.field("row", b.row);
+            c.w.field("col", b.col);
+            if (b.rowSpan > 1) c.w.field("rowSpan", b.rowSpan);
+            if (b.colSpan > 1) c.w.field("colSpan", b.colSpan);
+        }
+        c.w.field("x", b.x);
+        c.w.field("y", b.y);
+        c.w.field("width", b.width);
+        c.w.field("height", b.height);
+        if (b.inlineChar) c.w.field("inline", true);
+        if (b.band) c.w.field("band", true);
+        if (b.master) c.w.field("master", true);
+        if (b.turned) c.w.field("turned", true);
         c.w.endObject();
     }
     c.w.endArray();
@@ -860,7 +1271,7 @@ std::string statusJson(const Status& status) {
     return w.take();
 }
 
-CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_view fileDir) {
+CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_view fileDir, const FileReader& readFile) {
     CallResult out;
     Json json;
     std::string error;
@@ -889,21 +1300,25 @@ CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_v
         JsonWriter body(false);
         body.beginObject();
         std::vector<CallFile> files;
-        Call call{doc, json, fileDir, body, files};
+        Call call{doc, json, fileDir, body, files, readFile};
         if (name == "info") status = callInfo(call);
         else if (name == "pages") status = callPages(call);
         else if (name == "stories") status = callStories(call);
         else if (name == "paragraph") status = callParagraph(call);
+        else if (name == "table") status = callTable(call);
+        else if (name == "section") status = callSection(call);
+        else if (name == "layout") status = callLayout(call);
         else if (name == "text") status = callText(call);
         else if (name == "find") status = callFind(call);
         else if (name == "apply") status = callApply(call);
+        else if (name == "view") status = callView(call);
         else if (name == "undo" || name == "redo") {
             const bool done = name == "undo" ? doc.undo() : doc.redo();
             body.field("done", done);
             body.field("pages", static_cast<int>(doc.pages().size()));
         } else if (name == "render") status = callRender(call);
         else if (name == "save") status = callSave(call);
-        else status = bad("call " + name + " 은 모릅니다. info, pages, stories, paragraph, text, find, apply, undo, redo, render, save 중 하나입니다.");
+        else status = bad("call " + name + " 은 모릅니다. info, pages, stories, paragraph, table, section, layout, text, find, apply, view, undo, redo, render, save 중 하나입니다.");
         body.endObject();
         if (status.ok()) {
             out.ok = true;

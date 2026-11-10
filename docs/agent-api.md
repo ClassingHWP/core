@@ -153,10 +153,11 @@ bool redo();
 | `splitParagraph` / `mergeParagraphs` | `at` / `paragraph` | 있음(`splitParagraphAt`, `mergeParagraphs`) |
 | `insertTable` | `at`, 행·열, 칸 너비, 칸 글 | **새로** |
 | `setCellText` | `{object,row,col}`, `text` | 칸 story 에 insert/delete 로 |
-| `insertPicture` | `at`, 그림 바이트, 크기, 글자처럼 여부 | **새로** (BinData 추가) |
+| `insertPicture` | `at`, `file`(셸이 읽음)·`base64`, `width`·`height`(HU) | 있음(2026-11-10). 글자처럼 넣는다 |
 | `insertEquation` | `at`, 한글 수식 스크립트 | **새로** (측정은 `measureHangulEquation`) |
-| `deleteObject` | `object` | 개체 자리 글자 하나 지우기 |
-| `resizeObject` | `object`, 너비·높이 | `applyObjectResize` 있음 |
+| `deleteObject` | `object` | 있음(2026-11-10). `render::editDeleteObject` |
+| `objectProperties` | `object`, `set`(놓기·크기·바깥 여백) | 있음(2026-11-10). `render::editObjectProperties`, 크기는 손잡이 조절과 같은 규칙 |
+| 편집기 명령 | 머리말·꼬리말·쪽 번호·바탕쪽·쪽 지우기·메모·교정 부호·블록 계산·각주/미주·주석 모양·쪽 테두리·구역·단·표 속성·표↔문자열·캡션·책갈피·하이퍼링크·덧말·글자 바꾸기·정렬·조판 부호 지우기·모양 복사·도형 | 있음(2026-11-10). `OpKind::Command`(command 이름, 자리 at·range·object·story·section, set·args). 값은 `commandView`(JSON `view`) |
 
 `EditReport`:
 
@@ -195,8 +196,14 @@ template <class T> struct Result { Status status; T value; };
                            "text": "인수분해"}]}
 ```
 
-CLI 는 `chwp-dump` 에 `call` 명령 하나를 더한다: `chwp-dump call 문서.hwp req.json [-o out.json] [--save out.hwp]`.
+CLI 는 따로 둔다: `tools/chwp-agent`. `chwp-agent 문서.hwp req.json [-o out.json] [--out-dir DIR] [--save out.hwp]`.
 요청 파일에 여러 줄(JSON Lines)을 주면 같은 세션에서 차례로 부른다. 그림은 `--out-dir` 에 쓰고 JSON 에는 경로를 남긴다.
+`chwp-agent` 는 `agentCall` 을 감싸는 일만 한다. 문서 열기, 요청 읽기, 응답·그림 쓰기, 저장. 판단은 모두 core 에 있다.
+
+- 이 CLI 의 입력·출력 JSON 이 Skill 이 기대는 유일한 약속이다. 모양은 이 문서와 `tests/test_agent.cpp` 로 고정하고,
+  바꿀 때는 이 문서부터 고친다.
+- `chwp-dump` 는 개발용 점검 도구로 남는다. 출력이 필요에 따라 바뀌므로 Skill 은 부르지 않는다.
+
 WASM 은 `agentCall` 을 그대로 내보낸다.
 
 ## 9. 문서화 규칙
@@ -211,7 +218,7 @@ WASM 은 `agentCall` 을 그대로 내보낸다.
 2. 판정 코드를 `hit_test.cpp` 로 옮기고 `hitTest`/`itemsIn`. 포인터 처리도 같은 코드를 쓰게.
 3. `renderPage`/`renderRegion`/`renderRange`/`renderObject`.
 4. 위치 기반 `insertText`/`delete`/`replace`/서식, 트랜잭션·되돌리기.
-5. `agentCall` JSON, `chwp-dump call`, WASM 내보내기.
+5. `agentCall` JSON, `chwp-agent` CLI, WASM 내보내기.
 6. `insertTable`/`insertPicture`/`insertEquation`, 칸·글상자 편집의 다시 조판 보강.
 
 각 단계마다 `tests/test_agent.cpp` 에 샘플 문서(커밋된 `samples/shortcut.hwp` 등)로 왕복 테스트를 붙인다.
@@ -226,7 +233,7 @@ AI 웹(claude.ai 등)에서 문서를 보여 주는 길은 세 가지다. 2026-1
   Node 는 기본 목록에 없다. 런타임에 패키지를 설치할 수 없다.
 - 네트워크: Claude API 는 **완전히 막힘**. claude.ai 는 사용자·관리자 설정에 따라 다름. Claude Code 는 열림.
   → 글꼴·WASM 을 내려받는 방식은 쓸 수 없다. **필요한 것은 모두 Skill 안에 넣는다.**
-- 그래서 Skill 에는 **Linux x86_64 정적 빌드 CLI**(`chwp-dump call`)를 넣는다. Python 으로 부르기만 한다.
+- 그래서 Skill 에는 **Linux x86_64 정적 빌드 CLI**(`chwp-agent`)를 넣는다. Python 으로 부르기만 한다.
   글꼴은 자유 글꼴 묶음(함초롬 등)만 넣고, 없는 글꼴은 대체 규칙으로 그린다. 대체가 일어나면 결과 JSON 에 적는다.
 - `renderPage`/`renderRegion` 이 만든 PNG 를 Claude 가 대화에 보여 준다. 편집 결과는 HWP/HWPX 파일로 돌려준다.
 - 정할 것: Skill 묶음 크기 한도(공식 수치를 찾지 못함), 넣을 글꼴과 라이선스.

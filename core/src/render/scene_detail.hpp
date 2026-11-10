@@ -100,6 +100,13 @@ bool occupiesBodyLine(const Control& control);
 // deferSpans 면 안쪽 칸·글상자·캡션의 lineSeg 가 있는 줄은 글자 묶음을 그 쪽을 그릴 때 채운다.
 Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Document& doc, int depth,
                 std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans = false);
+// 덧말(tdut)·글자 겹치기(tcps). 글자처럼 줄에 앉는 글자 묶음 개체다(glyph_group.cpp).
+bool glyphGroupControl(const Control& control);
+std::int32_t glyphGroupWidth(const Document& doc, const Control& control, std::uint32_t charShapeId);
+Node makeGlyphGroup(const Control& control, std::uint32_t charShapeId, const Document& doc, std::int32_t x);
+// 글자처럼 넣은 원자의 개체 노드. 덧말·글자 겹치기는 글자 묶음, 나머지는 makeObject 다.
+Node atomObject(const Atom& atom, std::int32_t x, const Document& doc, int depth, std::int32_t defaultTab,
+                bool useStoredLineHeight, bool deferSpans = false);
 // 세로쓰기 틀의 개체 자리와 상자(scene.cpp). 개체는 세운 그대로라 틀에서는 너비·높이가 바뀐다.
 Placement turnedPlacement(const Placement& p);
 // 문단 runs 의 항목을 차례로 센 번호. 없으면 -1 이다. 개체 노드가 문서의 그 컨트롤을 가리킬 때 쓴다.

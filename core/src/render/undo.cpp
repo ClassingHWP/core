@@ -58,6 +58,38 @@ void placeCaretMark(const model::Document& doc, const std::vector<Node>& pages, 
                      model::CursorPos{mark.story, focusPara, focusOff});
 }
 
+// 되돌린 캐럿이 머리말·꼬리말 글이면 그 편집으로, 아니면 본문으로 둔다. 머리말 만들기·지우기를 되돌리면
+// 머리말 편집에 들어가고 나오는 것도 같이 돌아간다. 바뀌었으면 참이다.
+bool syncBandMode(const model::Document& doc) {
+    PointerHold& hold = pointerHold();
+    const PointerCursor cur = pointerCursor();
+    const model::StorySlot* slot = cur.active && cur.story > 0 ? resolveStory(doc, cur.story) : nullptr;
+    const bool band = slot && slot->kind == model::StoryKind::SubList && slot->control &&
+                      (slot->control->kind == model::ControlKind::Header ||
+                       slot->control->kind == model::ControlKind::Footer);
+    const bool master = slot && slot->kind == model::StoryKind::MasterPage;
+    if (band || master) {
+        if (hold.bandStory == cur.story && hold.bandMaster == master) return false;
+        hold.bandStory = cur.story;
+        hold.editStory = cur.story;
+        hold.bandHeader = band && slot->control->kind == model::ControlKind::Header;
+        hold.bandMaster = master;
+        setMasterView(master);
+        return true;
+    }
+    if (hold.bandStory <= 0) {
+        // 커서를 비운 뒤(agent apply 끝 등)에도 바탕쪽 보기가 남지 않게 한다.
+        if (!masterView()) return false;
+        setMasterView(false);
+        return true;
+    }
+    if (hold.editStory == hold.bandStory) hold.editStory = 0;
+    hold.bandStory = 0;
+    hold.bandMaster = false;
+    setMasterView(false);
+    return true;
+}
+
 // 문단 자체가 같은가. 줄 나눔 기록(lineSegs)은 편집이 지우므로 보지 않는다. 개체 안은 종류만 본다.
 // 개체 안 글을 고치면 그 글의 story 에서 따로 기록한다.
 bool sameParagraph(const model::Paragraph& a, const model::Paragraph& b);
@@ -99,7 +131,11 @@ bool sameParagraph(const model::Paragraph& a, const model::Paragraph& b) {
                 ia.synthetic != ib.synthetic || ia.replacedUnits != ib.replacedUnits) {
                 return false;
             }
-            if (ia.type == model::InlineItem::Type::Control && ia.control.kind != ib.control.kind) return false;
+            // 필드 명령(계산식 등)만 고쳐도 다른 문단이다. 결과 글이 같은 계산식 고치기도 되돌리기 칸에 남긴다.
+            if (ia.type == model::InlineItem::Type::Control &&
+                (ia.control.kind != ib.control.kind || ia.control.command != ib.control.command)) {
+                return false;
+            }
             if (ia.type == model::InlineItem::Type::Control && !sameTable(ia.control, ib.control)) return false;
         }
     }
@@ -144,8 +180,19 @@ public:
         armed_ = true;
     }
 
-    void finish(const model::Document& doc, const std::vector<Node>& pages, const EditResult& result) {
-        if (!armed_ || !result.documentChanged) return;
+    // 기록하고 바뀐 범위를 알린다(afterEditCommitted). result 는 알림을 들은 쪽이 더 고친 것까지 합친 결과가 된다.
+    void finish(model::Document& doc, std::vector<Node>& pages, EditResult& result, bool useStoredLineHeight) {
+        const EditChange change = record(doc, pages, result);
+        result = afterEditCommitted(doc, pages, result, change, useStoredLineHeight);
+    }
+
+private:
+    // 편집 앞뒤를 견줘 되돌리기 칸을 남기고 바뀐 범위를 돌려준다.
+    EditChange record(const model::Document& doc, const std::vector<Node>& pages, const EditResult& result) {
+        if (!result.documentChanged) return {};
+        EditChange whole;
+        whole.whole = true;
+        if (!armed_) return whole;
         UndoHistory& h = historyFor(doc);
         UndoRecord record;
         record.kind = kind_;
@@ -156,14 +203,14 @@ public:
             record.sections = std::move(sections_);
             record.fonts = std::move(fonts_);
             push(h, std::move(record));
-            return;
+            return whole;
         }
         const std::vector<model::Paragraph>* paras = storyParagraphs(doc, story_);
-        if (!paras) return;
+        if (!paras) return whole;
         const int countAfter = static_cast<int>(paras->size());
         int first = first_;
         int count = static_cast<int>(paragraphs_.size()) + (countAfter - countBefore_);
-        if (count < 0 || first + count > countAfter) return;
+        if (count < 0 || first + count > countAfter) return whole;
         // 바뀌지 않은 앞뒤 문단은 덜어 낸다.
         std::size_t head = 0;
         while (head < paragraphs_.size() && count > 0 &&
@@ -178,7 +225,11 @@ public:
             --tail;
             --count;
         }
-        if (tail == head && count == 0) return;
+        EditChange change;
+        change.story = story_;
+        change.first = first;
+        change.count = count;
+        if (tail == head && count == 0) return change;
         const bool sameCount = countAfter == countBefore_;
         // 같은 문단에 이어 친 글자·이어 지운 글자는 앞 칸에 잇는다. 앞 칸이 가진 옛 문단이 그대로 되돌릴 모습이다.
         if (!h.undo.empty() && sameCount && (kind_ == UndoKind::Typing || kind_ == UndoKind::Deleting)) {
@@ -188,7 +239,7 @@ public:
                 first >= top.first && first + count <= top.first + top.count) {
                 top.caretAfter = record.caretAfter;
                 h.redo.clear();
-                return;
+                return change;
             }
         }
         record.story = story_;
@@ -197,9 +248,9 @@ public:
         record.paragraphs.assign(std::make_move_iterator(paragraphs_.begin() + static_cast<std::ptrdiff_t>(head)),
                                  std::make_move_iterator(paragraphs_.begin() + static_cast<std::ptrdiff_t>(tail)));
         push(h, std::move(record));
+        return change;
     }
 
-private:
     static void push(UndoHistory& h, UndoRecord record) {
         if (record.id == 0) record.id = h.nextId++;
         h.redo.clear();
@@ -259,6 +310,7 @@ UndoRecord applyRecord(model::Document& doc, std::vector<Node>& pages, UndoRecor
         relayout.fullInvalidation = true;
         relayout.pageListChanged = true;
         placeCaretMark(doc, pages, record.caretBefore);
+        if (syncBandMode(doc)) placeCaretMark(doc, pages, record.caretBefore);
         return inverse;
     }
 
@@ -371,12 +423,14 @@ UndoKind keyKind(EditKey key) {
 
 }  // namespace
 
+bool syncEditBand(const model::Document& doc) { return syncBandMode(doc); }
+
 EditResult editInsertText(model::Document& doc, std::vector<Node>& pages, const std::string& text, bool composing,
                           bool useStoredLineHeight) {
     const bool lineBreak = text.find_first_of("\r\n") != std::string::npos;
     UndoTrack track(doc, pages, lineBreak ? UndoKind::Other : UndoKind::Typing);
     EditResult result = insertTextNow(doc, pages, text, composing, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -384,7 +438,7 @@ EditResult editKeyDown(model::Document& doc, std::vector<Node>& pages, EditKey k
                        bool useStoredLineHeight) {
     UndoTrack track(doc, pages, keyKind(key));
     EditResult result = keyDownNow(doc, pages, key, shift, ctrl, alt, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -395,12 +449,12 @@ EditResult editApplyFormat(model::Document& doc, std::vector<Node>& pages, const
     if (cellBlockHost(hostStory, hostParagraph)) {
         UndoTrack track(doc, pages, UndoKind::Other, hostStory, hostParagraph);
         EditResult result = applyFormatToCellsNow(doc, pages, patch, useStoredLineHeight);
-        track.finish(doc, pages, result);
+        track.finish(doc, pages, result, useStoredLineHeight);
         return result;
     }
     UndoTrack track(doc, pages, UndoKind::Other);
     EditResult result = applyFormatNow(doc, pages, patch, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -408,7 +462,7 @@ EditResult editApplyPageSetup(model::Document& doc, std::vector<Node>& pages, co
                               bool wholeDocument, bool useStoredLineHeight) {
     UndoTrack track(doc, pages, UndoKind::Sections);
     EditResult result = applyPageSetupNow(doc, pages, fields, wholeDocument, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -417,8 +471,8 @@ namespace {
 // 막힌 글꼴 때문에 받지 못한 표·그림 넣기. 글꼴을 바꾸면 그 캐럿 자리에 이어서 넣는다.
 struct PendingInsert {
     int kind = 0;  // 0 없음, 1 표, 2 그림
-    int rows = 0;
-    int cols = 0;
+    int rows = 0;  // 그림이면 정한 너비(HWPUNIT, 0 이면 그림 크기)
+    int cols = 0;  // 그림이면 정한 높이
     Bytes image;
 };
 
@@ -433,17 +487,279 @@ EditResult editInsertTable(model::Document& doc, std::vector<Node>& pages, int r
                            bool useStoredLineHeight) {
     UndoTrack track(doc, pages, UndoKind::Other);
     EditResult result = insertTableNow(doc, pages, rows, cols, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     if (result.needsFontSwap) pendingInsert() = PendingInsert{1, rows, cols, {}};
     return result;
 }
 
-EditResult editInsertPicture(model::Document& doc, std::vector<Node>& pages, const Bytes& image,
-                             bool useStoredLineHeight) {
+EditResult editInsertNote(model::Document& doc, std::vector<Node>& pages, bool endnote, bool useStoredLineHeight,
+                          std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = insertNoteNow(doc, pages, endnote, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editInsertHyperlink(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                               const std::string& url, bool useStoredLineHeight, std::string* error) {
     UndoTrack track(doc, pages, UndoKind::Other);
-    EditResult result = insertPictureNow(doc, pages, image, useStoredLineHeight);
-    track.finish(doc, pages, result);
-    if (result.needsFontSwap) pendingInsert() = PendingInsert{2, 0, 0, image};
+    std::string why;
+    EditResult result = insertHyperlinkNow(doc, pages, text, url, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editLeaveNote(model::Document& doc, std::vector<Node>& pages) { return leaveNoteNow(doc, pages); }
+
+EditResult editNoteShape(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, bool endnote,
+                         bool wholeDocument, bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = noteShapeNow(doc, pages, fields, endnote, wholeDocument, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editPageBorder(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, bool wholeDocument,
+                          bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = pageBorderNow(doc, pages, fields, wholeDocument, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editCaption(model::Document& doc, std::vector<Node>& pages, const std::string& caption,
+                       bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result;
+    TableEditCommand cmd;
+    if (pointerHold().selectedObject) {
+        result = objectCaptionNow(doc, pages, caption, useStoredLineHeight, why);
+    } else if (tableCommandAtCursor(doc, cmd)) {
+        cmd.kind = TableEditKind::Caption;
+        cmd.caption = caption;
+        result = tableEditNow(doc, pages, cmd, useStoredLineHeight, why);
+    } else {
+        why = "캡션을 달 개체를 고르거나 캐럿을 표 안에 두십시오.";
+    }
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editBookmark(model::Document& doc, std::vector<Node>& pages, const std::string& action, const std::string& name,
+                        bool useStoredLineHeight, std::string* error, const std::string& newName) {
+    std::string why;
+    if (action == "goto") {
+        EditResult moved = bookmarkNow(doc, pages, action, name, useStoredLineHeight, why);
+        if (error) *error = why;
+        return moved;
+    }
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = bookmarkNow(doc, pages, action, name, useStoredLineHeight, why, newName);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editGlyphGroup(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                          bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = glyphGroupNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editConvertText(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                           bool useStoredLineHeight, std::string* error) {
+    // 블록이 여러 문단에 걸칠 수 있다. 구역째 베껴 되돌리기 한 칸으로 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = convertTextNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editSortParagraphs(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                              bool useStoredLineHeight, std::string* error) {
+    // 블록이 여러 문단에 걸친다. 구역째 베껴 되돌리기 한 칸으로 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = sortParagraphsNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editDeleteMarks(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                           bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = deleteMarksNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editTableText(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                         bool useStoredLineHeight, std::string* error) {
+    std::string action;
+    for (const auto& [name, value] : fields) {
+        if (name == "action") {
+            if (const std::string* t = std::get_if<std::string>(&value)) action = *t;
+        }
+    }
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = action == "textToTable" ? textToTableNow(doc, pages, fields, useStoredLineHeight, why)
+                                                : tableToTextNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editCopyShape(model::Document& doc, std::vector<Node>& pages, const std::string& action, int type,
+                         bool useStoredLineHeight, std::string* error) {
+    std::string why;
+    if (action == "copy") {
+        EditResult result = copyShapeNow(doc, pages, action, type, useStoredLineHeight, why);
+        if (error) *error = why;
+        return result;
+    }
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = copyShapeNow(doc, pages, action, type, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editExchangeNotes(model::Document& doc, std::vector<Node>& pages, int mode, bool useStoredLineHeight,
+                             std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = exchangeNotesNow(doc, pages, mode, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editGoToSection(model::Document& doc, std::vector<Node>& pages, int section, std::string* error) {
+    std::string why;
+    EditResult moved = goToSectionNow(doc, pages, section, why);
+    if (error) *error = why;
+    return moved;
+}
+
+EditResult editGoToPage(model::Document& doc, std::vector<Node>& pages, int page, std::string* error) {
+    std::string why;
+    EditResult moved = goToPageNow(doc, pages, page, why);
+    if (error) *error = why;
+    return moved;
+}
+
+EditResult editTableProperties(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                               bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = tablePropertiesNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editSectionSettings(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                               bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = sectionSettingsNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editColumns(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                       bool useStoredLineHeight, std::string* error) {
+    // 문서 전체는 구역마다 첫 문단을 고치고, 새 단·새 쪽은 문단을 가른다. 구역째 베껴 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = columnsNow(doc, pages, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editPageControl(model::Document& doc, std::vector<Node>& pages, PageControlKind kind,
+                           const FormatFields& fields, bool useStoredLineHeight, std::string* error) {
+    // 머리말·쪽 번호는 구역 첫 문단이나 표 칸 문단 등 캐럿 밖 문단을 고친다. 구역째 베껴 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = pageControlNow(doc, pages, kind, fields, useStoredLineHeight, error);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
+EditResult editInsertBreak(model::Document& doc, std::vector<Node>& pages, BreakKind kind,
+                           bool useStoredLineHeight) {
+    // 구역 나누기는 구역 목록을, 나머지는 문단을 바꾼다. 둘 다 구역째 베껴 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = insertBreakNow(doc, pages, kind, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
+EditResult editReplaceText(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                           const std::string& replacement, bool matchCase, bool useStoredLineHeight) {
+    UndoTrack track(doc, pages, UndoKind::Other);
+    EditResult result = replaceTextNow(doc, pages, text, replacement, matchCase, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
+EditResult editReplaceAllText(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                              const std::string& replacement, bool matchCase, bool useStoredLineHeight, int* count) {
+    // 문서 곳곳의 문단을 고친다. 구역째 베껴 되돌리기 한 칸으로 둔다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    int changed = 0;
+    EditResult result = replaceAllTextNow(doc, pages, text, replacement, matchCase, useStoredLineHeight, changed);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (count) *count = changed;
+    return result;
+}
+
+EditResult editTable(model::Document& doc, std::vector<Node>& pages, const TableEditCommand& cmd,
+                     bool useStoredLineHeight, std::string* error) {
+    std::string why;
+    int story = -1;
+    int paragraph = -1;
+    EditResult result;
+    if (!tableEditHost(doc, cmd, story, paragraph)) {
+        why = "story " + std::to_string(cmd.story) + " 은 표 칸이 아닙니다.";
+    } else {
+        // 표를 담은 문단을 베껴 둔다. 표 구조와 칸 글이 모두 그 문단 안에 있다.
+        UndoTrack track(doc, pages, UndoKind::Other, story, paragraph);
+        result = tableEditNow(doc, pages, cmd, useStoredLineHeight, why);
+        track.finish(doc, pages, result, useStoredLineHeight);
+    }
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editInsertPicture(model::Document& doc, std::vector<Node>& pages, const Bytes& image,
+                             bool useStoredLineHeight, std::int32_t width, std::int32_t height) {
+    UndoTrack track(doc, pages, UndoKind::Other);
+    EditResult result = insertPictureNow(doc, pages, image, useStoredLineHeight, width, height);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    // 그림은 rows·cols 칸에 정한 크기를 둔다.
+    if (result.needsFontSwap) pendingInsert() = PendingInsert{2, width, height, image};
     return result;
 }
 
@@ -453,7 +769,9 @@ EditResult resumePendingInsert(model::Document& doc, std::vector<Node>& pages, b
     PendingInsert pending = std::move(pendingInsert());
     pendingInsert() = PendingInsert{};
     if (pending.kind == 1) return editInsertTable(doc, pages, pending.rows, pending.cols, useStoredLineHeight);
-    if (pending.kind == 2) return editInsertPicture(doc, pages, pending.image, useStoredLineHeight);
+    if (pending.kind == 2) {
+        return editInsertPicture(doc, pages, pending.image, useStoredLineHeight, pending.rows, pending.cols);
+    }
     return editInsertDrawnShape(doc, pages, useStoredLineHeight);
 }
 
@@ -480,7 +798,7 @@ EditResult editInsertShape(model::Document& doc, std::vector<Node>& pages, int t
     shapeAnchor(doc, pages, page, std::min(y0, y1), story, paragraph);
     UndoTrack track(doc, pages, UndoKind::Other, story, paragraph);
     EditResult result = insertShapeNow(doc, pages, tool, page, x0, y0, x1, y1, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -492,7 +810,28 @@ EditResult editInsertDrawnShape(model::Document& doc, std::vector<Node>& pages, 
     shapeAnchor(doc, pages, hold.drawPage, std::min(hold.drawY0, hold.drawY1), story, paragraph);
     UndoTrack track(doc, pages, UndoKind::Other, story, paragraph);
     EditResult result = insertDrawnShapeNow(doc, pages, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
+EditResult editObjectProperties(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                                const FormatFields& fields, bool useStoredLineHeight, std::string* error) {
+    // 글을 비켜 가는 개체는 그 글 묶음의 저장된 줄을 다 지우므로 구역째 남긴다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = objectPropertiesNow(doc, pages, story, paragraph, item, fields, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editDeleteObject(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                            bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = deleteObjectNow(doc, pages, story, paragraph, item, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
     return result;
 }
 
@@ -502,7 +841,7 @@ EditResult editMoveObject(model::Document& doc, std::vector<Node>& pages, bool u
     // 글을 비켜 가는 개체는 그 글 묶음의 저장된 줄을 다 지우므로 구역째 남긴다.
     UndoTrack track(doc, pages, UndoKind::Sections);
     EditResult result = moveObjectNow(doc, pages, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -511,7 +850,7 @@ EditResult editResizeObject(model::Document& doc, std::vector<Node>& pages, bool
     if (!hold.resizeObjectPending) return {};
     UndoTrack track(doc, pages, UndoKind::Sections);
     EditResult result = resizeObjectNow(doc, pages, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -520,7 +859,7 @@ EditResult editResizeTableBorder(model::Document& doc, std::vector<Node>& pages,
     if (!hold.borderPending) return {};
     UndoTrack track(doc, pages, UndoKind::Sections);
     EditResult result = resizeTableBorderNow(doc, pages, useStoredLineHeight);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -529,16 +868,21 @@ EditResult editSwapLicenseFonts(model::Document& doc, std::vector<Node>& pages, 
                                 const std::vector<std::pair<std::string, std::string>>& chosen) {
     UndoTrack track(doc, pages, UndoKind::Sections);
     EditResult result = swapLicenseFontsNow(doc, pages, useStoredLineHeight, chosen);
-    track.finish(doc, pages, result);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
+// 되돌리기·다시 하기도 편집이다. 계산식 결과는 입력에서 나오는 값이라 되돌리기 칸에 담지 않고, 되돌린 뒤 다시 계산한다.
 EditResult editUndo(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
-    return stepHistory(doc, pages, useStoredLineHeight, true);
+    EditChange whole;
+    whole.whole = true;
+    return afterEditCommitted(doc, pages, stepHistory(doc, pages, useStoredLineHeight, true), whole, useStoredLineHeight);
 }
 
 EditResult editRedo(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
-    return stepHistory(doc, pages, useStoredLineHeight, false);
+    EditChange whole;
+    whole.whole = true;
+    return afterEditCommitted(doc, pages, stepHistory(doc, pages, useStoredLineHeight, false), whole, useStoredLineHeight);
 }
 
 bool canUndo() { return !undoHistory().undo.empty(); }

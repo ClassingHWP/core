@@ -87,8 +87,13 @@ struct FrameDesc {
     int lineStory = -1;
     int lineParagraph = -1;
     int lineStart = -1;
-    // 세로쓰기 본문 칸. x·y·w·h 는 종이 픽셀이고, huX·huY·huW·huH·originX·originY 는 돌린 틀의 HU 다.
-    // 칸은 돌린 틀로 그린 뒤 시계 방향으로 돌려 굽는다.
+    // 칸을 그릴 때 쓰는 상자(HU). 가로 칸은 huX·huY·huW·huH 와 같고, 세로쓰기 칸은 돌린 틀의 상자다.
+    std::int32_t drawHuX = 0;
+    std::int32_t drawHuY = 0;
+    std::int32_t drawHuW = 0;
+    std::int32_t drawHuH = 0;
+    // 세로쓰기 본문 칸. x·y·w·h 는 종이 픽셀이고 huX·huY·huW·huH 는 종이 HU 다(다른 배율의 자리·잘라 내기에 쓴다).
+    // drawHu*·originX·originY 는 돌린 틀의 HU 다. 칸은 돌린 틀로 그린 뒤 시계 방향으로 돌려 굽는다.
     bool turned = false;
     std::vector<int> path;
 };
@@ -197,6 +202,8 @@ struct CursorStyle {
     std::string styleType = "PARA";
     std::uint32_t paraShapeId = 0;
     std::string align = "JUSTIFY";
+    std::string headingType = "NONE";  // NONE, OUTLINE, NUMBER, BULLET
+    int headingLevel = 0;              // 0 이 1 수준
     std::string lineSpacingType = "PERCENT";
     std::int32_t lineSpacing = 160;
     // 보이는 줄 간격: 퍼센트면 % 값, 아니면 pt 값과 그 단위.
@@ -206,6 +213,8 @@ struct CursorStyle {
     std::string font;
     // font 가 라이선스로 막힌 글꼴이면 편집할 때 바뀔 글꼴 이름. 아니면 비어 있다.
     std::string fontSwapTo;
+    // 언어별 글꼴(model::Lang 차례: 한글, 영문, 한자, 일어, 외국어, 기호, 사용자). 서식 막대 언어 칸이 고른 언어의 글꼴이다.
+    std::array<std::string, model::kLangCount> langFonts{};
     std::int32_t fontSize = 1000;
     double fontSizePt() const;
     // 글자 크기 칸이 고른 단위(pt, mm, cm, inch, px)로 본 크기. 소수 둘째 자리다.
@@ -215,6 +224,12 @@ struct CursorStyle {
     bool underline = false;
     std::string underlineType = "NONE";
     bool strikeout = false;
+    bool superscript = false;
+    bool subscript = false;
+    std::string underlineColor = "#000000";
+    std::string strikeColor = "#000000";
+    // 글자 테두리가 한 변이라도 있는가.
+    bool charBorder = false;
     std::string color = "#000000";
     // 블록 안에서 값이 섞였는가. 섞인 칸은 셸이 비워 둔다(한글처럼 글꼴·크기는 빈칸, 정렬은 아무것도 누르지 않음).
     // 위 값은 블록 첫 글자 자리의 값이다.
@@ -226,10 +241,18 @@ struct CursorStyle {
         bool italic = false;
         bool underline = false;
         bool strikeout = false;
+        bool superscript = false;
+        bool subscript = false;
+        bool underlineColor = false;
+        bool strikeColor = false;
+        bool charBorder = false;
         bool color = false;
         bool align = false;
         bool lineSpacing = false;
+        std::array<bool, model::kLangCount> langFonts{};
+        bool operator==(const Mixed&) const = default;
     } mixed;
+    bool operator==(const CursorStyle&) const = default;
 };
 
 CursorStyle cursorStyle(const model::Document& doc, const std::vector<Node>& pages);
@@ -247,6 +270,12 @@ struct CaretStatus {
     // 머리말·꼬리말 편집 중이면 1(머리말)·2(꼬리말), 본문이면 0.
     int band = 0;
     bool overwrite = false;  // 수정 모드
+    bool table = false;      // 캐럿이 표 칸 안이거나 칸 블록을 잡았다(셸은 표 탭을 보인다)
+    bool cellBlock = false;  // 칸 블록을 잡았다(블록 단축키 M·S·W·H 가 산다)
+    bool cellStart = false;  // 블록 없이 캐럿이 표 칸 맨 앞이다(Ctrl+Backspace 가 줄을 뺀다)
+    int note = 0;            // 캐럿이 각주(1)·미주(2) 안이다(셸은 주석 탭을 보인다)
+    bool master = false;     // 바탕쪽 편집 중이다(셸은 바탕쪽 탭을 보인다)
+    bool operator==(const CaretStatus&) const = default;
 };
 
 CaretStatus caretStatus(const model::Document& doc, const std::vector<Node>& pages);
@@ -262,6 +291,11 @@ struct BandVeil {
 };
 
 BandVeil bandVeil(int page);
+
+// 바탕쪽 편집 화면이면 참이다. 그동안 쪽에는 바탕쪽만 그린다(본문·머리말·꼬리말을 감춘다).
+// 켜고 끌 때마다 masterViewEpoch 가 오른다. 세션은 그 값이 바뀌면 쪽 그림을 모두 다시 그린다.
+bool masterView();
+int masterViewEpoch();
 
 // 블록으로 칠할 칸. 좌표는 그 쪽의 종이 왼쪽 위 기준이다.
 // 세로는 글자 상자에 그 줄의 줄 간격을 더한 값이다. 다음 줄 글자는 이 칸에 넣지 않는다.
@@ -326,6 +360,8 @@ bool selectionPins();
 bool pinUnder(int page, int x, int y, double radius);
 // 마커를 끌지 않고 눌렀다 뗐으면 한 번만 true 다. 셸은 이때 복사·잘라내기 메뉴를 띄운다.
 bool takePinTap();
+// 두 번 누르기로 연 고치기 대화 상자 이름(rubyEdit·composeEdit). 한 번 가져가면 비운다.
+std::string takeOpenDialog();
 // 마우스가 올라간 자리의 CSS 커서 이름. 개체 손잡이면 크기 화살표, 글줄 위면 text, 나머지는 default 다.
 // 읽기 전용이면 손잡이 화살표를 내지 않는다. handleRadius 는 HWPUNIT 이다.
 std::string hoverCursor(const model::Document& doc, const std::vector<Node>& pages, int page, int x, int y,
@@ -413,7 +449,12 @@ enum class EditKey : int {
     Escape = 11,  // 머리말·꼬리말 편집에서 본문으로 나간다
     SelectAll = 12,  // Ctrl+A. 커서가 든 글 묶음 전체를 블록으로 잡는다
     Insert = 13,     // 삽입·수정 바꾸기
+    DocBegin = 14,   // Ctrl+PageUp. 문서 본문 처음(한글 MoveTopLevelBegin)
+    DocEnd = 15,     // Ctrl+PageDown. 문서 본문 끝(한글 MoveTopLevelEnd)
 };
+// 키 하나에 붙은 이동(한글 2024 단축키 표): Ctrl+←→ 단어(MovePrevWord·MoveNextWord), Ctrl+↑↓ 문단 처음
+// (MovePrevParaBegin·MoveNextParaBegin), Alt+Home·End 문단 처음·끝(MoveParaBegin·MoveParaEnd).
+// Shift 를 같이 누르면 블록을 넓힌다.
 
 // 읽기 전용 문서. 글자 넣기·지우기·문단 나누기·탭·서식·개체 크기 조절을 받지 않는다.
 // 클릭·끌기 블록, 방향키·Home·End 이동, 블록 글자 읽기(복사)는 그대로다.
@@ -460,7 +501,8 @@ EditResult editSwapLicenseFonts(model::Document& doc, std::vector<Node>& pages, 
                                 const std::vector<std::pair<std::string, std::string>>& chosen = {});
 
 // 진행 중인 한글 IME 조합을 확정한다(조합 반전 해제).
-EditResult editCommitComposition(model::Document& doc, const std::vector<Node>& pages);
+// 조합을 끝낸다. 조합 중에는 미뤘던 편집 마무리 알림(계산식 다시 계산 등)을 확정한 글자로 낸다.
+EditResult editCommitComposition(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
 
 // 키보드 편집/이동 키(Backspace, Delete, Enter, Shift+Enter, 방향키, Home, End, Tab)를 처리한다.
 EditResult editKeyDown(model::Document& doc, std::vector<Node>& pages, EditKey key, bool shift = false,
@@ -474,6 +516,21 @@ using FormatFields = std::vector<std::pair<std::string, FormatValue>>;
 struct FormatPatch {
     bool hasStyleId = false;
     std::uint32_t styleId = 0;
+    // 스타일 이름(styleName). 적용할 때 문서의 스타일에서 찾는다. 없는 이름이면 고치지 않는다.
+    std::string styleName;
+    // 첫 줄 들여쓰기 한 단계(+)·내어쓰기 한 단계(-). 한 단계는 1pt 다(한글 2024 ParagraphShapeIndentPositive).
+    int indentStep = 0;
+    // 왼쪽·오른쪽 여백 한 단계(한글 2024 ParagraphShapeIncrease/DecreaseLeftMargin·RightMargin). 한 단계는 1pt(100HU)이고 끝값은 단 폭으로 정한다.
+    // marginLeftStep 은 + 가 왼쪽 여백을 늘리고, marginRightStep 은 + 가 오른쪽 여백을 줄인다(한글 이름 그대로:
+    // IncreaseRightMargin 은 글 오른쪽 끝을 오른쪽으로 민다).
+    int marginLeftStep = 0;
+    int marginRightStep = 0;
+    // 문단 번호(NUMBER)·글머리표(BULLET)·개요(OUTLINE) 켜고 끄기. 블록 첫 문단이 이미 그 종류면 끄고, 아니면 켠다.
+    // 개요는 개요 수준 스타일(개요 1)을 입히고, 끄면 바탕 스타일로 돌린다(한글 2024 PutOutlineNumber).
+    std::string headingToggle;
+    // 수준 한 단계 아래(+)·위(-). 개요는 그 수준의 개요 스타일을, 번호·글머리표는 수준 값을 바꾼다.
+    // 머리가 없는 문단을 아래로 내리면 개요 1 이 된다(한글 2024 ParaNumberBulletLevelDown).
+    int headingLevelStep = 0;
 
     bool hasAlign = false;
     std::string align;
@@ -497,6 +554,11 @@ struct FormatPatch {
     std::string fontSizeUnit;
     // 글자마다 1pt 씩 올리기(+)·내리기(-).
     int fontSizeStep = 0;
+    // 글자마다 자간 1%·장평 1% 씩 넓히기(+)·좁히기(-)(한글 2024 CharShapeSpacing·Width Increase/Decrease).
+    int spacingStep = 0;
+    int ratioStep = 0;
+    // 보통 모양(한글 2024 CharShapeNormal, Alt+Shift+C). 글꼴·크기·장평·자간·위치는 두고 속성을 모두 끈다.
+    bool normalShape = false;
     bool hasBold = false;
     bool bold = false;
     bool hasItalic = false;
@@ -507,10 +569,17 @@ struct FormatPatch {
     std::string underlineType;
     bool hasStrikeout = false;
     bool strikeout = false;
-    // 켜고 끄기("bold", "italic", "underline", "strikeout"). 지금 고른 글의 모양을 보고 켤지 끌지 core 가 정한다.
+    // 밑줄·취소선·글자 테두리 목록에서 고른 값(한글 2024 서식 탭 펼침 목록). 이름은 underlineShape, underlineColor,
+    // strikeShape, strikeColor, charBorderType, charBorderColor 이다. 고른 값을 기억하고 그 줄을 켠다.
+    std::vector<std::pair<std::string, std::string>> linePicks;
+    // 켜고 끄기("bold", "italic", "underline", "strikeout", "superscript", "subscript", "superSub", "charBorder").
+    // 지금 고른 글의 모양을 보고 켤지 끌지 core 가 정한다. superSub 는 보통 → 위 첨자 → 아래 첨자 → 보통 차례다.
     std::vector<std::string> toggles;
     bool hasColor = false;
     std::string color;
+    // 형광펜(#RRGGBB). 빈 값은 지운다. 고른 글자에만 칠한다.
+    bool hasMarkpen = false;
+    std::string markpen;
 
     // 위에 없는 나머지 글자 모양·문단 모양 값. 고친 값만 들어 있다. 이름과 단위는 setFormatField 가 정한다.
     FormatFields fields;
@@ -526,6 +595,70 @@ FormatFields formatFieldsAtCursor(const model::Document& doc, const std::vector<
 // 현재 커서 또는 블록 선택 구간에 스타일·문단 속성·글자 모양 변경을 적용하고 재조판한다.
 EditResult editApplyFormat(model::Document& doc, std::vector<Node>& pages, const FormatPatch& patch,
                            bool useStoredLineHeight = false);
+
+// 쪽 하나의 그려진 배치. 좌표는 쪽 왼쪽 위에서 잰 HWPUNIT 이고, 그리기와 같은 자리 계산(placeLine)이다.
+// 줄: story·문단·글자 범위 [from, to)(글자 순번), 줄 상자, 글자가 실제로 끝나는 오른쪽(inkRight), 그 줄에 붙은
+// 문단 번호·글머리(heading). 상자: 표·칸·그림·도형·수식·묶음·단. 칸은 그 칸 글 story 와 줄·칸 자리를 든다.
+// band 는 머리말·꼬리말·쪽 번호, master 는 바탕쪽, turned 는 세로쓰기 틀 안(좌표가 돌린 틀 기준)이다.
+struct LayoutLine {
+    int story = -1;
+    int paragraph = -1;
+    int from = 0;
+    int to = 0;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    std::int32_t inkRight = 0;
+    std::string heading;
+    bool band = false;
+    bool master = false;
+    bool turned = false;
+};
+struct LayoutBox {
+    std::string kind;  // table, cell, picture, shape, equation, container, column, object
+    int story = -1;    // 칸: 칸 글 story. 개체: 개체가 박힌 문단의 story
+    int paragraph = -1;
+    int row = -1;
+    int col = -1;
+    int rowSpan = 1;
+    int colSpan = 1;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+    bool inlineChar = false;
+    bool band = false;
+    bool master = false;
+    bool turned = false;
+};
+struct PageLayout {
+    std::int32_t width = 0;   // 쪽 크기
+    std::int32_t height = 0;
+    std::int32_t bodyX = 0;   // 본문 틀(여백 안)
+    std::int32_t bodyY = 0;
+    std::int32_t bodyWidth = 0;
+    std::int32_t bodyHeight = 0;
+    std::vector<LayoutLine> lines;
+    std::vector<LayoutBox> boxes;
+};
+// 쪽 글자를 아직 채우지 않았으면 채운다(그리기 전과 같다).
+PageLayout describePage(const model::Document& doc, std::vector<Node>& pages, int pageIndex);
+
+// 모양 값 읽기. 이름은 setFormatField 와 대화 상자가 쓰는 이름과 같다(읽은 값을 고쳐 그대로 넣을 수 있다).
+// 글자 모양(font·fontSize·bold … 언어별 값, "char." 테두리/배경)과 문단 모양(align·줄 간격·여백·번호, "para.", 탭).
+FormatFields charShapeFields(const model::Document& doc, std::uint32_t charShapeId);
+FormatFields paraShapeFields(const model::Document& doc, std::uint32_t paraShapeId);
+// 표: 칸 간격·쪽 나눔·제목 줄 반복·안쪽 여백과 "table." 테두리/배경.
+FormatFields tableFields(const model::Document& doc, const model::Table& table);
+// 표 칸: 세로 정렬·제목 칸·안 여백(칸 여백이 없으면 표 안쪽 여백)과 "cell." 테두리/배경.
+FormatFields tableCellFields(const model::Document& doc, const model::Table& table, const model::TableCell& cell);
+// 개체 놓기: 글자처럼 취급·본문과의 배치·기준·정렬·오프셋·크기(HWPUNIT).
+FormatFields placementFields(const model::Placement& placement);
+// 구역 하나(0부터)의 편집 용지 값(pageSetupAtCursor 와 같은 이름)과 단(columnCount·columnGap·columnType·
+// columnSameSize·columnLineType), 쪽 번호 시작(pageStart, 0 은 앞 구역에 이어서), 기본 탭(sectionDefaultTab),
+// 감추기(hideHeader·hideFooter·hideMaster·hidePageNum).
+FormatFields sectionFields(const model::Document& doc, int section);
 
 // 편집 용지: 커서가 있는 구역의 용지·여백·제본·격자 값. 길이는 HWPUNIT 이다.
 // paperWidth·paperHeight 는 한글 대화 상자처럼 좁게(세로) 놓은 크기이고, landscape 가 참이면 가로로 눕힌다.
@@ -544,10 +677,316 @@ EditResult editApplyPageSetup(model::Document& doc, std::vector<Node>& pages, co
 EditResult editInsertTable(model::Document& doc, std::vector<Node>& pages, int rows, int cols,
                            bool useStoredLineHeight = false);
 
+// 표 구조 편집. 칸은 표 칸 story 번호로 가리킨다. 규칙은 한글 2024 와 같다(model/table_edit.hpp).
+enum class TableEditKind {
+    InsertRows, InsertColumns, DeleteRows, DeleteColumns, Merge, Split,
+    CellBorder,   // 셀 테두리 단추(border)
+    CellFill,     // 셀 배경색(color)
+    EqualWidth,   // 셀 너비를 같게
+    EqualHeight,  // 셀 높이를 같게
+    CellAlign,    // 내용 정렬: vertAlign(TOP·CENTER·BOTTOM), horzAlign(LEFT·CENTER·RIGHT, 비면 그대로)
+    CellDirection,  // 글자 방향: direction 0 가로, 1 세로(영문 눕힘), 2 세로(영문 세움)
+    TableMargin,  // 표 여백: margin 은 outer(바깥 여백)·inner(모든 셀의 안 여백), preset 은 normal·wide·narrow·none
+    TreatAsChar,  // 글자처럼 취급 켜고 끄기
+    Wrap,         // 본문과의 배치: wrap 은 SQUARE·TOP_AND_BOTTOM·IN_FRONT_OF_TEXT·BEHIND_TEXT. 글자처럼 취급이면 거절
+    Caption,      // 캡션: caption 은 TOP·BOTTOM·LEFT_TOP·LEFT_CENTER·LEFT_BOTTOM·RIGHT_TOP·RIGHT_CENTER·RIGHT_BOTTOM·NONE(떼기)
+    SplitTable,   // 표 나누기: 캐럿 줄부터 아래를 새 표로
+    MergeTable,   // 표 붙이기: 바로 다음 문단의 표를 이 표 아래에 잇는다
+    Comma,        // 1,000 단위 구분 쉼표: comma 가 insert 면 넣고 delete 면 뺀다. 칸 블록에만 한다
+    Flip,         // 표 뒤집기: flip 0 줄 기준, 1 칸 기준, 2 줄/칸, 3 반시계 90도, 4 180도, 5 시계 90도. swapMargin 은 여백 뒤집기
+    AutoFill,     // 표 자동 채우기: 칸 블록의 처음 값 규칙으로 나머지 칸을 채운다. 칸 블록에만 한다
+    Sort,         // 표 정렬: sortKeys(기준 셋까지), sortFromRear·sortExtendYear·sortYearBase. 두 줄 이상 칸 블록에만 한다
+    // 계산식(한글 TableFormula·TableFormulaSum/Avg/Pro + Auto·Hor·Ver). formulaMode 가 block 이면 블록 계산식(칸 블록),
+    // horizontal·vertical 이면 쉬운 계산식(칸 블록이면 끝 칸, 아니면 캐럿 자리), custom 이면 formulaText·formulaFormat 을
+    // 캐럿 자리에 넣는다(캐럿이 계산식 결과 안이면 그 식을 고친다). formulaFunc 0 합계 1 평균 2 곱
+    Formula
+};
+struct TableEditCommand {
+    TableEditKind kind = TableEditKind::InsertRows;
+    int story = -1;     // 기준 칸
+    int toStory = -1;   // 지우기·합치기·테두리·배경·크기 같게: 범위의 다른 끝 칸. 두 칸을 덮는 사각형이 범위다. -1 이면 기준 칸만
+    bool after = true;  // 넣기: 참이면 아래(오른쪽), 거짓이면 위(왼쪽)
+    int count = 1;      // 넣기: 줄(칸) 수
+    int rows = 1;       // 나누기: 줄 수 × 칸 수
+    int cols = 1;
+    // 테두리: all, outside, inside, top, bottom, left, right, insideHorz, insideVert, none, diagonalDown, diagonalUp
+    std::string border;
+    // 테두리 선. 한글 표 탭의 기본 선(실선 0.12mm 검정)이 기본값이다. lineWidth 는 HWPUNIT, 0 이면 0.12mm.
+    std::string lineType = "SOLID";
+    std::int32_t lineWidth = 0;
+    std::string lineColor = "#000000";
+    std::string color;  // 배경: "#RRGGBB". 비었거나 "none" 이면 배경을 없앤다
+    std::string vertAlign;  // 내용 정렬
+    std::string horzAlign;
+    int direction = 0;      // 글자 방향
+    std::string margin;     // 표 여백: outer, inner
+    std::string preset;     // 표 여백: normal, wide, narrow, none
+    std::string wrap;       // 배치
+    std::string caption;    // 캡션 자리
+    std::string comma;      // 1,000 단위 쉼표: insert, delete
+    int flip = 0;           // 표 뒤집기 종류(한글 TableSwap type)
+    bool swapMargin = false;  // 표 뒤집기: 표 안쪽 여백과 칸 여백도 같이 뒤집는다
+    // 표 정렬 기준(한글 Sort 의 KeyOption). column 은 블록 첫 칸이 1, format 0 글자 1 숫자 2 날짜 3 코드.
+    struct SortKey {
+        int column = 1;
+        int format = 0;
+        bool descending = false;
+    };
+    std::vector<SortKey> sortKeys;
+    bool sortFromRear = false;   // 뒤에서 앞으로 비교
+    bool sortExtendYear = true;  // 두 자리 연도 기준 적용
+    int sortYearBase = 1930;
+    bool sortOldHangul = false;   // 고어 정렬
+    bool sortFinalFirst = false;  // 종성/중성/초성 순으로 비교
+    std::string formulaMode;      // 계산식: block, horizontal, vertical, custom
+    int formulaFunc = 0;          // 계산식: 0 합계, 1 평균, 2 곱
+    std::string formulaText;      // 계산식(custom): "=SUM(A1:B2)"
+    std::string formulaFormat;    // 계산식(custom): "%g,", "%.2f" 등
+};
+const char* tableEditName(TableEditKind kind);
+// 이름(insertRows, insertColumns, deleteRows, deleteColumns, mergeCells, splitCell, cellBorder, cellFill,
+// equalWidth, equalHeight, cellAlign, cellDirection, tableMargin, treatAsChar, wrap, caption, splitTable,
+// mergeTable, comma, flip, autoFill, sort, formula)을 종류로. 모르는 이름이면 거짓.
+bool tableEditKindOf(const std::string& name, TableEditKind& kind);
+// 편집기 캐럿·칸 블록으로 칸을 채운다. 칸 블록이면 두 끝 칸, 아니면 캐럿이 든 칸. 표 칸이 아니면 거짓.
+bool tableCommandAtCursor(const model::Document& doc, TableEditCommand& cmd);
+// 명령이 고칠 표를 담은 story·문단.
+bool tableEditHost(const model::Document& doc, const TableEditCommand& cmd, int& story, int& paragraph);
+// 표를 고치고 다시 놓고, 캐럿을 고친 자리의 칸으로 옮긴다. 되돌리기 한 칸이다.
+// 고치지 못하면 handled 가 거짓이고 error 에 이유를 적는다(합친 칸을 자르는 합치기 등).
+// 모든 줄·칸을 지우면 표를 지운다.
+EditResult editTable(model::Document& doc, std::vector<Node>& pages, const TableEditCommand& cmd,
+                     bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 각주·미주 넣기(한글 InsertFootnote·InsertEndnote). 캐럿 자리에 주를 넣고 캐럿을 주 글 묶음의 번호 뒤로 옮긴다.
+// 머리말·꼬리말·주 안이면 넣지 않고 error 에 이유를 적는다. 되돌리기 한 칸이다.
+EditResult editInsertNote(model::Document& doc, std::vector<Node>& pages, bool endnote, bool useStoredLineHeight = false,
+                          std::string* error = nullptr);
+
+// 캡션(한글 2024 CaptionPos*·TableCaptionPos*·DetachCaption). 개체를 골랐으면 그 개체(그림·도형·수식·글상자·표),
+// 아니면 캐럿이 든 표다. caption: TOP·BOTTOM·LEFT_TOP·LEFT_CENTER·LEFT_BOTTOM·RIGHT_TOP·RIGHT_CENTER·RIGHT_BOTTOM·NONE.
+EditResult editCaption(model::Document& doc, std::vector<Node>& pages, const std::string& caption,
+                       bool useStoredLineHeight = false, std::string* error = nullptr);
+// 책갈피(한글 2024 책갈피 대화 상자, bookmark_commands.cpp). 목록은 글 묶음·문단·글자 차례다.
+struct BookmarkEntry {
+    std::string name;
+    int story = -1;
+    int paragraph = -1;
+    int charIndex = 0;
+};
+std::vector<BookmarkEntry> bookmarkList(const model::Document& doc);
+// 대화 상자의 처음 이름: 캐럿 뒤 낱말, 없으면 앞 낱말.
+std::string bookmarkDefaultName(const model::Document& doc, const std::vector<Node>& pages);
+// action: insert(캐럿 자리에 넣기, 같은 이름이 있으면 거절), delete(지우기), goto(그 자리로 캐럿, 문서는 그대로),
+// rename(name 을 newName 으로. 빈 이름·이미 있는 이름은 거절).
+EditResult editBookmark(model::Document& doc, std::vector<Node>& pages, const std::string& action, const std::string& name,
+                        bool useStoredLineHeight = false, std::string* error = nullptr, const std::string& newName = {});
+// 찾아가기: 쪽(0 부터) 본문 맨 위 줄 맨 앞으로 캐럿을 옮긴다.
+EditResult editGoToPage(model::Document& doc, std::vector<Node>& pages, int page, std::string* error = nullptr);
+// 구역 찾아가기. section 은 0 부터다. 그 구역 본문 맨 앞으로 캐럿을 옮긴다.
+EditResult goToSectionNow(model::Document& doc, std::vector<Node>& pages, int section, std::string& why);
+EditResult editGoToSection(model::Document& doc, std::vector<Node>& pages, int section, std::string* error = nullptr);
+// 모양 복사(한글 ShapeCopyPaste, Alt+C). action copy(type 0 글자 모양, 1 문단 모양, 2 둘 다, 4 문단 스타일)는 캐럿 자리
+// 모양을 기억하고, paste 는 블록에 입힌다(블록이 없으면 그대로). copiedShapeReady 는 기억한 모양이 있는지다.
+EditResult copyShapeNow(model::Document& doc, std::vector<Node>& pages, const std::string& action, int type,
+                        bool useStoredLineHeight, std::string& why);
+EditResult editCopyShape(model::Document& doc, std::vector<Node>& pages, const std::string& action, int type,
+                         bool useStoredLineHeight = false, std::string* error = nullptr);
+bool copiedShapeReady();
+// 표를 문자열로(fields: delimiter tab·comma·space·other, text)와 문자열을 표로(fields: delimiter auto·tab·comma·space·
+// char·string, text, keep). 규칙은 table_text.cpp. editTableText 는 fields 의 action(tableToText·textToTable)으로 고른다.
+EditResult tableToTextNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                          bool useStoredLineHeight, std::string& why);
+EditResult textToTableNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                          bool useStoredLineHeight, std::string& why);
+EditResult editTableText(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                         bool useStoredLineHeight = false, std::string* error = nullptr);
+// 각주↔미주 바꾸기(한글 ExchangeFootnoteEndnote). mode 0 모든 각주를 미주로, 1 모든 미주를 각주로, 2 서로 바꾸기.
+EditResult exchangeNotesNow(model::Document& doc, std::vector<Node>& pages, int mode, bool useStoredLineHeight, std::string& why);
+EditResult editExchangeNotes(model::Document& doc, std::vector<Node>& pages, int mode, bool useStoredLineHeight = false,
+                             std::string* error = nullptr);
+// 찾아가기의 줄·스타일·조판 부호(goto_commands.cpp). fields: kind(line·style·mark)와 line(1부터)·style(스타일 id)·mark(이름).
+// goToView 는 lineCount, styles("id\t이름" 줄), marks(조판 부호 이름 줄)다.
+FormatFields goToView(const model::Document& doc, const std::vector<Node>& pages);
+EditResult goToNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, std::string& why);
+// 조판 부호 지우기. fields.marks 는 지울 조판 부호 이름(goToView 의 marks 이름)을 줄로 나눈 것이다.
+EditResult deleteMarksNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, bool useStoredLineHeight,
+                          std::string& why);
+EditResult editDeleteMarks(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                           bool useStoredLineHeight = false, std::string* error = nullptr);
+// 글자 바꾸기(한글 대문자/소문자 바꾸기·전각/반각 바꾸기). 블록 안 글을 바꾸고 블록은 그대로 둔다.
+// fields: kind(case·width), case 는 mode(upper·lower·toggle·wordCap·sentenceCap·sentenceCapOnly),
+// width 는 to(half·full)와 바꿀 대상 digit·latin·symbol·kana·jamo(0·1, 없으면 1).
+EditResult convertTextNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                          bool useStoredLineHeight, std::string& why);
+EditResult editConvertText(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                           bool useStoredLineHeight, std::string* error = nullptr);
+// 본문 정렬(한글 Sort, 글 블록). 블록이 걸친 문단을 기준대로 옮긴다(규칙은 sort_commands.cpp·model::paragraphSortOrder).
+// fields: keyNPosition(0 문단, n 필드 n, 2147483647 단어; 2·3 번째의 0 은 없음)·keyNFormat(0 글자 1 숫자 2 날짜 3 코드)·
+// keyNDesc(N 은 1~3), delimiter(0 탭 1 쉼표 2 빈칸 3 기호)·delimiterChars·ignoreMulti, fromRear·oldHangul·finalFirst·
+// extendYear·yearBase·eachPara. 되돌리기 한 칸이다.
+EditResult sortParagraphsNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                             bool useStoredLineHeight, std::string& why);
+EditResult editSortParagraphs(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                              bool useStoredLineHeight, std::string* error = nullptr);
+// 계산식 대화 상자가 볼 값: inTable(캐럿이 표 칸인지), cell(칸 이름 "B2"), 캐럿이 계산식 결과 안이면 formula·format.
+FormatFields tableFormulaView(const model::Document& doc, const std::vector<Node>& pages);
+// 정렬 대화 상자가 볼 값: mode(table 칸 블록·text 글 블록·빈 값 못 함), text 면 paragraphs(블록 문단 수)·
+// fields(fields 의 구분 기호로 가장 많이 나뉜 필드 수).
+FormatFields sortView(const model::Document& doc, const std::vector<Node>& pages, const FormatFields& fields);
+// 하이퍼링크 넣기(한글 InsertHyperlink). text 가 비면 주소를 보인다. 고른 글은 바꾼다. 되돌리기 한 칸이다.
+EditResult editInsertHyperlink(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                               const std::string& url, bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 단 설정(한글 2024 단 설정 대화 상자·단 ▾ 목록, column_commands.cpp). 값 이름:
+//   type(NEWSPAPER·BALANCED_NEWSPAPER·PARALLEL), count, direction(LEFT·RIGHT·MIRROR), sameSize, gapMm,
+//   widthMm.N·gapMm.N(너비가 다를 때 단마다), line·lineType·lineWidth(HWPUNIT)·lineColor(구분선),
+//   preset(one·two·three·left·right: 그 모양으로 다시 짠다), applyTo(WHOLE 문서 전체·NEW_PAGE 새 쪽으로·NEW_COLUMN 새 단으로).
+// columnView 는 캐럿 자리 단 설정에 고른 값을 얹어 너비·간격을 다시 계산한 값(대화 상자에 보일 값)이다.
+// 함께 maxCount(단 수 최대)와 bodyMm(본문 폭), preset(지금 모양과 같은 목록 칸)을 준다.
+FormatFields columnView(const model::Document& doc, const std::vector<Node>& pages, const FormatFields& asked);
+// 단 설정을 넣는다. 되돌리기 한 칸이다. 하지 못하면 error 에 이유를 적는다.
+EditResult editColumns(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                       bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 구역 설정(한글 2024 구역 설정 대화 상자, section_commands.cpp). 값 이름:
+//   startsOn(CONTINUE·EVEN·ODD·USER), pageNumber(USER 일 때), pictureStart·tableStart·equationStart(0 이어서),
+//   hideFirstHeaderFooter·hideFirstMaster·hideFirstBorderFill·hideEmptyLine, columnGapPt·defaultTabPt,
+//   applyTo(CURRENT·WHOLE·NEW_SECTION). sectionSettingsView 는 캐럿 구역 값과 applyOptions(고를 수 있는 적용 범위)를 준다.
+FormatFields sectionSettingsView(const model::Document& doc);
+// 표/셀 속성(한글 2024 표/셀 속성 대화 상자, table_props.cpp). 캐럿 표(칸 블록이면 그 칸들) 값. 값 이름:
+//   기본 widthMm·heightMm(보기만)·treatAsChar·wrap·horzRelTo·horzAlign·horzOffsetMm·vertRelTo·vertAlign·vertOffsetMm·
+//   flowWithText·allowOverlap·numberingType, 여백/캡션 outLeftMm..outBottomMm·caption·captionWidthMm·captionGapMm·
+//   captionFullSize, 표 pageBreak(NONE·TABLE·CELL)·repeatHeader·inLeftMm..inBottomMm,
+//   셀 cellWidthMm·cellHeightMm(보기만)·cellMargin·cellLeftMm..cellBottomMm·header·direction·cellVertAlign.
+FormatFields tablePropertiesView(model::Document& doc);
+// 덧말 넣기·글자 겹치기(glyph_group_commands.cpp). 값 이름:
+//   kind(ruby·compose), 덧말 mainText·subText·pos(TOP·BOTTOM)·ratio(%)·align(문단 정렬 이름),
+//   겹치기 chars·circle(CHAR·SHAPE_CIRCLE…)·size(글자 크기 조절)·type(OVERLAP·SPREAD). 겹쳐 쓸 글자 수 한도는 없다.
+//   블록이 한 문단 안 글자면 그 글이 본말·겹칠 글자이고, 넣을 때 블록을 지운다.
+FormatFields glyphGroupView(model::Document& doc, const std::vector<Node>& pages);
+EditResult glyphGroupNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                         bool useStoredLineHeight, std::string& why);
+EditResult editGlyphGroup(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                          bool useStoredLineHeight = false, std::string* error = nullptr);
+EditResult editTableProperties(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                               bool useStoredLineHeight = false, std::string* error = nullptr);
+// 주석 모양(한글 2024 주석 모양 대화 상자, note_shape_commands.cpp). 값 이름:
+//   numFormat·userChar·prefix·suffix, line·lineLength(5CM·2CM·THIRD·COLUMN·USER)·lineLengthMm·lineType·lineWidth·lineColor,
+//   aboveMm·betweenMm·belowMm, numbering(CONTINUOUS·ON_SECTION·ON_PAGE)·startNumber, superscript(작게), beneathText,
+//   place(각주 EACH_COLUMN·MERGED_COLUMN·RIGHT_MOST_COLUMN, 미주 END_OF_DOCUMENT·END_OF_SECTION).
+FormatFields noteShapeView(const model::Document& doc, bool endnote);
+// 캐럿이 든 각주·미주를 닫고 그 주 바로 뒤 본문으로 간다(한글 주석 탭 닫기). 문서는 고치지 않는다.
+EditResult editLeaveNote(model::Document& doc, std::vector<Node>& pages);
+EditResult editNoteShape(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, bool endnote,
+                         bool wholeDocument, bool useStoredLineHeight = false, std::string* error = nullptr);
+// 쪽 테두리/배경 넣기(대화 상자 값은 FormatViewKind::PageBorder). 되돌리기 한 칸이다.
+EditResult editPageBorder(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields, bool wholeDocument,
+                          bool useStoredLineHeight = false, std::string* error = nullptr);
+EditResult editSectionSettings(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                               bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 쪽 탭 컨트롤. 어디에 넣는지는 한글 2024 와 같다(page_commands.cpp).
+enum class PageControlKind {
+    Header,      // 머리말(apply: BOTH·ODD·EVEN). 캐럿 문단 맨 앞에 새로 넣고 그 쪽 머리말 편집으로 들어간다
+    Footer,      // 꼬리말. 머리말과 같다
+    DeleteBand,  // 고치는 머리말·꼬리말을 지우고 본문으로 나간다
+    PageNumber,  // 쪽 번호 매기기(pos·format·sideChar). 구역 첫 문단의 것을 고치거나 넣는다
+    NewNumber,   // 새 번호로 시작(numType·number). 캐럿 자리에 넣는다
+    PageHiding,  // 현재 쪽만 감추기(hideHeader·hideFooter·hideMaster·hideBorder·hideFill·hidePageNum). 모두 끄면 지운다
+    InsertPageNum,  // 쪽 번호 넣기(한글 InsertPageNum). 캐럿 자리에 쪽 자동 번호(아라비아 숫자)를 넣는다
+    PrevBand,    // 이전 머리말/꼬리말(HeaderFooterToPrev). 문서 차례로 앞 머리말·꼬리말 편집으로 간다
+    NextBand,    // 다음 머리말/꼬리말(HeaderFooterToNext)
+    // 머리말/꼬리말 대화 상자의 편집(band: header·footer, apply: BOTH·ODD·EVEN). 캐럿 쪽에 보이는 그 머리말·꼬리말,
+    // 없으면 앞쪽(가까운 쪽부터), 그다음 뒤쪽에서 처음 보이는 것으로 들어간다
+    EditBand,
+    // 바탕쪽(한글 2024 MasterPage·MasterPageType*·DeleteMasterPage·MasterPageToPrev/Next·MasterPageFront·
+    // DuplicateMasterPage·ExcludeFirstPage). 캐럿 구역의 바탕쪽을 고친다.
+    MasterPage,     // type(BOTH·ODD·EVEN·LAST_PAGE·OPTIONAL_PAGE)·pageNumber 의 바탕쪽 편집으로 들어간다. 없으면 만든다.
+                    // duplicate·front 를 주면 그 바탕쪽에 준다
+    CloseMaster,    // 바탕쪽 편집을 끝내고 들어오기 전 본문 자리로 간다(Shift+Esc 와 같다)
+    DeleteMaster,   // scope: current(고치는 바탕쪽)·section(이 구역 모두)·document(문서 모두). 편집을 끝낸다
+    PrevMaster,     // 문서 차례로 앞 바탕쪽 편집으로 간다
+    NextMaster,
+    MasterOptions,  // 고치는 바탕쪽의 front·duplicate, 구역의 excludeFirst(첫 쪽 감추기)
+    // 쪽 지우기(한글 2024 DeletePage·현재 쪽 지우기). range: current(캐럿 쪽, 블록이면 블록이 걸친 쪽)·selected(블록이
+    // 걸친 쪽)·custom(pages "2-3,5,7-" 쪽 차례, pageNumber 가 참이면 쪽 번호). 그 쪽 첫 글자부터 다음 쪽 첫 글자 앞까지를
+    // 지운다(구역 마지막 쪽이면 앞 문단 끝부터 구역 끝까지). 첫 문단의 구역 정의·단 정의는 남긴다.
+    DeletePage,
+    // 메모(한글 InsertFieldMemo·메모 고치기·DeleteMemo). 캐럿 문단의 블록(없으면 캐럿 자리)에 메모를 건다.
+    // text 는 메모 글(줄마다 문단), author 는 작성자. 고치기·지우기는 캐럿이 든 메모(겹치면 안쪽)다.
+    InsertMemo,
+    EditMemo,
+    DeleteMemo,
+    // 블록 계산(도구 > 블록 합계·블록 평균, 규칙은 model/block_calc.hpp). 값은 pageControlFields 로 읽고(ok·cells·count·
+    // sum·average·canInsert), 넣기는 mode(sum·average)의 결과를 글 블록 바로 뒤에 넣는다(블록이 빈칸으로 끝나지 않으면
+    // 빈칸 하나를 띄운다). 칸 블록은 칸 글을 칸 차례로 읽고 넣지는 않는다.
+    BlockCalc,
+    // 교정 부호 넣기(한글 검토-교정 부호, 파일 모양은 model/proofreading.hpp). kind 는 delete·clipping·attach·lineAttach·
+    // sawtooth·thinking·praise·line·simpleChange·change(메모 고침표)·space·lineSeparate·lineInsert·symbol·insert, text 는
+    // 고칠·넣을 글이다. 한글 2024 처럼 범위 부호(지움표 ...)는 블록이 있어야 하고 자리 부호(띄움표 ...)는 블록이 없어야 한다.
+    // 줄 붙임표는 블록 문단 맨 앞에 빈 범위로, 메모 고침표는 메모처럼 블록(없으면 캐럿 낱말)에 건다(author·text).
+    InsertProofMark
+};
+const char* pageControlName(PageControlKind kind);
+// 이름(header, footer, deleteBand, pageNumber, newNumber, pageHiding, insertPageNum, prevBand, nextBand, editBand,
+// masterPage, closeMaster, deleteMaster, prevMaster, nextMaster, masterOptions, deletePage, insertMemo, editMemo,
+// deleteMemo, blockCalc, insertProofMark)을 종류로.
+// 모르는 이름이면 거짓.
+bool pageControlKindOf(const std::string& name, PageControlKind& kind);
+// 대화 상자를 열 때 채울 값. 이름은 editPageControl 이 받는 이름과 같다.
+// pos 는 NONE, TOP_LEFT, TOP_CENTER, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_CENTER, BOTTOM_RIGHT, OUTSIDE_TOP, OUTSIDE_BOTTOM,
+// INSIDE_TOP, INSIDE_BOTTOM 이고 format 은 DIGIT, CIRCLED_DIGIT, ROMAN_CAPITAL, ROMAN_SMALL, LATIN_CAPITAL,
+// LATIN_SMALL, HANGUL_SYLLABLE … 이다. sideChar 는 번호 앞뒤에 붙는 글(줄표 "-", 없으면 "").
+// start 는 시작 번호다. 1 이 아니면 쪽 번호와 같은 문단에 쪽 새 번호를 둔다(한글 PageNumPos 의 NewNumber).
+FormatFields pageControlFields(const model::Document& doc, const std::vector<Node>& pages, PageControlKind kind);
+// 쪽 탭 컨트롤을 넣거나 고치고 문서를 다시 짠다. 되돌리기 한 칸이다. 하지 못하면 error 에 이유를 적는다.
+EditResult editPageControl(model::Document& doc, std::vector<Node>& pages, PageControlKind kind,
+                           const FormatFields& fields, bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 문서 글 찾기. 찾은 구간은 story 안 문단의 글자 순번 [from, to)다. 문단 경계는 넘지 않는다.
+// story 가 0 이면 모든 글 묶음을 번호 차례(구역 본문 먼저)로 본다. 글자처럼 놓인 개체는 U+FFFC 한 글자다.
+// matchCase 가 거짓이면 ASCII 대소문자를 가리지 않는다. limit 이 0 이면 끝까지 찾는다.
+struct TextHit {
+    int story = -1;
+    int paragraph = -1;
+    int from = 0;
+    int to = 0;
+};
+std::vector<TextHit> findText(const model::Document& doc, const std::string& text, bool matchCase, int story = 0,
+                              int limit = 0);
+// 찾기가 보는 문단 글(개체는 U+FFFC).
+std::string paragraphSearchText(const model::Paragraph& para);
+// 다음 찾기. 고른 글(없으면 캐럿) 뒤에서(backward 면 앞에서) 처음 맞는 곳을 골라 선택한다.
+// 읽는 차례는 구역 본문 문단 차례이고, 문단 안 개체(표 칸·글상자)의 글은 그 문단 글 뒤다.
+// 끝에 닿으면 처음부터(뒤로 찾으면 끝부터) 돌고 wrapped 를 참으로 한다. 없으면 handled 가 거짓이다.
+EditResult selectNextText(const model::Document& doc, const std::vector<Node>& pages, const std::string& text,
+                          bool matchCase, bool backward, bool* wrapped = nullptr);
+// 바꾸기. 고른 글이 text 와 같으면 replacement 로 바꾼다. 한글처럼 i 번째 새 글자는 찾은 i 번째 글자의
+// 모양을 받고, 남는 새 글자는 찾은 마지막 글자의 모양을 받는다. 고른 글이 다르면 바꾸지 않는다.
+// replacement 에 줄 끝(CR·LF)이 있으면 바꾸지 않는다.
+EditResult editReplaceText(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                           const std::string& replacement, bool matchCase, bool useStoredLineHeight);
+// 모두 바꾸기. 문서의 모든 text 를 바꾼다. 되돌리기 한 칸이다. count 에 바꾼 수를 적는다.
+EditResult editReplaceAllText(model::Document& doc, std::vector<Node>& pages, const std::string& text,
+                              const std::string& replacement, bool matchCase, bool useStoredLineHeight,
+                              int* count = nullptr);
+
+// 나누기(한글 2024 BreakPage·BreakColumn·BreakColDef·BreakSection). 캐럿 자리에서 문단을 나눈다.
+//   Page: 뒤 문단을 다음 쪽에서 시작한다. Column: 다음 단에서 시작한다(1단이면 다음 쪽).
+//   ColumnDef: 뒤 문단부터 단 설정을 새로 한다(앞 단 정의를 베낀다).
+//   Section: 뒤 문단부터 새 구역이다. 구역 설정과 단 정의만 이어받고 머리말·꼬리말은 가져가지 않는다.
+// 구역 본문에서만 한다. 표 칸·글상자 안이면 handled 가 거짓이다. 블록이 있으면 지우고 나눈다.
+enum class BreakKind { Page, Column, ColumnDef, Section };
+bool breakKindOf(const std::string& name, BreakKind& kind);  // page, column, columnDef, section
+EditResult editInsertBreak(model::Document& doc, std::vector<Node>& pages, BreakKind kind,
+                           bool useStoredLineHeight = false);
+
 // 캐럿 자리에 그림 파일(png·jpg·gif·bmp)을 글자처럼 넣는다. 한글 그림 넣기처럼 픽셀 × 75 크기이고, 단보다 넓으면
-// 단 폭으로 줄인다. 캐럿은 그림 뒤로 간다. 모르는 파일이면 아무것도 하지 않는다.
+// 단 폭으로 줄인다. width·height(HWPUNIT)를 주면 그 크기다. 하나만 주면 그림 가로세로 비율로 다른 쪽을 정한다.
+// 캐럿은 그림 뒤로 간다. 모르는 파일이면 아무것도 하지 않는다.
 EditResult editInsertPicture(model::Document& doc, std::vector<Node>& pages, const Bytes& image,
-                             bool useStoredLineHeight = false);
+                             bool useStoredLineHeight = false, std::int32_t width = 0, std::int32_t height = 0);
 
 // 도형 그리기. tool: 0 끔, 1 직사각형, 2 타원, 3 직선, 4 글상자, 5 세로 글상자.
 // 켜면 다음 끌기 한 번이 그 도형 상자가 된다(한글처럼 한 번 그리면 꺼진다). Esc 로 끈다.
@@ -561,6 +1000,28 @@ void dropPendingInsert();
 // page 쪽 종이 좌표 (x0, y0)에서 (x1, y1)까지 끈 도형을 넣는다. 한글이 마우스로 그린 도형과 같은 값이다.
 EditResult editInsertShape(model::Document& doc, std::vector<Node>& pages, int tool, int page, std::int32_t x0,
                            std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight = false);
+
+// 캐럿 자리에 맞춰 머리말·꼬리말·바탕쪽 편집 상태를 맞춘다(캐럿이 머리말 글이면 그 편집, 본문이면 나옴).
+// 캐럿을 화면 밖에서 옮긴 뒤(agent) 부른다. 바뀌었으면 참.
+bool syncEditBand(const model::Document& doc);
+
+// 이름으로 가리킨 개체(object_commands.cpp). 개체는 글 묶음 story·문단·문단 안 항목 순번 item(글 조각과 컨트롤을
+// 차례로 센 번호, 쪽 그림의 anchorItem 과 같다)이다.
+// 고른 개체를 놓는다(캐럿·블록은 그대로).
+void clearObjectSelection();
+// 그 개체를 고른다(화면에서 누른 것과 같은 고르기와 손잡이). 쪽에 그려진 개체가 없으면 거짓.
+bool selectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int story, int paragraph, int item);
+// 개체 속성 값: placementFields 의 이름(treatAsChar, textWrap, textFlow, vertRelTo, horzRelTo, vertAlign, horzAlign,
+// vertOffset, horzOffset, width, height, zOrder, flowWithText, allowOverlap)과 바깥 여백 marginLeft·marginRight·
+// marginTop·marginBottom. 길이는 HWPUNIT. 크기가 없는 개체(머리말 등)면 빈 값이다.
+FormatFields objectPropertiesView(const model::Document& doc, int story, int paragraph, int item);
+// 위 이름 가운데 준 값만 고치고 문서를 다시 짠다. 크기는 손잡이 크기 조절과 같은 규칙(표는 칸·줄을 비율대로)이다.
+// 모르는 이름·틀린 값이면 고치지 않고 error 에 이유를 적는다. 되돌리기 한 칸이다.
+EditResult editObjectProperties(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                                const FormatFields& fields, bool useStoredLineHeight = false, std::string* error = nullptr);
+// 개체를 지운다(표면 칸 글까지). 캐럿은 개체가 있던 자리로 간다. 되돌리기 한 칸이다.
+EditResult editDeleteObject(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                            bool useStoredLineHeight = false, std::string* error = nullptr);
 
 // 고른 띄운 개체를 끌어 옮겼으면 그 위치를 문서에 반영한다. 포인터를 뗀 뒤 부른다. 없으면 handled 가 거짓이다.
 EditResult editMoveObject(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
@@ -650,6 +1111,15 @@ bool attachRemoteScreen();
 void setScreenVectors(bool on);
 // 웹에서는 브라우저 WebGPU 장치가 나중에 붙는다. 붙기 전에는 false다.
 bool screenReady();
+// GPU 파이프라인(그리기 조합마다 하나인 셰이더 묶음) 기록. 장치가 붙으면 화면이 쓸 조합을 미리 만든다.
+// drawnFirst 는 미리 만들지 않았는데 그리면서 쓴 조합의 이름이다. 비어 있어야 첫 화면이 컴파일을 기다리지 않는다.
+struct PipelineTally {
+    int precompiled = 0;
+    std::vector<std::string> drawnFirst;
+};
+PipelineTally pipelineTally();
+// 그리다 만든 기록만 비운다. 미리 만든 파이프라인은 장치에 남는다.
+void clearDrawnPipelines();
 void dropScreenSprite(int id);
 bool frameHasGlyphs(int id);
 // 칸이 들고 있는 화면 글자의 문단 위치(이야기, 문단, 글자). 블록 판단이 쓰는 값이다.

@@ -20,7 +20,7 @@ struct ColumnBox {
 struct ColumnLayout {
     int count = 1;
     std::int32_t gap = 0;
-    std::string type;  // NEWSPAPER·BalancedNewspaper 는 배분. PARALLEL 은 평행. 그 밖은 일반.
+    std::string type;  // BALANCED_NEWSPAPER 는 배분, PARALLEL 은 평행, NEWSPAPER(와 빈 값·NORMAL)는 일반.
     bool sameSize = true;
     std::vector<std::int32_t> widths;
     std::vector<std::int32_t> gaps;  // 그 단 오른쪽 간격. 마지막 단은 쓰지 않는다.
@@ -28,8 +28,8 @@ struct ColumnLayout {
 };
 
 inline bool balancedColumns(const std::string& type) {
-    return type == "NEWSPAPER" || type == "BALANCED_NEWSPAPER" || type == "BalancedNewspaper" ||
-           type == "BALANCEDNEWSPAPER";
+    // OWPML 의 NEWSPAPER 는 일반 다단이다. 배분 다단으로 놓으면 2단 문서의 미주·쪽 수가 한글과 달라진다.
+    return type == "BALANCED_NEWSPAPER" || type == "BalancedNewspaper" || type == "BALANCEDNEWSPAPER";
 }
 
 inline bool parallelColumns(const std::string& type) { return type == "PARALLEL" || type == "Parallel"; }

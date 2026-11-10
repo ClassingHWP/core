@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace chwp {
@@ -86,5 +87,9 @@ public:
 private:
     Bytes data_;
 };
+
+// base64 글을 바이트로. 공백·줄바꿈은 건너뛰고, 앞의 data URL 머리("data:image/png;base64,")도 뗀다.
+// '+' '/' 와 URL 꼴 '-' '_' 를 모두 받는다. 끝 '=' 는 있어도 없어도 된다. 그 밖의 글자가 있으면 거짓.
+bool decodeBase64(std::string_view text, Bytes& out);
 
 }  // namespace chwp

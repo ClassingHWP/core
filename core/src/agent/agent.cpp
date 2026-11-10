@@ -16,6 +16,7 @@
 #include "chwp/app/doc_session.hpp"
 #include "chwp/app/session.hpp"
 #include "chwp/export/font.hpp"
+#include "chwp/model/table_edit.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/edit_state.hpp"
 #include "chwp/render/frame_cache.hpp"
@@ -25,6 +26,7 @@
 #include "chwp/writer.hpp"
 #include "export/font_metrics.hpp"
 #include "render/paint_detail.hpp"
+#include "render/picture.hpp"
 
 // 에이전트 API 구현. 판정·조판·편집은 render 쪽 함수를 그대로 부르고, 여기서는 입구 검사와 모양 바꾸기만 한다.
 
@@ -137,21 +139,6 @@ bool sameRef(const PageRef& a, const PageRef& b) {
     return a.page == b.page && a.section == b.section && a.nth == b.nth;
 }
 
-// 문단 글자열. paragraph() 의 text 와 같은 글이고 같은 순번이다.
-std::string plainText(const model::Paragraph& para) {
-    std::string text;
-    for (const model::Run& run : para.runs) {
-        for (const model::InlineItem& item : run.items) {
-            if (item.type == model::InlineItem::Type::Text) {
-                text += item.text;
-            } else if (render::paint_detail::isCaretCharControl(item.control)) {
-                text += "\xEF\xBF\xBC";  // U+FFFC
-            }
-        }
-    }
-    return text;
-}
-
 // 코드 포인트마다 시작 바이트. 끝에 글 길이를 하나 더 둔다.
 std::vector<std::size_t> codePointStarts(const std::string& text) {
     std::vector<std::size_t> starts;
@@ -160,11 +147,6 @@ std::vector<std::size_t> codePointStarts(const std::string& text) {
     }
     starts.push_back(text.size());
     return starts;
-}
-
-std::string asciiLower(std::string text) {
-    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return text;
 }
 
 std::string positionText(const Position& p) {
@@ -344,6 +326,8 @@ struct AgentDocument::Impl {
         const int focusOff = charIndexToOffset(doc, pages, focus.story, focus.paragraph, focus.index);
         render::setPointerCursor(doc, pages, model::CursorPos{anchor.story, anchor.paragraph, anchorOff},
                                  model::CursorPos{focus.story, focus.paragraph, focusOff});
+        // 앞 op 가 머리말·바탕쪽 편집에 들어갔어도 이 자리에 맞춘다(편집기의 그 자리 누르기와 같다).
+        render::syncEditBand(doc);
         const render::PointerCursor cur = render::pointerCursor();
         if (!cur.active || canonicalStory(cur.story) != canonicalStory(anchor.story)) {
             return fail(Code::NotEditable, positionText(focus) + " 에 캐럿을 놓을 수 없습니다. 쪽에 놓이지 않은 글입니다.");
@@ -453,6 +437,197 @@ struct AgentDocument::Impl {
         return {};
     }
 
+    Status insertPicture(const EditOp& op, OpReport& report) {
+        int pixelW = 0;
+        int pixelH = 0;
+        std::string extension;
+        if (!render::paint_detail::imageInfo(op.image.data(), op.image.size(), pixelW, pixelH, extension)) {
+            return fail(Code::BadArgument, "insertPicture: png·jpg·gif·bmp 그림 파일이 아닙니다.");
+        }
+        if (op.width < 0 || op.height < 0) return fail(Code::BadArgument, "insertPicture: width·height 는 0 이상입니다.");
+        if (Status s = check(op.at); !s.ok()) return s;
+        if (Status s = place(op.at, op.at); !s.ok()) return s;
+        const render::EditResult r = session.insertPicture(op.image, op.width, op.height);
+        if (!r.documentChanged) return refused(r, "insertPicture");
+        render::rebuildStoryMap(doc);
+        // 캐럿은 그림 바로 뒤다. 그 앞 글자(U+FFFC)인 그림의 개체 이름을 돌려준다.
+        const Position end = caret();
+        const std::vector<model::Paragraph>* paras = storyParas(end.story);
+        if (paras && end.paragraph >= 0 && end.paragraph < static_cast<int>(paras->size()) && end.index > 0) {
+            int at = 0;
+            int ordinal = 0;
+            for (const model::Run& run : (*paras)[static_cast<std::size_t>(end.paragraph)].runs) {
+                for (const model::InlineItem& entry : run.items) {
+                    if (entry.type == model::InlineItem::Type::Text) {
+                        at += codePoints(entry.text);
+                    } else if (render::paint_detail::isCaretCharControl(entry.control)) {
+                        if (at == end.index - 1 && entry.control.kind == ControlKind::Picture) {
+                            report.object = objectRefOf(end.story, end.paragraph, ordinal);
+                        }
+                        ++at;
+                    }
+                    ++ordinal;
+                }
+            }
+        }
+        return {};
+    }
+
+    // story 칸이 든 표의 칸 그림.
+    Status tableOf(int story, TableInfo& out) const {
+        const model::StoryMap& map = render::ensureStoryMap(doc);
+        const model::StorySlot* slot = map.valid(story) ? map.slot(story) : nullptr;
+        if (!slot || !slot->paragraphs) return fail(Code::PositionOutOfRange, "story " + std::to_string(story) + " 은 없습니다.");
+        if (!slot->tableCell || !slot->control || !slot->control->table) {
+            return fail(Code::BadArgument, "story " + std::to_string(story) + " 은 표 칸이 아닙니다.");
+        }
+        const model::Table& table = *slot->control->table;
+        out = TableInfo{};
+        out.parentStory = canonicalStory(slot->parentStory);
+        out.parentParagraph = slot->parentParagraph;
+        const model::TableGrid grid = model::tableGrid(table);
+        out.rows = grid.rows;
+        out.cols = grid.cols;
+        out.columnWidths = model::tableColumnWidths(table);
+        out.rowHeights = model::tableRowHeights(table);
+        out.format = render::tableFields(doc, table);
+        if (slot->control->placement) out.placement = render::placementFields(*slot->control->placement);
+        out.cells.resize(table.cells.size());
+        for (std::size_t i = 0; i < table.cells.size(); ++i) {
+            const model::TableCell& cell = table.cells[i];
+            TableCellInfo& info = out.cells[i];
+            info.row = static_cast<int>(cell.row);
+            info.col = static_cast<int>(cell.col);
+            info.rowSpan = std::max(1, static_cast<int>(cell.rowSpan));
+            info.colSpan = std::max(1, static_cast<int>(cell.colSpan));
+            info.width = static_cast<std::int32_t>(cell.width);
+            info.height = static_cast<std::int32_t>(cell.height);
+            info.format = render::tableCellFields(doc, table, cell);
+            for (std::size_t p = 0; p < cell.content.paragraphs.size(); ++p) {
+                if (p > 0) info.text += '\n';
+                info.text += cell.content.paragraphs[p].text();
+            }
+        }
+        for (int s = 1; s <= map.count(); ++s) {
+            const model::StorySlot* other = map.slot(s);
+            if (!other || other->control != slot->control || !other->tableCell || other->subIndex < 0 ||
+                map.storyOf(other->paragraphs) != s) {
+                continue;
+            }
+            if (other->subIndex < static_cast<int>(out.cells.size())) out.cells[static_cast<std::size_t>(other->subIndex)].story = s;
+        }
+        return {};
+    }
+
+    // 표 구조 op. 규칙과 거절은 core 표 편집(model/table_edit)이 정한다.
+    Status tableOp(const EditOp& op, OpReport& report) {
+        render::TableEditCommand cmd;
+        const char* name = "table";
+        switch (op.kind) {
+            case OpKind::InsertRows: cmd.kind = render::TableEditKind::InsertRows; break;
+            case OpKind::InsertColumns: cmd.kind = render::TableEditKind::InsertColumns; break;
+            case OpKind::DeleteRows: cmd.kind = render::TableEditKind::DeleteRows; break;
+            case OpKind::DeleteColumns: cmd.kind = render::TableEditKind::DeleteColumns; break;
+            case OpKind::MergeCells: cmd.kind = render::TableEditKind::Merge; break;
+            case OpKind::SplitCell: cmd.kind = render::TableEditKind::Split; break;
+            case OpKind::CellBorder: cmd.kind = render::TableEditKind::CellBorder; break;
+            case OpKind::CellFill: cmd.kind = render::TableEditKind::CellFill; break;
+            case OpKind::EqualWidth: cmd.kind = render::TableEditKind::EqualWidth; break;
+            case OpKind::EqualHeight: cmd.kind = render::TableEditKind::EqualHeight; break;
+            default: return fail(Code::Internal, "표 op 가 아닙니다.");
+        }
+        cmd.border = op.border;
+        cmd.lineType = op.lineType;
+        cmd.lineWidth = op.lineWidth;
+        cmd.lineColor = op.lineColor;
+        cmd.color = op.color;
+        name = render::tableEditName(cmd.kind);
+        TableInfo before;
+        if (Status s = tableOf(op.story, before); !s.ok()) return s;
+        if (op.toStory >= 0) {
+            TableInfo other;
+            if (Status s = tableOf(op.toStory, other); !s.ok()) return s;
+            if (other.parentStory != before.parentStory || other.parentParagraph != before.parentParagraph) {
+                return fail(Code::BadArgument, std::string(name) + ": story " + std::to_string(op.story) + " 와 " +
+                                                   std::to_string(op.toStory) + " 은 다른 표의 칸입니다.");
+            }
+        }
+        cmd.story = op.story;
+        cmd.toStory = op.toStory;
+        cmd.after = op.after;
+        cmd.count = op.count;
+        cmd.rows = op.rows;
+        cmd.cols = op.cols;
+        if ((op.kind == OpKind::InsertRows && (op.count < 1 || before.rows + op.count > render::kTableMaxRows)) ||
+            (op.kind == OpKind::InsertColumns && (op.count < 1 || before.cols + op.count > render::kTableMaxCols))) {
+            return fail(Code::BadArgument, std::string(name) + ": 표는 1~" + std::to_string(render::kTableMaxRows) +
+                                               " 줄, 1~" + std::to_string(render::kTableMaxCols) + " 칸입니다.");
+        }
+        if (op.kind == OpKind::SplitCell &&
+            (op.rows < 1 || op.cols < 1 || before.rows + op.rows - 1 > render::kTableMaxRows ||
+             before.cols + op.cols - 1 > render::kTableMaxCols)) {
+            return fail(Code::BadArgument, std::string(name) + ": 나눌 줄·칸 수가 표 한도를 넘거나 1 보다 작습니다.");
+        }
+        std::string why;
+        const render::EditResult r = session.editTable(cmd, &why);
+        if (!r.documentChanged) {
+            return fail(Code::BadArgument, std::string(name) + ": " + (why.empty() ? "표를 고치지 못했습니다." : why));
+        }
+        render::rebuildStoryMap(doc);
+        const render::PointerCursor cur = render::pointerCursor();
+        if (cur.active && cur.story > 0) {
+            if (Status s = tableOf(cur.story, report.table); !s.ok()) report.table = TableInfo{};
+        }
+        if (report.table.rows == 0) {
+            report.table.parentStory = before.parentStory;
+            report.table.parentParagraph = before.parentParagraph;
+        }
+        return {};
+    }
+
+    Status insertBreak(const EditOp& op) {
+        render::BreakKind kind = render::BreakKind::Page;
+        if (!render::breakKindOf(op.breakKind, kind)) {
+            return fail(Code::BadArgument, "insertBreak: kind 는 page, column, columnDef, section 중 하나입니다.");
+        }
+        if (Status s = check(op.at); !s.ok()) return s;
+        if (Status s = place(op.at, op.at); !s.ok()) return s;
+        const render::EditResult r = session.insertBreak(kind);
+        if (!r.documentChanged) return fail(Code::NotEditable, "insertBreak: 나누기는 구역 본문에서만 할 수 있습니다.");
+        render::rebuildStoryMap(doc);
+        return {};
+    }
+
+    Status replaceAll(const EditOp& op, OpReport& report) {
+        if (op.find.empty()) return fail(Code::BadArgument, "replaceAll: find 가 비어 있습니다.");
+        if (op.text.find_first_of("\r\n") != std::string::npos) {
+            return fail(Code::BadArgument, "replaceAll: text 에 줄 끝을 넣을 수 없습니다. 문단은 나누지 않습니다.");
+        }
+        int count = 0;
+        const render::EditResult r = session.replaceAll(op.find, op.text, op.matchCase, &count);
+        if (r.needsFontSwap) return refused(r, "replaceAll");
+        report.replaced = count;
+        return {};
+    }
+
+    Status pageSetup(const EditOp& op) {
+        const int count = static_cast<int>(doc.sections.size());
+        if (op.section < 1 || op.section > count) {
+            return fail(Code::BadArgument, "pageSetup: 구역 " + std::to_string(op.section) + " 은 없습니다. 구역은 1~" +
+                                               std::to_string(count) + " 입니다.");
+        }
+        render::FormatFields fields;
+        for (const auto& [key, value] : op.format) fields.emplace_back(key, value);
+        if (fields.empty()) return fail(Code::BadArgument, "pageSetup: set 이 비어 있습니다.");
+        // 그 구역 본문 첫 자리에 캐럿을 두면 편집기와 같은 명령이 그 구역을 고친다.
+        const int story = render::ensureStoryMap(doc).storyOf(&doc.sections[static_cast<std::size_t>(op.section - 1)].paragraphs);
+        if (Status s = place({story, 0, 0}, {story, 0, 0}); !s.ok()) return s;
+        const render::EditResult r = session.applyPageSetup(fields, op.whole);
+        if (r.needsFontSwap) return refused(r, "pageSetup");
+        if (!r.documentChanged) return fail(Code::BadArgument, "pageSetup: 바꿀 값이 없거나 이름을 모릅니다.");
+        return {};
+    }
+
     Status setText(int story, const std::string& text) {
         const std::vector<model::Paragraph>* paras = storyParas(story);
         if (!paras || paras->empty()) return fail(Code::PositionOutOfRange, "story " + std::to_string(story) + " 은 없습니다.");
@@ -460,6 +635,324 @@ struct AgentDocument::Impl {
         const int length = render::paint_detail::paragraphCharCount(paras->back());
         if (Status s = erase({{story, 0, 0}, {story, last, length}}); !s.ok()) return s;
         return insertText({story, 0, 0}, text);
+    }
+
+    // ---- 편집기 명령(Command). 자리를 커서·고른 개체로 바꾸고 DocSession 명령을 부른다.
+
+    int shapePage = -1;  // insertShape: apply 가 미리 고른 쪽 순번
+
+    static const FieldValue* argOf(const EditOp& op, const char* name) {
+        const FieldValue* found = nullptr;
+        for (const auto& [key, value] : op.args) {
+            if (key == name) found = &value;
+        }
+        return found;
+    }
+    static bool argFlag(const EditOp& op, const char* name, bool fallback) {
+        const FieldValue* v = argOf(op, name);
+        const bool* b = v ? std::get_if<bool>(v) : nullptr;
+        return b ? *b : fallback;
+    }
+    static double argNumber(const EditOp& op, const char* name, double fallback) {
+        const FieldValue* v = argOf(op, name);
+        const double* d = v ? std::get_if<double>(v) : nullptr;
+        return d ? *d : fallback;
+    }
+    static std::string argText(const EditOp& op, const char* name, const std::string& fallback = {}) {
+        const FieldValue* v = argOf(op, name);
+        const std::string* s = v ? std::get_if<std::string>(v) : nullptr;
+        return s ? *s : fallback;
+    }
+    static render::FormatFields setOf(const EditOp& op) {
+        render::FormatFields fields;
+        for (const auto& [key, value] : op.format) {
+            render::FormatValue v;
+            std::visit([&](const auto& x) { v = x; }, value);
+            fields.emplace_back(key, std::move(v));
+        }
+        return fields;
+    }
+
+    // 개체 이름 {story, paragraph, index} → 문단 항목 순번(글 조각·컨트롤을 차례로 센 번호).
+    Status objectItem(const ObjectRef& ref, int& item) const {
+        const std::vector<model::Paragraph>* paras = storyParas(ref.story);
+        if (!paras) return fail(Code::PositionOutOfRange, "story " + std::to_string(ref.story) + " 은 없습니다.");
+        if (ref.paragraph < 0 || ref.paragraph >= static_cast<int>(paras->size())) {
+            return fail(Code::PositionOutOfRange, "object: 문단은 0~" + std::to_string(paras->size() - 1) + " 입니다.");
+        }
+        int ordinal = 0;
+        int count = 0;
+        for (const model::Run& run : (*paras)[static_cast<std::size_t>(ref.paragraph)].runs) {
+            for (const model::InlineItem& entry : run.items) {
+                if (entry.type == model::InlineItem::Type::Control && objectKind(entry.control)) {
+                    if (count == ref.index) {
+                        item = ordinal;
+                        return {};
+                    }
+                    ++count;
+                }
+                ++ordinal;
+            }
+        }
+        return fail(Code::PositionOutOfRange, "object: 그 문단의 개체는 " + std::to_string(count) + " 개입니다.");
+    }
+
+    // 문단 항목 순번 → 개체 이름.
+    ObjectRef objectRefOf(int story, int paragraph, int item) const {
+        ObjectRef ref;
+        const std::vector<model::Paragraph>* paras = storyParas(story);
+        if (!paras || paragraph < 0 || paragraph >= static_cast<int>(paras->size())) return ref;
+        int ordinal = 0;
+        int count = 0;
+        for (const model::Run& run : (*paras)[static_cast<std::size_t>(paragraph)].runs) {
+            for (const model::InlineItem& entry : run.items) {
+                const bool object = entry.type == model::InlineItem::Type::Control && objectKind(entry.control);
+                if (ordinal == item) {
+                    if (object) ref = ObjectRef{canonicalStory(story), paragraph, count};
+                    return ref;
+                }
+                if (object) ++count;
+                ++ordinal;
+            }
+        }
+        return ref;
+    }
+
+    // 명령 자리. range(블록) > at(캐럿) > story(그 글 묶음 첫 자리) > section(구역 본문 첫 자리) 가운데 처음 것에 커서를
+    // 두고, object 가 있으면 그 개체를 고른다. 아무 자리도 없으면 placed 가 거짓이다.
+    Status placeCommand(const EditOp& op, bool& placed) {
+        render::clearObjectSelection();
+        placed = true;
+        if (op.hasRange) {
+            if (Status s = checkRange(op.range); !s.ok()) return s;
+            const Range r = ordered(op.range);
+            if (Status s = place(r.from, r.to); !s.ok()) return s;
+        } else if (op.hasAt) {
+            if (Status s = check(op.at); !s.ok()) return s;
+            if (Status s = place(op.at, op.at); !s.ok()) return s;
+        } else if (op.story >= 0) {
+            if (!storyParas(op.story)) return fail(Code::PositionOutOfRange, "story " + std::to_string(op.story) + " 은 없습니다.");
+            if (Status s = place({op.story, 0, 0}, {op.story, 0, 0}); !s.ok()) return s;
+        } else if (op.section > 0) {
+            const int count = static_cast<int>(doc.sections.size());
+            if (op.section > count) {
+                return fail(Code::BadArgument, "구역 " + std::to_string(op.section) + " 은 없습니다. 구역은 1~" +
+                                                   std::to_string(count) + " 입니다.");
+            }
+            const int story =
+                render::ensureStoryMap(doc).storyOf(&doc.sections[static_cast<std::size_t>(op.section - 1)].paragraphs);
+            if (Status s = place({story, 0, 0}, {story, 0, 0}); !s.ok()) return s;
+        } else {
+            placed = op.hasObject;
+            // 자리 없이 문서에 거는 명령(도형 넣기 등)은 앞 op 의 캐럿을 이어 쓰지 않는다.
+            if (!placed) {
+                render::setPointerCursor(doc, pages, model::CursorPos{}, model::CursorPos{});
+                render::syncEditBand(doc);
+            }
+        }
+        if (op.hasObject) {
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            if (!session.selectObject(op.object.story, op.object.paragraph, item)) {
+                return fail(Code::NotEditable, "object: 그 개체는 쪽에 그려지지 않아 고를 수 없습니다.");
+            }
+        }
+        return {};
+    }
+
+    static Status commandFailed(const std::string& name, const render::EditResult& r, const std::string& why) {
+        if (r.needsFontSwap) return refused(r, name.c_str());
+        return fail(Code::BadArgument, name + ": " + (why.empty() ? std::string("하지 못했습니다.") : why));
+    }
+
+    Status command(const EditOp& op, OpReport& report) {
+        const std::string& name = op.command;
+        bool placed = false;
+        if (Status s = placeCommand(op, placed); !s.ok()) return s;
+        // 문서 전체에 거는 명령 말고는 자리가 있어야 한다(agent 는 커서를 들고 있지 않는다).
+        const bool anywhere = name == "exchangeNotes" || name == "insertShape";
+        if (!placed && !anywhere) {
+            return fail(Code::BadArgument, name + ": 자리(at·range·object·story·section)가 없습니다.");
+        }
+        const render::FormatFields set = setOf(op);
+        std::string why;
+        render::EditResult r;
+        bool typeAfter = false;  // 끝에 text 인자를 캐럿 자리에 친다(머리말·주·캡션·글상자 글)
+        render::PageControlKind kind{};
+        if (render::pageControlKindOf(name, kind)) {
+            r = session.pageControl(kind, set, &why);
+            typeAfter = kind == render::PageControlKind::Header || kind == render::PageControlKind::Footer ||
+                        kind == render::PageControlKind::EditBand || kind == render::PageControlKind::MasterPage;
+        } else if (name == "insertNote") {
+            r = session.insertNote(argFlag(op, "endnote", false), &why);
+            typeAfter = true;
+        } else if (name == "exchangeNotes") {
+            const int mode = static_cast<int>(argNumber(op, "mode", 2));
+            if (mode < 0 || mode > 2) {
+                return fail(Code::BadArgument, "exchangeNotes: mode 는 0(각주→미주), 1(미주→각주), 2(서로) 입니다.");
+            }
+            r = session.exchangeNotes(mode, &why);
+        } else if (name == "noteShape") {
+            r = session.noteShape(set, argFlag(op, "endnote", false), argFlag(op, "whole", false), &why);
+        } else if (name == "pageBorder") {
+            r = session.pageBorder(set, argFlag(op, "whole", false), &why);
+        } else if (name == "sectionSettings") {
+            r = session.sectionSettings(set, &why);
+        } else if (name == "columns") {
+            r = session.columns(set, &why);
+        } else if (name == "caption") {
+            r = session.caption(argText(op, "caption", "BOTTOM"), &why);
+            typeAfter = true;
+        } else if (name == "bookmark") {
+            r = session.bookmark(argText(op, "action", "insert"), argText(op, "name"), &why, argText(op, "newName"));
+        } else if (name == "tableToText" || name == "textToTable") {
+            render::FormatFields fields = set;
+            fields.emplace_back("action", name);
+            r = session.tableText(fields, &why);
+        } else if (name == "deleteMarks") {
+            r = session.deleteMarks(set, &why);
+        } else if (name == "tableProperties") {
+            r = session.tableProperties(set, &why);
+        } else if (name == "glyphGroup") {
+            r = session.glyphGroup(set, &why);
+        } else if (name == "convertText") {
+            r = session.convertText(set, &why);
+        } else if (name == "sortParagraphs") {
+            r = session.sortParagraphs(set, &why);
+        } else if (name == "insertHyperlink") {
+            const std::string url = argText(op, "url");
+            if (url.empty()) return fail(Code::BadArgument, "insertHyperlink: url 이 없습니다.");
+            r = session.insertHyperlink(argText(op, "text"), url, &why);
+        } else if (name == "copyShape") {
+            // at 자리의 모양을 기억해 range 블록에 입힌다.
+            if (!op.hasAt || !op.hasRange) {
+                return fail(Code::BadArgument, "copyShape: at(모양을 가져올 자리)과 range(입힐 블록)가 있어야 합니다.");
+            }
+            const int type = static_cast<int>(argNumber(op, "type", 2));
+            if (type != 0 && type != 1 && type != 2 && type != 4) {
+                return fail(Code::BadArgument, "copyShape: type 은 0(글자), 1(문단), 2(둘 다), 4(스타일) 입니다.");
+            }
+            if (Status s = check(op.at); !s.ok()) return s;
+            if (Status s = place(op.at, op.at); !s.ok()) return s;
+            r = session.copyShape("copy", type, &why);
+            if (!r.handled) return commandFailed(name, r, why);
+            const Range target = ordered(op.range);
+            if (Status s = place(target.from, target.to); !s.ok()) return s;
+            r = session.copyShape("paste", type, &why);
+        } else if (name == "insertShape") {
+            static const std::pair<const char*, int> kTools[] = {
+                {"rect", 1}, {"ellipse", 2}, {"line", 3}, {"textBox", 4}, {"verticalTextBox", 5}};
+            const std::string toolName = argText(op, "tool", "rect");
+            int tool = 0;
+            for (const auto& [n, t] : kTools) {
+                if (toolName == n) tool = t;
+            }
+            if (tool == 0) {
+                return fail(Code::BadArgument, "insertShape: tool 은 rect, ellipse, line, textBox, verticalTextBox 입니다.");
+            }
+            if (shapePage < 0) return fail(Code::BadArgument, "insertShape: page 가 없습니다.");
+            const auto x = static_cast<std::int32_t>(argNumber(op, "x", 0));
+            const auto y = static_cast<std::int32_t>(argNumber(op, "y", 0));
+            const auto w = static_cast<std::int32_t>(argNumber(op, "width", 0));
+            const auto h = static_cast<std::int32_t>(argNumber(op, "height", 0));
+            // 편집기는 2mm 보다 작게 끈 도형을 그리지 않는다.
+            if (tool != 3 && (w < 567 || h < 567)) {
+                return fail(Code::BadArgument, "insertShape: width·height 는 2mm(567) 이상입니다.");
+            }
+            if (tool == 3 && std::max(std::abs(w), std::abs(h)) < 567) {
+                return fail(Code::BadArgument, "insertShape: 선 길이는 2mm(567) 이상입니다.");
+            }
+            r = session.insertShape(tool, shapePage, x, y, x + w, y + h);
+            if (r.documentChanged) {
+                // 새 도형은 그 글 묶음에서 가장 앞(zOrder 가 가장 큰) 개체다.
+                const std::vector<model::Paragraph>* paras = storyParas(r.dirtyStory);
+                if (paras && r.dirtyParagraph >= 0 && r.dirtyParagraph < static_cast<int>(paras->size())) {
+                    int ordinal = 0;
+                    int best = -1;
+                    std::int32_t bestZ = std::numeric_limits<std::int32_t>::min();
+                    for (const model::Run& run : (*paras)[static_cast<std::size_t>(r.dirtyParagraph)].runs) {
+                        for (const model::InlineItem& entry : run.items) {
+                            if (entry.type == model::InlineItem::Type::Control && entry.control.kind == ControlKind::Shape &&
+                                entry.control.placement && entry.control.placement->zOrder >= bestZ) {
+                                bestZ = entry.control.placement->zOrder;
+                                best = ordinal;
+                            }
+                            ++ordinal;
+                        }
+                    }
+                    if (best >= 0) report.object = objectRefOf(r.dirtyStory, r.dirtyParagraph, best);
+                }
+            }
+            typeAfter = tool >= 4;
+        } else if (name == "objectProperties" || name == "deleteObject") {
+            if (!op.hasObject) return fail(Code::BadArgument, name + ": object 가 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            r = name == "deleteObject" ? session.deleteObject(op.object.story, op.object.paragraph, item, &why)
+                                       : session.objectProperties(op.object.story, op.object.paragraph, item, set, &why);
+        } else {
+            return fail(Code::BadArgument, "명령 " + name + " 은 모릅니다.");
+        }
+        if (!r.handled && !r.documentChanged) return commandFailed(name, r, why);
+        // 편집 명령이 글 묶음 표를 다시 만들고 쪽을 다시 짰다. 여기서 다시 만들면 쪽이 붙인 별칭 번호(머리말 등)가 빠진다.
+        const std::string text = argText(op, "text");
+        if (typeAfter && !text.empty()) {
+            // 명령이 캐럿을 새 글 묶음(머리말·주·캡션·글상자)에 넣었을 때만 친다. 이미 있던 캡션처럼 들어가지 않았으면 거절한다.
+            const render::PointerCursor cur = render::pointerCursor();
+            const model::StorySlot* slot = cur.active ? render::resolveStory(doc, cur.story) : nullptr;
+            if (!slot || slot->kind == model::StoryKind::Section || slot->kind == model::StoryKind::TableCell) {
+                return fail(Code::BadArgument, name + ": text 를 칠 새 글 묶음이 없습니다(이미 있는 캡션 등). insertText 로 넣으세요.");
+            }
+            if (Status s = typeText(text); !s.ok()) return s;
+        }
+        return {};
+    }
+
+    // Command op 의 대화 상자 값. 자리를 잡고 읽는다.
+    Status view(const EditOp& op, Fields& out) {
+        const std::string& name = op.command;
+        render::PageControlKind kind{};
+        const bool known = render::pageControlKindOf(name, kind) || name == "noteShape" || name == "pageBorder" ||
+                           name == "sectionSettings" || name == "columns" || name == "tableProperties" ||
+                           name == "glyphGroup" || name == "sortParagraphs" || name == "bookmark" ||
+                           name == "objectProperties";
+        if (!known) return fail(Code::BadArgument, "view: " + name + " 은 읽을 값이 없습니다.");
+        bool placed = false;
+        if (Status s = placeCommand(op, placed); !s.ok()) return s;
+        if (!placed) return fail(Code::BadArgument, name + ": 자리(at·range·object·story·section)가 없습니다.");
+        render::FormatFields fields;
+        if (render::pageControlKindOf(name, kind)) {
+            fields = session.pageControlFields(kind);
+        } else if (name == "noteShape") {
+            fields = session.noteShapeView(argFlag(op, "endnote", false));
+        } else if (name == "pageBorder") {
+            fields = render::formatView(doc, pages, render::FormatViewKind::PageBorder, {}).values;
+        } else if (name == "sectionSettings") {
+            fields = session.sectionSettingsView();
+        } else if (name == "columns") {
+            fields = session.columnView(setOf(op));
+        } else if (name == "tableProperties") {
+            fields = session.tablePropertiesView();
+        } else if (name == "glyphGroup") {
+            fields = session.glyphGroupView();
+        } else if (name == "sortParagraphs") {
+            fields = session.sortView(setOf(op));
+        } else if (name == "bookmark") {
+            fields = session.bookmarkView();
+        } else {
+            if (!op.hasObject) return fail(Code::BadArgument, name + ": object 가 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            fields = session.objectPropertiesView(op.object.story, op.object.paragraph, item);
+            if (fields.empty()) return fail(Code::BadArgument, name + ": 크기·위치가 없는 개체입니다.");
+        }
+        out.clear();
+        for (const auto& [key, value] : fields) {
+            FieldValue v;
+            std::visit([&](const auto& x) { v = x; }, value);
+            out.emplace_back(key, std::move(v));
+        }
+        return {};
     }
 
     Status run(const EditOp& op, OpReport& report) {
@@ -474,6 +967,21 @@ struct AgentDocument::Impl {
             case OpKind::Format: status = restyle(op.range, op.format, op.style); break;
             case OpKind::InsertTable: status = insertTable(op, report); break;
             case OpKind::SetText: status = setText(op.story, op.text); break;
+            case OpKind::InsertRows:
+            case OpKind::InsertColumns:
+            case OpKind::DeleteRows:
+            case OpKind::DeleteColumns:
+            case OpKind::MergeCells:
+            case OpKind::SplitCell:
+            case OpKind::CellBorder:
+            case OpKind::CellFill:
+            case OpKind::EqualWidth:
+            case OpKind::EqualHeight: status = tableOp(op, report); break;
+            case OpKind::InsertBreak: status = insertBreak(op); break;
+            case OpKind::ReplaceAll: status = replaceAll(op, report); break;
+            case OpKind::PageSetup: status = pageSetup(op); break;
+            case OpKind::InsertPicture: status = insertPicture(op, report); break;
+            case OpKind::Command: status = command(op, report); break;
         }
         if (status.ok()) report.end = caret();
         return status;
@@ -640,13 +1148,21 @@ std::vector<StoryInfo> AgentDocument::stories() const {
         if (slot->tableCell) {
             info.row = static_cast<int>(slot->tableCell->row);
             info.col = static_cast<int>(slot->tableCell->col);
+            info.rowSpan = std::max(1, static_cast<int>(slot->tableCell->rowSpan));
+            info.colSpan = std::max(1, static_cast<int>(slot->tableCell->colSpan));
         }
         out.push_back(std::move(info));
     }
     return out;
 }
 
-Result<ParagraphInfo> AgentDocument::paragraph(int story, int paragraph) const {
+Result<TableInfo> AgentDocument::table(int story) const {
+    Result<TableInfo> out;
+    out.status = impl_->tableOf(story, out.value);
+    return out;
+}
+
+Result<ParagraphInfo> AgentDocument::paragraph(int story, int paragraph, bool detail) const {
     Result<ParagraphInfo> out;
     const model::StoryMap& map = render::ensureStoryMap(impl_->doc);
     const model::StorySlot* slot = map.valid(story) ? map.slot(story) : nullptr;
@@ -721,6 +1237,7 @@ Result<ParagraphInfo> AgentDocument::paragraph(int story, int paragraph) const {
                     object.height = static_cast<std::int32_t>(ctrl.placement->height);
                 }
                 if (ctrl.kind == ControlKind::Equation) object.script = ctrl.script;
+                if (ctrl.placement) object.placement = render::placementFields(*ctrl.placement);
                 if (auto found = inner.find(&ctrl); found != inner.end()) object.stories = found->second;
                 info.objects.push_back(std::move(object));
             }
@@ -740,6 +1257,26 @@ Result<ParagraphInfo> AgentDocument::paragraph(int story, int paragraph) const {
     if (place.hit && place.page >= 0 && place.page < static_cast<int>(impl_->pageInfos.size())) {
         info.pageOrder = impl_->pageInfos[static_cast<std::size_t>(place.page)].order;
     }
+    if (detail) {
+        info.format = render::paraShapeFields(doc, para.paraShapeId);
+        for (const FormatRun& run : info.runs) {
+            const bool seen = std::any_of(info.charShapes.begin(), info.charShapes.end(),
+                                          [&](const auto& entry) { return entry.first == run.charShapeId; });
+            if (!seen) info.charShapes.emplace_back(run.charShapeId, render::charShapeFields(doc, run.charShapeId));
+        }
+    }
+    return out;
+}
+
+Result<Fields> AgentDocument::section(int section) const {
+    Result<Fields> out;
+    const int count = static_cast<int>(impl_->doc.sections.size());
+    if (section < 1 || section > count) {
+        out.status = fail(Code::BadArgument, "구역 " + std::to_string(section) + " 은 없습니다. 구역은 1~" +
+                                                 std::to_string(count) + " 입니다.");
+        return out;
+    }
+    out.value = render::sectionFields(impl_->doc, section - 1);
     return out;
 }
 
@@ -753,38 +1290,96 @@ Result<std::vector<Match>> AgentDocument::find(const FindQuery& query) const {
         out.status = fail(Code::PositionOutOfRange, "story " + std::to_string(query.story) + " 은 없습니다.");
         return out;
     }
-    const std::string needle = query.matchCase ? query.text : asciiLower(query.text);
-    const int needleLength = codePoints(query.text);
     const int limit = query.limit > 0 ? query.limit : 100;
     const model::Document& doc = impl_->doc;
-    for (const StoryInfo& story : stories()) {
-        if (query.story != 0 && story.story != query.story) continue;
-        const std::vector<model::Paragraph>& paras = *impl_->storyParas(story.story);
-        for (int p = 0; p < static_cast<int>(paras.size()); ++p) {
-            const std::string text = plainText(paras[static_cast<std::size_t>(p)]);
-            const std::string hay = query.matchCase ? text : asciiLower(text);
-            const std::vector<std::size_t> starts = codePointStarts(text);
-            for (std::size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size())) {
-                const auto hit = std::lower_bound(starts.begin(), starts.end(), at);
-                if (hit == starts.end() || *hit != at) continue;  // 글자 가운데에서 맞은 것은 버린다
-                const int index = static_cast<int>(hit - starts.begin());
-                Match match;
-                match.range = {{story.story, p, index}, {story.story, p, index + needleLength}};
-                const int offset = render::paint_detail::charIndexToOffset(doc, impl_->pages, story.story, p, index);
-                const render::CaretPlace place =
-                    render::caretForCursor(doc, impl_->pages, model::CursorPos{story.story, p, offset});
-                if (place.hit && place.page >= 0 && place.page < static_cast<int>(impl_->pageInfos.size())) {
-                    match.page = impl_->pageInfos[static_cast<std::size_t>(place.page)].ref;
-                }
-                constexpr int kAround = 20;
-                const int lo = std::max(0, index - kAround);
-                const int hi = std::min(static_cast<int>(starts.size()) - 1, index + needleLength + kAround);
-                match.context = text.substr(starts[static_cast<std::size_t>(lo)],
-                                            starts[static_cast<std::size_t>(hi)] - starts[static_cast<std::size_t>(lo)]);
-                out.value.push_back(std::move(match));
-                if (static_cast<int>(out.value.size()) >= limit) return out;
-            }
+    for (const render::TextHit& hit : render::findText(doc, query.text, query.matchCase, query.story, limit)) {
+        Match match;
+        match.range = {{hit.story, hit.paragraph, hit.from}, {hit.story, hit.paragraph, hit.to}};
+        const int offset = render::paint_detail::charIndexToOffset(doc, impl_->pages, hit.story, hit.paragraph, hit.from);
+        const render::CaretPlace place =
+            render::caretForCursor(doc, impl_->pages, model::CursorPos{hit.story, hit.paragraph, offset});
+        if (place.hit && place.page >= 0 && place.page < static_cast<int>(impl_->pageInfos.size())) {
+            match.page = impl_->pageInfos[static_cast<std::size_t>(place.page)].ref;
         }
+        const std::string text = render::paragraphSearchText((*impl_->storyParas(hit.story))[static_cast<std::size_t>(hit.paragraph)]);
+        const std::vector<std::size_t> starts = codePointStarts(text);
+        constexpr int kAround = 20;
+        const int lo = std::max(0, hit.from - kAround);
+        const int hi = std::min(static_cast<int>(starts.size()) - 1, hit.to + kAround);
+        match.context = text.substr(starts[static_cast<std::size_t>(lo)],
+                                    starts[static_cast<std::size_t>(hi)] - starts[static_cast<std::size_t>(lo)]);
+        out.value.push_back(std::move(match));
+    }
+    return out;
+}
+
+Result<PageLayoutInfo> AgentDocument::layout(const PageRef& page, bool withText) const {
+    Result<PageLayoutInfo> out;
+    const Result<int> index = resolvePage(page);
+    if (!index.ok()) {
+        out.status = index.status;
+        return out;
+    }
+    const render::PageLayout drawn = render::describePage(impl_->doc, impl_->pages, index.value);
+    PageLayoutInfo& info = out.value;
+    info.page = impl_->pageInfos[static_cast<std::size_t>(index.value)].ref;
+    info.width = drawn.width;
+    info.height = drawn.height;
+    info.bodyX = drawn.bodyX;
+    info.bodyY = drawn.bodyY;
+    info.bodyWidth = drawn.bodyWidth;
+    info.bodyHeight = drawn.bodyHeight;
+    const std::int32_t bodyBottom = drawn.bodyY + drawn.bodyHeight;
+    const model::StoryMap& map = render::ensureStoryMap(impl_->doc);
+    const auto canonical = [&](int story) {
+        const model::StorySlot* slot = story > 0 && map.valid(story) ? map.slot(story) : nullptr;
+        return slot && slot->paragraphs ? map.storyOf(slot->paragraphs) : story;
+    };
+    for (const render::LayoutLine& l : drawn.lines) {
+        LayoutLineInfo line;
+        line.from = {canonical(l.story), l.paragraph, l.from};
+        line.to = l.to;
+        line.x = l.x;
+        line.y = l.y;
+        line.width = l.width;
+        line.height = l.height;
+        line.inkRight = l.inkRight;
+        line.heading = l.heading;
+        line.band = l.band;
+        line.master = l.master;
+        line.turned = l.turned;
+        const model::StorySlot* slot = l.story > 0 && map.valid(l.story) ? map.slot(l.story) : nullptr;
+        const bool body = slot && !slot->control && !l.band && !l.master && !l.turned;
+        line.overflow = body && drawn.bodyHeight > 0 && l.y + l.height > bodyBottom;
+        if (withText && slot && slot->paragraphs && l.paragraph >= 0 &&
+            l.paragraph < static_cast<int>(slot->paragraphs->size())) {
+            const std::string text = render::paragraphSearchText((*slot->paragraphs)[static_cast<std::size_t>(l.paragraph)]);
+            const std::vector<std::size_t> starts = codePointStarts(text);
+            const int last = static_cast<int>(starts.size()) - 1;
+            const int a = std::clamp(l.from, 0, last);
+            const int b = std::clamp(l.to, a, last);
+            line.text = text.substr(starts[static_cast<std::size_t>(a)], starts[static_cast<std::size_t>(b)] - starts[static_cast<std::size_t>(a)]);
+        }
+        info.lines.push_back(std::move(line));
+    }
+    for (const render::LayoutBox& b : drawn.boxes) {
+        LayoutBoxInfo box;
+        box.kind = b.kind;
+        box.story = canonical(b.story);
+        box.paragraph = b.paragraph;
+        box.row = b.row;
+        box.col = b.col;
+        box.rowSpan = b.rowSpan;
+        box.colSpan = b.colSpan;
+        box.x = b.x;
+        box.y = b.y;
+        box.width = b.width;
+        box.height = b.height;
+        box.inlineChar = b.inlineChar;
+        box.band = b.band;
+        box.master = b.master;
+        box.turned = b.turned;
+        info.boxes.push_back(std::move(box));
     }
     return out;
 }
@@ -839,7 +1434,14 @@ Result<EditReport> AgentDocument::apply(const std::vector<EditOp>& ops) {
     const int group = session.beginEditGroup();
     for (std::size_t i = 0; i < ops.size(); ++i) {
         OpReport report;
-        Status status = impl_->run(ops[i], report);
+        Status status;
+        impl_->shapePage = -1;
+        if (ops[i].kind == OpKind::Command && ops[i].command == "insertShape") {
+            const Result<int> page = resolvePage(ops[i].page);
+            if (page.ok()) impl_->shapePage = page.value;
+            else status = page.status;
+        }
+        if (status.ok()) status = impl_->run(ops[i], report);
         if (!status.ok()) {
             // 앞 op 들까지 묶음째 되돌리고, 다시 하기로 살아나지 않게 버린다. apply 는 전부 아니면 없음이라
             // 이 apply 가 한 글꼴 바꾸기도 되돌린다.
@@ -848,6 +1450,7 @@ Result<EditReport> AgentDocument::apply(const std::vector<EditOp>& ops) {
             if (swapped) session.undo();
             session.dropRedo();
             session.edit.clearCursor();
+            render::syncEditBand(impl_->doc);
             impl_->indexPages();
             status.message = "op " + std::to_string(i) + ": " + status.message;
             out.status = std::move(status);
@@ -857,17 +1460,46 @@ Result<EditReport> AgentDocument::apply(const std::vector<EditOp>& ops) {
         out.value.ops.push_back(std::move(report));
     }
     session.endEditGroup();
-    // 위치는 요청마다 받으므로 커서·블록은 남기지 않는다.
+    // 위치는 요청마다 받으므로 커서·블록은 남기지 않는다. 머리말·바탕쪽 편집 상태도 나온다.
     session.edit.clearCursor();
+    render::syncEditBand(impl_->doc);
     impl_->indexPages();
     out.value.pages = static_cast<int>(impl_->pages.size());
     return out;
+}
+
+Result<Fields> AgentDocument::commandView(const EditOp& op) {
+    Result<Fields> out;
+    if (op.kind != OpKind::Command) {
+        out.status = fail(Code::BadArgument, "view 는 명령(Command) op 만 읽습니다.");
+        return out;
+    }
+    const render::EditScope scope = impl_->session.bind();
+    out.status = impl_->view(op, out.value);
+    render::clearObjectSelection();
+    impl_->session.edit.clearCursor();
+    render::syncEditBand(impl_->doc);
+    if (!out.ok()) out.value.clear();
+    return out;
+}
+
+std::vector<std::string> commandNames() {
+    std::vector<std::string> names = {"insertNote", "exchangeNotes", "noteShape", "pageBorder", "sectionSettings",
+                                      "columns", "caption", "bookmark", "tableToText", "textToTable", "deleteMarks",
+                                      "tableProperties", "glyphGroup", "convertText", "sortParagraphs", "insertHyperlink",
+                                      "copyShape", "insertShape", "objectProperties", "deleteObject"};
+    // 쪽 탭 컨트롤(머리말·꼬리말·쪽 번호·바탕쪽·메모·교정 부호 ...)은 편집기 이름 그대로다.
+    for (int k = 0; k <= static_cast<int>(render::PageControlKind::InsertProofMark); ++k) {
+        names.emplace_back(render::pageControlName(static_cast<render::PageControlKind>(k)));
+    }
+    return names;
 }
 
 bool AgentDocument::undo() {
     if (!impl_->session.canUndo()) return false;
     impl_->session.undo();
     impl_->session.edit.clearCursor();
+    render::syncEditBand(impl_->doc);
     impl_->indexPages();
     return true;
 }
@@ -876,6 +1508,7 @@ bool AgentDocument::redo() {
     if (!impl_->session.canRedo()) return false;
     impl_->session.redo();
     impl_->session.edit.clearCursor();
+    render::syncEditBand(impl_->doc);
     impl_->indexPages();
     return true;
 }

@@ -28,9 +28,41 @@ const char* objectNumberingType(ControlKind kind, const std::string& stored) {
     return "NONE";
 }
 
+namespace {
+
+constexpr const char* kDutmalPos[] = {"TOP", "BOTTOM", "CENTER"};
+constexpr const char* kDutmalAlign[] = {"JUSTIFY", "LEFT", "RIGHT", "CENTER", "DISTRIBUTE", "DISTRIBUTE_SPACE"};
+constexpr const char* kComposeCircle[] = {
+    "CHAR", "SHAPE_CIRCLE", "SHAPE_REVERSAL_CIRCLE", "SHAPE_RECTANGLE", "SHAPE_REVERSAL_RECTANGLE",
+    "SHAPE_TRIANGLE", "SHAPE_REVERSAL_TIRANGLE", "SHAPE_LIGHT", "SHAPE_RHOMBUS", "SHAPE_REVERSAL_RHOMBUS",
+    "SHAPE_ROUNDED_RECTANGLE", "SHAPE_EMPTY_CIRCULATE_TRIANGLE", "SHAPE_THIN_CIRCULATE_TRIANGLE",
+    "SHAPE_THICK_CIRCULATE_TRIANGLE"};
+
+template <std::size_t N>
+const char* nameAt(const char* const (&names)[N], std::uint32_t code) {
+    return code < N ? names[code] : names[0];
+}
+template <std::size_t N>
+std::uint32_t codeOf(const char* const (&names)[N], const std::string& name) {
+    for (std::uint32_t i = 0; i < N; ++i) {
+        if (name == names[i]) return i;
+    }
+    return 0;
+}
+
+}  // namespace
+
+const char* dutmalPosName(std::uint32_t code) { return nameAt(kDutmalPos, code); }
+std::uint32_t dutmalPosCode(const std::string& name) { return codeOf(kDutmalPos, name); }
+const char* dutmalAlignName(std::uint32_t code) { return nameAt(kDutmalAlign, code); }
+std::uint32_t dutmalAlignCode(const std::string& name) { return codeOf(kDutmalAlign, name); }
+const char* composeCircleName(std::uint32_t code) { return nameAt(kComposeCircle, code); }
+std::uint32_t composeCircleCode(const std::string& name) { return codeOf(kComposeCircle, name); }
+
 const char* controlKindName(ControlKind kind) {
     switch (kind) {
         case ControlKind::Unknown: return "unknown";
+        case ControlKind::FieldEnd: return "fieldEnd";
         case ControlKind::SectionDef: return "sectionDef";
         case ControlKind::ColumnDef: return "columnDef";
         case ControlKind::Table: return "table";

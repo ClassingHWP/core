@@ -1,6 +1,6 @@
 ---
 name: chwp-agent
-description: 한글(HWP·HWPX) 문서를 열어 글을 읽고, 찾고, 고치고(글 넣기·지우기·바꾸기·글자/문단 서식·표 넣기·표 칸 채우기), 쪽을 PNG 로 그려 확인하고, HWP 또는 HWPX 로 저장한다. 사용자가 .hwp/.hwpx 파일의 내용을 묻거나 고쳐 달라고 할 때 쓴다.
+description: 한글(HWP·HWPX) 문서를 열어 글을 읽고, 찾고, 고치고(글 넣기·지우기·바꾸기·모두 바꾸기·글자/문단 서식·표 넣기·표 칸 채우기·표 줄/칸 넣기·지우기·칸 합치기·나누기·셀 테두리/배경·셀 크기 같게·그림·머리말/꼬리말·쪽 번호·바탕쪽·각주/미주·메모·교정 부호·단·구역·캡션·책갈피·하이퍼링크·도형·개체 속성), 쪽을 PNG 로 그려 확인하고, HWP 또는 HWPX 로 저장한다. 사용자가 .hwp/.hwpx 파일의 내용을 묻거나 고쳐 달라고 할 때 쓴다.
 ---
 
 # chwp-agent
@@ -85,16 +85,48 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "문서.hwp" render.jsonl --ou
 `--out-dir` 폴더는 없으면 만든다. 응답 한 줄이 한 쪽이고, 실패한 쪽은 `error.message` 에 까닭이 있다.
 사용자에게 그림을 건넬 때는 `info` 의 `missingGlyphs` 도 같이 보고, 몇 장은 Read 로 열어 눈으로 확인한 뒤 건넨다.
 
+## 문서 구조 한눈에
+
+```
+구역(section, 1부터) ─ 용지·여백·단·쪽 번호·바탕쪽
+└─ 구역 본문 story ─ 문단(0부터) ─ 글자(코드 포인트, 0부터)  → 위치 "story:문단:글자"
+                              └─ 개체(objects, 0부터)       → 개체 이름 "story:문단:개체"
+                                 └─ 안의 글 묶음: 표 칸·글상자·머리말/꼬리말·각주·캡션 (각자 story 번호)
+```
+
+- **글 묶음(story)** 마다 문단 목록이 따로다. 표 칸 글은 표 칸 story, 머리말 글은 머리말 story 에서 읽고 고친다.
+  `{"call":"stories"}` 의 `kind`·`owner`·`parentStory`·`parentParagraph` 로 어디에 든 글인지 안다.
+- **개체**는 문단에 붙는다. `paragraph` 응답의 `objects` 가 그 목록이고 `at`(붙은 글자 자리), `inline`(글자처럼 취급),
+  `placement`(놓기), `stories`(안의 글 묶음)를 준다. 머리말·꼬리말은 보통 구역 첫 문단에 `at` 0 개체로 붙어 있다.
+- **글자처럼 취급**한 개체는 글자 하나(U+FFFC ￼)라 글과 같이 흐르고, **띄운 개체**는 글자를 차지하지 않고 기준(종이·쪽·단·문단)과
+  거리로 놓인다. 어울림(`SQUARE`)·자리 차지(`TOP_AND_BOTTOM`)·글 뒤로·글 앞으로가 글이 비켜 가는 방법이다.
+
+## 그림·개체 놓기 요령
+
+1. 그림은 `insertPicture` 로 넣는다. **늘 글자처럼** 들어가고, 응답 `object` 가 새 그림 이름이다.
+2. 글 사이에 한 줄로 둘 그림은 그대로 둔다. 가운데 두려면 그 문단을 `format` 의 `align:"CENTER"` 로 한다.
+3. 글 옆·종이의 정한 자리·글 뒤에 둘 그림은 이어서 `objectProperties` 로 `treatAsChar:false` 와 `textWrap`·기준·정렬·거리를 준다.
+   지금 값은 `{"call":"view","op":"objectProperties","object":"1:0:0"}` 로 읽는다.
+4. 띄우면 그 ￼ 글자가 빠져 뒤 글자 순번이 하나 당겨진다. 같은 apply 의 뒤 op 위치를 그만큼 고친다.
+5. 놓은 뒤 `layout` 의 `boxes` 로 자리를, `render` 로 글이 어떻게 비켜 갔는지 눈으로 본다.
+
+값의 뜻(기준 영역, 거리를 어느 쪽에서 재는지, 문단 기준 세로 거리 등)과 예 다섯 가지(가운데 그림, 오른쪽 어울림, 종이 오른쪽 위 로고,
+쪽 전체 바탕 그림, 캡션)는 reference.md 의 「문서 구조」·「개체 놓기」에 있다. 그림을 놓기 전에 꼭 읽는다.
+
 ## 일하는 차례
 
 1. **훑기**: `{"call":"info"}`, `{"call":"text"}` 로 글 전체를 읽는다. 길면 응답의 `next` 를 그대로 붙여 이어 읽는다.
    표는 문단 안 `objects` 의 `stories` 로 칸 글 묶음 번호를 알려 주고, 그 칸 글도 `text` 에 같이 나온다.
 2. **자리 찾기**: `{"call":"find","text":"..."}` 로 고칠 글의 구간(`from`·`to`)과 쪽을 얻는다.
    위치는 `{story, paragraph, char}` 또는 `"story:문단:글자"` 이고, `char` 는 그 문단 글의 코드 포인트 순번이다.
+   모양을 고치거나 맞출 때는 먼저 지금 값을 읽는다: 글자·문단 모양은 `{"call":"paragraph",...,"detail":true}`,
+   쪽 모양(용지·여백·단)은 `{"call":"section","section":1}`, 표 칸 테두리·배경·여백은 `{"call":"table","story":N}`.
+   읽은 이름이 곧 `format`·`pageSetup` 의 `set` 이름이다.
 3. **고치기**: `{"call":"apply","ops":[...]}`. 한 apply 는 트랜잭션이다. 하나라도 실패하면 아무것도 바뀌지 않고
    `error.message` 가 `op N:` 으로 시작한다. op 의 위치는 앞 op 까지 적용한 문서 기준이므로, 한 apply 에 여러 곳을
    고칠 때는 **문서 뒤쪽부터** 고치거나 고친 뒤 다시 `find` 한다.
-4. **확인**: 바뀐 문단을 `paragraph`/`text` 로 다시 읽고, 모양이 중요하면 `render` 로 그 쪽을 그려 본다.
+4. **확인**: 바뀐 문단을 `paragraph`/`text` 로 다시 읽고, 그 쪽을 `{"call":"layout","page":...}` 로 읽어
+   줄 나눔·넘침(`overflow`)·표가 쪽에서 잘렸는지를 본다. 색·굵기처럼 눈으로 볼 모양만 `render` 로 그려 본다.
    찾은 결과의 `page` 를 그대로 `render` 의 `page` 로 넘기면 된다.
 5. **저장**: `--save 경로` 또는 `{"call":"save","path":"..."}`. 확장자(.hwp/.hwpx)로 형식을 정한다.
    틀렸으면 `{"call":"undo"}` 로 마지막 apply 를 되돌린다(같은 실행 안에서만).
@@ -113,10 +145,15 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "원본.hwp" req.jsonl --out-d
 
 ## 알아 둘 것
 
-- 글에서 U+FFFC(￼)는 글자처럼 놓인 개체(표·그림·수식) 한 글자다. 지우면 그 개체가 지워진다.
+- 글에서 U+FFFC(￼)는 글자처럼 놓인 개체(표·그림·수식·도형)와 각주·미주 번호 한 글자다. 지우면 그 개체가 지워진다. 띄운 개체는 글자가 없으니 `deleteObject` 로 지운다.
 - 한글 전용 기호는 사용자 영역 글자(U+E000~U+F8FF)로 들어 있어 터미널에 안 보일 수 있다. 순번을 셀 때 빠뜨리지 않는다.
 - 쪽은 쪽 번호 + 구역으로 가리키거나, `{"order":N}` 으로 물리 순서를 가리킨다. `AmbiguousPage` 가 오면
   `candidates` 에서 골라 다시 부르거나 `pages` 의 `order` 를 쓴다.
 - 머리말·꼬리말·바탕쪽처럼 쪽에 놓이지 않는 글은 `NotEditable` 이 날 수 있다.
 - 글자 서식은 빈 구간에 주면 효과가 없다. 문단 서식(정렬·줄 간격 등)은 빈 구간이어도 그 문단에 들어간다.
-- 아직 없는 것: 그림·수식 넣기, 좌표로 찾기(hitTest), 쪽 일부만 그리기.
+- 표 구조(`insertRows`·`insertColumns`·`deleteRows`·`deleteColumns`·`mergeCells`·`splitCell`)는 칸 story 로 가리킨다.
+  먼저 `{"call":"table","story":칸}` 으로 칸 그림(합친 칸 포함)을 보고, 고친 뒤에는 응답의 `table` 에서 다음 칸을 고른다.
+  칸 story 번호는 표를 고칠 때마다 바뀐다. 규칙은 reference.md 의 apply 표에 있다.
+- 머리말·각주·쪽 번호·바탕쪽·메모·단·캡션·도형 같은 편집기 명령은 op 이름으로 부르고 자리(at·range·object·story·section)와
+  `set` 을 준다. 값 이름은 먼저 `{"call":"view","op":"명령",자리}` 로 읽는다. 목록은 reference.md 의 「편집기 명령 op」다.
+- 아직 없는 것: 수식 넣기, 좌표로 찾기(hitTest), 쪽 일부만 그리기.

@@ -360,6 +360,9 @@ struct NodeExtra {
     bool borderIgnoreMargin = false;
     std::int32_t cellSpacing = 0;
     std::string pageLabel;          // 종이 노드. 쪽 번호 형식대로 쓴 번호("79", "iv"). 비면 pageNumber 그대로
+    int lineNumberNext = 0;         // 종이 노드. 줄 번호를 이어 셀 때 다음 쪽 첫 줄 번호(0 이면 아직 세지 않음)
+    // 종이 노드. 메모 상자가 쪽 오른쪽 밖으로 나가면 화면에서 쪽을 이만큼 넓힌다(W + 14mm − R).
+    std::int32_t memoExtra = 0;
     TailBox<ObjectExtra> object;
 
     // 개체·칸 값. 읽기는 obj(), 쓰기는 objMut().
@@ -448,6 +451,8 @@ struct Node {
     // 쪽 계산은 줄 위치만 남긴다. 글자열과 글꼴 이름은 그 쪽을 그리기 전에 채운다.
     bool spansLater = false;
     bool pageNumberHidden = false;  // 종이 노드. 「쪽 번호 감추기」로 이 쪽에 번호가 찍히지 않는다
+    bool pageBorderHidden = false;  // 종이 노드. 「현재 쪽만 감추기」의 쪽 테두리
+    bool pageFillHidden = false;    // 종이 노드. 「현재 쪽만 감추기」의 쪽 배경
     // 파일에 적힌 개체 크기. 조판이 칸을 키운 뒤의 width/height 와 비교한다.
     bool fileAudit = false;
     bool huBoundsReady = false;
@@ -463,6 +468,9 @@ struct Node {
     std::string& textMut() { return editContent().text; }
     LineGlyphs& glyphsMut() { return editContent().glyphs; }
 };
+
+// 화면에 보이는 쪽 폭: 종이 폭 + 메모 덧폭. 쪽 그림 크기와 카메라 쪽 폭이 쓴다.
+inline std::int32_t viewWidthOf(const Node& page) { return page.width + page.ext().memoExtra; }
 
 // 줄 글자 표. 줄 글자를 읽는 곳은 모두 이것을 쓴다.
 inline const LineGlyphs& lineGlyphs(const Node& line) { return line.glyphs(); }
@@ -520,8 +528,37 @@ void setPageCalcLog(bool on);
 // 켜면 lineseg 의 줄 경계는 그대로 쓰고, 줄 높이·줄 간격은 우리 측정값으로 쌓는다. 한글과 모양을 견줄 때 쓴다.
 void setMeasuredLineHeight(bool on);
 
+// 문서를 처음부터 한 쪽씩 쌓는다. 끝까지 돌리면 layoutPages(doc, -1, ...) 와 같은 쪽 목록이다.
+// 내놓은 쪽은 뒤에 쪽이 붙어도 바뀌지 않는다. 화면 여백(marginTop·marginBottom)만 첫·끝 쪽에 맞춰 다시 정한다.
+// 쌓는 동안 문서와 글 묶음 표를 쓰니, 문서를 고치거나 다시 쌓기 전에 끝까지 쌓는다(DocSession::finishLayout).
+// pages 는 빈 목록에서 시작해 이 쌓기만 붙인다.
+class PageStacker {
+ public:
+    PageStacker(const model::Document& doc, bool useStoredLineHeight, bool deferSpans);
+    ~PageStacker();
+    PageStacker(const PageStacker&) = delete;
+    PageStacker& operator=(const PageStacker&) = delete;
+    // 쪽을 한 장 이상 더 쌓아 pages 끝에 붙이고 붙인 장 수를 돌려준다(구역이 끝나면 여러 장). 다 쌓았으면 0 이다.
+    int step(std::vector<Node>& pages);
+    bool done() const;
+
+ private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
 std::vector<Node> layoutPages(const model::Document& doc, int onlyPage, bool useStoredLineHeight = false,
                              bool deferSpans = false);
+
+// 줄 번호(model::LineNumberShape). from 쪽부터 쪽마다 본문 줄에 번호를 붙인다(종이 자식, role "lineNumbers").
+// 앞쪽의 lineNumberNext 에서 이어 세고, 번호 자리가 바뀐 쪽만 다시 만든다. 다시 만든(또는 지운) 쪽 번호를 changed 에 넣는다.
+// 줄 번호를 보이는 구역이 없으면 아무것도 하지 않는다. 쪽 쌓기와 편집 뒤 다시 놓기가 부른다.
+void numberPageLines(const model::Document& doc, std::vector<Node>& pages, int from = 0,
+                     std::vector<int>* changed = nullptr);
+
+// 메모 상자(화면). 쪽마다 메모 필드 자리 옆 오른쪽 여백에 상자·연결선을 놓는다(종이 자식, role "memos").
+// 지난 배치는 지우고 다시 놓는다. 메모가 든 쪽과 메모를 지운 쪽 번호를 changed 에 넣는다(memo_layout.cpp).
+void placeMemos(const model::Document& doc, std::vector<Node>& pages, std::vector<int>* changed = nullptr);
 
 // 그림 크기가 바뀐 쪽부터 다시 놓는다. 뒤쪽 본문이 예전 쪽의 문단 처음과 같으면
 // 그 종이 노드를 옮기고, 쪽 번호만 고친다. 문단 중간에서 쪽이 시작하거나 단이 여러 개면 false.

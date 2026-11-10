@@ -160,4 +160,39 @@ void ByteWriter::hwpString(std::string_view utf8) {
     utf16(std::u16string_view(w.data(), len));
 }
 
+bool decodeBase64(std::string_view text, Bytes& out) {
+    out.clear();
+    if (text.substr(0, 5) == "data:") {
+        const std::size_t comma = text.find(',');
+        if (comma == std::string_view::npos || text.substr(0, comma).find(";base64") == std::string_view::npos) return false;
+        text.remove_prefix(comma + 1);
+    }
+    std::uint32_t acc = 0;
+    int bits = 0;
+    out.reserve(text.size() * 3 / 4);
+    bool ended = false;
+    for (const char ch : text) {
+        int v = -1;
+        if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+        else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+        else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+        else if (ch == '+' || ch == '-') v = 62;
+        else if (ch == '/' || ch == '_') v = 63;
+        else if (ch == '=') {
+            ended = true;
+            continue;
+        } else if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') {
+            continue;
+        }
+        if (v < 0 || ended) return false;
+        acc = (acc << 6) | static_cast<std::uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<std::uint8_t>((acc >> bits) & 0xFFu));
+        }
+    }
+    return !out.empty();
+}
+
 }  // namespace chwp

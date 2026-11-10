@@ -222,6 +222,7 @@ const std::vector<ParaField>& paraFields() {
         CHWP_PARA_BOOL("fontLineHeight", fontLineHeight),
         CHWP_PARA_BOOL("autoSpacingEng", autoSpacingEng),
         CHWP_PARA_BOOL("autoSpacingNum", autoSpacingNum),
+        CHWP_PARA_BOOL("suppressLineNumbers", suppressLineNumbers),
         CHWP_PARA_TEXT("lineWrap", lineWrap),
         CHWP_PARA_INT("borderOffsetLeft", borderOffsetLeft, 0, 1000000),
         CHWP_PARA_INT("borderOffsetRight", borderOffsetRight, 0, 1000000),
@@ -455,9 +456,49 @@ const Field* findField(const std::vector<Field>& fields, const std::string& key)
 
 namespace paint_detail {
 
+model::BorderFill borderFillOf(const model::Document& doc, std::uint32_t id) {
+    if (const model::BorderFill* have = borderFillById(doc, id)) return *have;
+    return {};
+}
+
+std::uint32_t internBorderFillOf(model::Document& doc, const model::BorderFill& fill) { return internBorderFill(doc, fill); }
+
+// 언어별 값: "ratio.LATIN" 처럼 이름 뒤에 언어(model::langName)를 붙인다. 붙이지 않은 이름은 모든 언어에 넣는다.
+// 글꼴(font.LANG)은 문서 글꼴 표에 넣어야 해서 deriveCharShapeId 가 넣는다.
+int langOfKey(const std::string& key, std::string& base) {
+    const std::size_t dot = key.rfind('.');
+    if (dot == std::string::npos || dot == 0) return -1;
+    const std::string tail = key.substr(dot + 1);
+    for (std::size_t i = 0; i < model::kLangCount; ++i) {
+        if (tail == model::langName(static_cast<model::Lang>(i))) {
+            base = key.substr(0, dot);
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+bool langCharKey(const std::string& key) {
+    std::string base;
+    if (langOfKey(key, base) < 0) return false;
+    return base == "ratio" || base == "spacing" || base == "relSize" || base == "charOffset" || base == "font";
+}
+
+void writeLangCharField(model::CharShape& shape, const std::string& key, const FormatValue& value) {
+    std::string base;
+    const int lang = langOfKey(key, base);
+    if (lang < 0 || !numberOf(value)) return;
+    const auto at = static_cast<std::size_t>(lang);
+    if (base == "ratio") shape.ratio[at] = intOf(value, 50, 200);
+    else if (base == "spacing") shape.spacing[at] = intOf(value, -50, 50);
+    else if (base == "relSize") shape.relSize[at] = intOf(value, 10, 250);
+    else if (base == "charOffset") shape.offset[at] = intOf(value, -100, 100);
+}
+
 bool formatFieldsTouchChar(const FormatFields& fields) {
     return std::any_of(fields.begin(), fields.end(), [](const auto& f) {
-        return findField(charFields(), f.first) != nullptr || fillFieldOf(f.first, "char.") != nullptr;
+        return findField(charFields(), f.first) != nullptr || fillFieldOf(f.first, "char.") != nullptr ||
+               langCharKey(f.first);
     });
 }
 
@@ -583,6 +624,29 @@ void applyParaFillFields(model::Document& doc, model::ParaShape& shape, const Fo
 void applyCharFields(model::CharShape& shape, const FormatFields& fields) {
     for (const auto& [key, value] : fields) {
         if (const CharField* field = findField(charFields(), key)) field->write(shape, value);
+        else if (langCharKey(key)) writeLangCharField(shape, key, value);
+    }
+}
+
+void applyCharLangFonts(model::Document& doc, model::CharShape& shape, const FormatFields& fields) {
+    for (const auto& [key, value] : fields) {
+        std::string base;
+        const int lang = langOfKey(key, base);
+        const std::string* face = std::get_if<std::string>(&value);
+        if (lang < 0 || base != "font" || !face || face->empty()) continue;
+        const auto slot = static_cast<std::size_t>(lang);
+        if (slot >= doc.header.fonts.size()) continue;
+        auto& fonts = doc.header.fonts[slot];
+        std::size_t idx = 0;
+        while (idx < fonts.size() && fonts[idx].face != *face) ++idx;
+        if (idx == fonts.size()) {
+            model::Font font;
+            font.id = static_cast<std::uint32_t>(fonts.size());
+            font.face = *face;
+            font.type = "TTF";
+            fonts.push_back(std::move(font));
+        }
+        shape.fontRef[slot] = static_cast<std::uint32_t>(idx);
     }
 }
 
@@ -603,6 +667,48 @@ bool setFormatField(FormatPatch& patch, const std::string& key, const FormatValu
         patch.hasStyleId = true;
         patch.styleId = static_cast<std::uint32_t>(std::max(0.0, *n));
         return true;
+    }
+    if (key == "styleName" && t) {
+        patch.styleName = *t;
+        return !t->empty();
+    }
+    if (key == "indentStep" && n) {
+        patch.indentStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.indentStep != 0;
+    }
+    if (key == "marginLeftStep" && n) {
+        patch.marginLeftStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.marginLeftStep != 0;
+    }
+    if (key == "marginRightStep" && n) {
+        patch.marginRightStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.marginRightStep != 0;
+    }
+    if (key == "spacingStep" && n) {
+        patch.spacingStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.spacingStep != 0;
+    }
+    if (t && (key == "pickUnderlineShape" || key == "pickUnderlineColor" || key == "pickStrikeShape" ||
+              key == "pickStrikeColor" || key == "pickCharBorderType" || key == "pickCharBorderColor")) {
+        patch.linePicks.emplace_back(key.substr(4), *t);
+        return true;
+    }
+    if (key == "normalShape" && b) {
+        patch.normalShape = *b;
+        return *b;
+    }
+    if (key == "ratioStep" && n) {
+        patch.ratioStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.ratioStep != 0;
+    }
+    if (key == "headingToggle" && t) {
+        if (*t != "NUMBER" && *t != "BULLET" && *t != "OUTLINE") return false;
+        patch.headingToggle = *t;
+        return true;
+    }
+    if (key == "headingLevelStep" && n) {
+        patch.headingLevelStep = *n > 0 ? 1 : (*n < 0 ? -1 : 0);
+        return patch.headingLevelStep != 0;
     }
     if (key == "align" && t) {
         patch.hasAlign = true;
@@ -684,12 +790,23 @@ bool setFormatField(FormatPatch& patch, const std::string& key, const FormatValu
         patch.color = t->empty() ? std::string("#000000") : *t;
         return true;
     }
+    if (key == "markpen" && t) {
+        patch.hasMarkpen = true;
+        patch.markpen = *t == "none" ? std::string() : *t;
+        if (!patch.markpen.empty()) {
+            for (char& ch : patch.markpen) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        return true;
+    }
     if (key == "toggle" && t) {
-        if (*t != "bold" && *t != "italic" && *t != "underline" && *t != "strikeout") return false;
+        if (*t != "bold" && *t != "italic" && *t != "underline" && *t != "strikeout" && *t != "superscript" &&
+            *t != "subscript" && *t != "superSub" && *t != "charBorder") {
+            return false;
+        }
         patch.toggles.push_back(*t);
         return true;
     }
-    if (findField(charFields(), key) || findField(paraFields(), key) || fillFieldOf(key, "char.") ||
+    if (findField(charFields(), key) || findField(paraFields(), key) || fillFieldOf(key, "char.") || langCharKey(key) ||
         fillFieldOf(key, "para.") || paint_detail::isTabKey(key)) {
         patch.fields.emplace_back(key, value);
         return true;
@@ -701,6 +818,39 @@ namespace paint_detail {
 
 std::vector<model::TabStop> parseTabStops(const std::string& text) { return tabStopsOf(text); }
 std::string tabStopsTextOf(const std::vector<model::TabStop>& stops) { return tabStopsText(stops); }
+
+void readFillFieldsOf(const model::Document& doc, std::uint32_t id, const char* prefix, FormatFields& out) {
+    readFillFields(doc, id, prefix, out);
+}
+
+std::uint32_t applyFillFieldsOf(model::Document& doc, std::uint32_t current, const FormatFields& fields, const char* prefix) {
+    return applyFillFields(doc, current, fields, prefix);
+}
+
+// 글자 모양 하나의 대화 상자 값(글꼴·크기 같은 첫 값 뒤에 붙는 것). 언어별 값과 "char." 테두리/배경까지.
+void appendCharShapeFields(const model::Document& doc, const model::CharShape& cs, FormatFields& out) {
+    for (const CharField& field : charFields()) out.emplace_back(field.key, field.read(cs));
+    readFillFields(doc, cs.borderFillId, "char.", out);
+    // 언어별 글꼴·장평·자간·상대 크기·글자 위치(글자 모양 대화 상자의 언어 고르기).
+    for (std::size_t i = 0; i < model::kLangCount; ++i) {
+        const std::string lang = model::langName(static_cast<model::Lang>(i));
+        std::string face;
+        if (i < doc.header.fonts.size() && cs.fontRef[i] < doc.header.fonts[i].size()) {
+            face = doc.header.fonts[i][cs.fontRef[i]].face;
+        }
+        out.emplace_back("font." + lang, face);
+        out.emplace_back("ratio." + lang, static_cast<double>(cs.ratio[i] != 0 ? cs.ratio[i] : 100));
+        out.emplace_back("spacing." + lang, static_cast<double>(cs.spacing[i]));
+        out.emplace_back("relSize." + lang, static_cast<double>(cs.relSize[i] != 0 ? cs.relSize[i] : 100));
+        out.emplace_back("charOffset." + lang, static_cast<double>(cs.offset[i]));
+    }
+}
+
+void appendParaShapeFields(const model::Document& doc, const model::ParaShape& ps, FormatFields& out) {
+    for (const ParaField& field : paraFields()) out.emplace_back(field.key, field.read(ps));
+    readFillFields(doc, ps.borderFillId, "para.", out);
+    readTabFields(doc, ps.tabDefId, out);
+}
 
 FormatFields formatFieldsOf(const model::Document& doc, const CursorStyle& st, std::int32_t sectionDefaultTab) {
     FormatFields out = {
@@ -715,15 +865,8 @@ FormatFields formatFieldsOf(const model::Document& doc, const CursorStyle& st, s
         {"lineSpacingType", st.lineSpacingType},
         {"lineSpacing", static_cast<double>(st.lineSpacing)},
     };
-    if (const model::CharShape* cs = Painter::findCharShape(doc, st.charShapeId)) {
-        for (const CharField& field : charFields()) out.emplace_back(field.key, field.read(*cs));
-        readFillFields(doc, cs->borderFillId, "char.", out);
-    }
-    if (const model::ParaShape* ps = Painter::findParaShape(doc, st.paraShapeId)) {
-        for (const ParaField& field : paraFields()) out.emplace_back(field.key, field.read(*ps));
-        readFillFields(doc, ps->borderFillId, "para.", out);
-        readTabFields(doc, ps->tabDefId, out);
-    }
+    if (const model::CharShape* cs = Painter::findCharShape(doc, st.charShapeId)) appendCharShapeFields(doc, *cs, out);
+    if (const model::ParaShape* ps = Painter::findParaShape(doc, st.paraShapeId)) appendParaShapeFields(doc, *ps, out);
     if (sectionDefaultTab > 0) out.emplace_back("sectionDefaultTab", static_cast<double>(sectionDefaultTab));
     return out;
 }
@@ -739,6 +882,84 @@ FormatFields formatFieldsAtCursor(const model::Document& doc, const std::vector<
         }
     }
     return formatFieldsOf(doc, cursorStyle(doc, pages), defaultTab);
+}
+
+FormatFields charShapeFields(const model::Document& doc, std::uint32_t charShapeId) {
+    FormatFields out;
+    const model::CharShape* cs = Painter::findCharShape(doc, charShapeId);
+    if (!cs) return out;
+    std::string color = "#000000";
+    if (cs->textColor) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "#%06X", static_cast<unsigned>(*cs->textColor & 0xFFFFFFu));
+        color = buf;
+    }
+    out.emplace_back("font", Painter::resolveCharShapeFontName(doc, *cs));
+    out.emplace_back("fontSize", static_cast<double>(cs->height > 0 ? cs->height : 1000));
+    out.emplace_back("bold", cs->bold);
+    out.emplace_back("italic", cs->italic);
+    out.emplace_back("underlineType", cs->underline.empty() ? std::string("NONE") : cs->underline);
+    out.emplace_back("strikeout", cs->strikeout);
+    out.emplace_back("color", color);
+    paint_detail::appendCharShapeFields(doc, *cs, out);
+    return out;
+}
+
+FormatFields paraShapeFields(const model::Document& doc, std::uint32_t paraShapeId) {
+    FormatFields out;
+    const model::ParaShape* ps = Painter::findParaShape(doc, paraShapeId);
+    if (!ps) return out;
+    out.emplace_back("align", ps->align.empty() ? std::string("JUSTIFY") : ps->align);
+    out.emplace_back("lineSpacingType", ps->lineSpacingType.empty() ? std::string("PERCENT") : ps->lineSpacingType);
+    out.emplace_back("lineSpacing", static_cast<double>(ps->lineSpacing > 0 ? ps->lineSpacing : 160));
+    paint_detail::appendParaShapeFields(doc, *ps, out);
+    return out;
+}
+
+FormatFields tableFields(const model::Document& doc, const model::Table& table) {
+    FormatFields out;
+    out.emplace_back("cellSpacing", static_cast<double>(table.cellSpacing));
+    out.emplace_back("pageBreak", table.pageBreak);
+    out.emplace_back("repeatHeader", table.repeatHeader);
+    out.emplace_back("marginLeft", static_cast<double>(table.marginLeft));
+    out.emplace_back("marginRight", static_cast<double>(table.marginRight));
+    out.emplace_back("marginTop", static_cast<double>(table.marginTop));
+    out.emplace_back("marginBottom", static_cast<double>(table.marginBottom));
+    paint_detail::readFillFieldsOf(doc, table.borderFillId, "table.", out);
+    return out;
+}
+
+FormatFields tableCellFields(const model::Document& doc, const model::Table& table, const model::TableCell& cell) {
+    FormatFields out;
+    out.emplace_back("vertAlign", cell.vertAlign.empty() ? std::string("CENTER") : cell.vertAlign);
+    out.emplace_back("header", cell.header);
+    // 칸 안 여백. 칸이 제 여백을 쓰지 않으면 표 안쪽 여백이다.
+    out.emplace_back("ownMargin", cell.hasMargin);
+    out.emplace_back("marginLeft", static_cast<double>(cell.hasMargin ? cell.marginLeft : table.marginLeft));
+    out.emplace_back("marginRight", static_cast<double>(cell.hasMargin ? cell.marginRight : table.marginRight));
+    out.emplace_back("marginTop", static_cast<double>(cell.hasMargin ? cell.marginTop : table.marginTop));
+    out.emplace_back("marginBottom", static_cast<double>(cell.hasMargin ? cell.marginBottom : table.marginBottom));
+    paint_detail::readFillFieldsOf(doc, cell.borderFillId, "cell.", out);
+    return out;
+}
+
+FormatFields placementFields(const model::Placement& p) {
+    FormatFields out;
+    out.emplace_back("treatAsChar", p.treatAsChar);
+    out.emplace_back("textWrap", p.textWrap.empty() ? std::string("TOP_AND_BOTTOM") : p.textWrap);
+    out.emplace_back("textFlow", p.textFlow);
+    out.emplace_back("vertRelTo", p.vertRelTo.empty() ? std::string("PARA") : p.vertRelTo);
+    out.emplace_back("horzRelTo", p.horzRelTo.empty() ? std::string("COLUMN") : p.horzRelTo);
+    out.emplace_back("vertAlign", p.vertAlign);
+    out.emplace_back("horzAlign", p.horzAlign);
+    out.emplace_back("vertOffset", static_cast<double>(p.vertOffset));
+    out.emplace_back("horzOffset", static_cast<double>(p.horzOffset));
+    out.emplace_back("width", static_cast<double>(p.width));
+    out.emplace_back("height", static_cast<double>(p.height));
+    out.emplace_back("zOrder", static_cast<double>(p.zOrder));
+    out.emplace_back("flowWithText", p.flowWithText);
+    out.emplace_back("allowOverlap", p.allowOverlap);
+    return out;
 }
 
 }  // namespace chwp::render

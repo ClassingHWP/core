@@ -62,6 +62,7 @@ Painter::ClipBounds Painter::childClipOf(const Node& parent, std::int32_t px, st
         if (child.role == "caption") {
             return intersectClip(cur, px + child.x, py + child.y, child.width, child.height);
         }
+        if (!clipsOwnBox(parent)) return cur;
         return intersectClip(cur, px, py, parent.width, parent.height);
     }
     return cur;
@@ -94,7 +95,7 @@ bool Painter::seedAncestorClips(const Node& page, const std::vector<int>& path, 
     if (path.empty()) return false;
     ClipBounds clip;
     if (page.width > 0 && page.height > 0) {
-        clip = intersectClip(clip, 0, 0, page.width, page.height);
+        clip = intersectClip(clip, 0, 0, viewWidthOf(page), page.height);
     }
     bool hasBoxClip = false;
     const Node* cur = &page;

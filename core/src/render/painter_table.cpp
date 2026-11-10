@@ -732,23 +732,29 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
 
     std::vector<Seg> hSegs;
     std::vector<Seg> vSegs;
+    // 투명 선: 선 없는 변. 같은 자리에 보이는 선이 있으면 긋지 않는다.
+    const bool transparent = shownMarks().transparent && !placesOnly;
+    std::vector<Seg> hNone;
+    std::vector<Seg> vNone;
 
     auto addH = [&](std::int32_t yFixed, std::int32_t xStart, std::int32_t xEnd, const BorderEdge& e,
                     bool isBottom) {
-        if (e.type.empty() || e.type == "NONE" || xEnd <= xStart) return;
+        const bool none = e.type.empty() || e.type == "NONE";
+        if ((none && !transparent) || xEnd <= xStart) return;
         if (striped && (yFixed < stripY0 || (isLastStrip ? (yFixed > stripY1) : (yFixed >= stripY1)))) return;
         auto it0 = std::lower_bound(xs.begin(), xs.end(), xStart);
         auto it1 = std::lower_bound(xs.begin(), xs.end(), xEnd);
         for (auto it = it0; it != it1 && (it + 1) != xs.end(); ++it) {
             const std::int32_t s = *it;
             const std::int32_t t = *(it + 1);
-            if (t > s) hSegs.push_back(Seg{yFixed, s, t, e, isBottom});
+            if (t > s) (none ? hNone : hSegs).push_back(Seg{yFixed, s, t, e, isBottom});
         }
     };
 
     auto addV = [&](std::int32_t xFixed, std::int32_t yStart, std::int32_t yEnd, const BorderEdge& e,
                     bool isRight) {
-        if (e.type.empty() || e.type == "NONE" || yEnd <= yStart || !ownsX(xFixed)) return;
+        const bool none = e.type.empty() || e.type == "NONE";
+        if ((none && !transparent) || yEnd <= yStart || !ownsX(xFixed)) return;
         if (striped) {
             yStart = std::max(yStart, stripY0);
             yEnd = std::min(yEnd, stripY1);
@@ -759,7 +765,7 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
         for (auto it = it0; it != it1 && (it + 1) != ys.end(); ++it) {
             const std::int32_t s = *it;
             const std::int32_t t = *(it + 1);
-            if (t > s) vSegs.push_back(Seg{xFixed, s, t, e, isRight});
+            if (t > s) (none ? vNone : vSegs).push_back(Seg{xFixed, s, t, e, isRight});
         }
     };
 
@@ -831,6 +837,47 @@ void Painter::paintTableBorders(const Node& tableNode, std::int32_t ox, std::int
         if (striped && (c->y < stripY0 || (isLastStrip ? (c->y > stripY1) : (c->y >= stripY1)))) continue;
         cellDiagonals(*c, ox + c->x, oy + c->y);
     }
+    if (!transparent) return;
+    // 맞닿은 칸 하나라도 그 변에 선을 그리면 그 선이 보이므로 투명 선을 긋지 않는다. 이어진 조각은 한 줄로 긋는다.
+    const auto strokeNone = [&](std::vector<Seg>& none, const std::vector<Seg>& shown, bool across) {
+        std::sort(none.begin(), none.end(), [](const Seg& a, const Seg& b) {
+            return a.fixed != b.fixed ? a.fixed < b.fixed : a.start < b.start;
+        });
+        std::int32_t runFixed = 0;
+        std::int32_t runStart = 0;
+        std::int32_t runEnd = -1;
+        const auto flush = [&]() {
+            if (runEnd <= runStart) return;
+            if (across) strokeTransparent(ox + runStart, oy + runFixed, ox + runEnd, oy + runFixed);
+            else strokeTransparent(ox + runFixed, oy + runStart, ox + runFixed, oy + runEnd);
+        };
+        for (const Seg& s : none) {
+            const bool covered = std::any_of(shown.begin(), shown.end(), [&](const Seg& v) {
+                return v.fixed == s.fixed && v.start <= s.start && v.end >= s.end;
+            });
+            if (covered) continue;
+            if (runEnd > runStart && s.fixed == runFixed && s.start <= runEnd) {
+                runEnd = std::max(runEnd, s.end);
+                continue;
+            }
+            flush();
+            runFixed = s.fixed;
+            runStart = s.start;
+            runEnd = s.end;
+        }
+        flush();
+    };
+    strokeNone(hNone, hSegs, true);
+    strokeNone(vNone, vSegs, false);
+}
+
+void Painter::strokeTransparent(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1) {
+    // 한글 투명 선은 늘 빨간 점선이다(도움말 virtual_lines). 화면 배율과 상관없이 가는 선으로 보이게 0.2mm 로 긋는다.
+    BorderEdge edge;
+    edge.type = "DOT";
+    edge.color = "#FF0000";
+    edge.width = 57;
+    strokeTableBorder(edge, x0, y0, x1, y1, 0);
 }
 
 }  // namespace chwp::render::paint_detail

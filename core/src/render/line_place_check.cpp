@@ -35,7 +35,11 @@ std::map<int, std::int32_t> drawnGlyphStarts(const model::Document& doc, const N
     return starts;
 }
 
+// 덧말·글자 겹치기 묶음 안 줄은 그리기만 하는 줄이다. 캐럿은 묶음 전체를 한 칸으로 지난다.
+bool drawOnlyLines(const Node& node) { return node.kind == NodeKind::Object && node.role == "glyphGroup"; }
+
 void checkNode(const model::Document& doc, const Node& node, LinePlaceCheck& out) {
+    if (drawOnlyLines(node)) return;
     if (node.kind == NodeKind::Line) {
         ++out.lines;
         Painter caret;
@@ -85,6 +89,7 @@ std::map<int, std::int32_t> drawnGlyphBaselines(const model::Document& doc, cons
 }
 
 void checkTops(const model::Document& doc, const Node& node, LinePlaceCheck& out) {
+    if (drawOnlyLines(node)) return;
     if (node.kind == NodeKind::Line) {
         ++out.lines;
         Painter caret;
@@ -140,6 +145,50 @@ std::vector<std::int32_t> freshCaretEdges(const model::Document& doc, const Node
     Painter caret;
     caret.doc = &doc;
     return caret.glyphEdges(line, 0, 0, nullptr);
+}
+
+std::vector<std::string> lineMarkLabels(const model::Document& doc, const Node& line) {
+    Painter painter;
+    painter.doc = &doc;
+    const std::vector<Painter::Mark> marks = painter.collectMarks(line);
+    std::vector<std::string> out;
+    for (const Painter::LineLabel& label : painter.placeLine(line, marks).labels) out.push_back(label.text);
+    return out;
+}
+
+int transparentBorderPieces(const model::Document& doc, const Node& table) {
+    std::vector<paint_detail::BorderPiece> pieces;
+    Painter painter;
+    painter.doc = &doc;
+    painter.borderSink = &pieces;
+    painter.paintTableBorders(table, 0, 0);
+    int count = 0;
+    for (const paint_detail::BorderPiece& piece : pieces) {
+        if (piece.r == 0xFF && piece.g == 0 && piece.b == 0) ++count;
+    }
+    return count;
+}
+
+std::vector<std::string> lineProofSpans(const model::Document& doc, const Node& line) {
+    Painter painter;
+    painter.doc = &doc;
+    const std::vector<Painter::Mark> marks = painter.collectMarks(line);
+    const Painter::LinePlacement place = painter.placeLine(line, marks);
+    std::vector<std::string> out;
+    for (const Painter::ProofSpan& span : painter.lineProofs(line, marks, place)) {
+        model::Control probe;
+        probe.kind = model::ControlKind::Field;
+        for (const char* id : {"%%*d", "%%*a", "%%*C", "%%*S", "%%*T", "%%*P", "%%*L", "%%*c", "%%*h", "%%*A", "%%*i",
+                               "%%*t", "%%*r", "%%*l", "%%*n", "%%*e", "%spl", "%%mr", "%sig"}) {
+            if (model::proofKindOfId(id) == span.kind) probe.ctrlId = id;
+        }
+        probe.command = span.kind == model::ProofKind::Sign ? "$RevisionSign;" + std::to_string(span.sign) + ";" : "";
+        out.push_back(model::proofName(probe) + " " + std::to_string(span.x0) + " " + std::to_string(span.x1) + " " +
+                      (span.head ? "1" : "0") + " " + (span.tail ? "1" : "0") +
+                      (span.split >= 0 ? " split " + std::to_string(span.split) : std::string()) +
+                      (span.text.empty() ? std::string() : " text " + span.text));
+    }
+    return out;
 }
 
 }  // namespace chwp::render

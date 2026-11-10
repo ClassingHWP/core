@@ -691,7 +691,8 @@ void FrameCache::reconcilePageTiles(int page, const CachedPageFrames& built) {
         }
         if (tile.percent != 100) continue;
         if (tile.desc.x == now->x && tile.desc.y == now->y && tile.desc.huX == now->huX && tile.desc.huY == now->huY &&
-            tile.desc.huW == now->huW && tile.desc.huH == now->huH) {
+            tile.desc.huW == now->huW && tile.desc.huH == now->huH && tile.desc.drawHuX == now->drawHuX &&
+            tile.desc.drawHuY == now->drawHuY && tile.desc.drawHuW == now->drawHuW && tile.desc.drawHuH == now->drawHuH) {
             continue;
         }
         tile.desc.x = now->x;
@@ -702,6 +703,10 @@ void FrameCache::reconcilePageTiles(int page, const CachedPageFrames& built) {
         tile.desc.huY = now->huY;
         tile.desc.huW = now->huW;
         tile.desc.huH = now->huH;
+        tile.desc.drawHuX = now->drawHuX;
+        tile.desc.drawHuY = now->drawHuY;
+        tile.desc.drawHuW = now->drawHuW;
+        tile.desc.drawHuH = now->drawHuH;
         tile.desc.originX = now->originX;
         tile.desc.originY = now->originY;
         tile.stamp = ++stamp_;

@@ -1,4 +1,6 @@
 #include "chwp/hwpx/hwpx_reader.hpp"
+#include "chwp/model/memo.hpp"
+#include "chwp/model/proofreading.hpp"
 
 #include <algorithm>
 #include <algorithm>
@@ -358,10 +360,14 @@ std::string fieldCtrlId(std::string_view type) {
         {"HYPERLINK", "%hlk"}, {"CLICK_HERE", "%clk"}, {"BOOKMARK", "%bmk"},
         {"FORMULA", "%fmu"},   {"DATE", "%dte"},       {"DOC_DATE", "%ddt"},
         {"PATH", "%pat"},      {"CROSSREF", "%xrf"},   {"MAILMERGE", "%mmg"},
-        {"MEMO", "%%me"},      {"SUMMARY", "%smr"},    {"USER_INFO", "%usr"}};
+        {"MEMO", "%%me"},      {"SUMMARY", "%smr"},    {"USER_INFO", "%usr"},
+        // 한글 2024 는 문서 요약 필드를 SUMMERY 로 쓴다(InsertDocTitle 로 넣어 저장한 HWPX 로 확인).
+        {"SUMMERY", "%smr"}};
     for (const auto& [k, v] : map) {
         if (k == type) return v;
     }
+    // 교정 부호(PROOFREADING_MARKS_*).
+    if (std::string proof = proofCtrlIdOfType(type); !proof.empty()) return proof;
     return "%unk";
 }
 
@@ -466,6 +472,24 @@ bool Parser::run() {
     if (doc_.header.sectionCount != doc_.sections.size()) {
         warn("section count mismatch: header=" + std::to_string(doc_.header.sectionCount) +
              ", files=" + std::to_string(doc_.sections.size()));
+    }
+    // 답글 관계: Contents/memoExtended.xml 의 he:memo id(답글 필드 id)·parentId(원 메모 필드 id).
+    {
+        std::string path = "Contents/memoExtended.xml";
+        if (const auto found = hrefById_.find("memoextended"); found != hrefById_.end() && !found->second.empty()) {
+            path = found->second;
+        }
+        pugi::xml_document extended;
+        if (zip_.contains(path) && loadXml(path, extended)) {
+            std::vector<Control*> memos = collectMemos(doc_);
+            for (auto memo : extended.document_element().children()) {
+                if (!is(memo, "memo")) continue;
+                const std::uint32_t id = u32(memo, "id");
+                for (Control* m : memos) {
+                    if (m->fieldId == id) m->memoParentId = u32(memo, "parentId");
+                }
+            }
+        }
     }
 
     parsePreviewText();
@@ -708,6 +732,37 @@ void Parser::parseHeader(const pugi::xml_node& head) {
             if (is(n, "style")) parseStyle(n);
         }
     }
+    // 메모 모양(id 1 부터). 너비가 0 이면 한글은 기본값 전체로 바꾼다.
+    if (auto memos = child(refList, "memoProperties")) {
+        std::vector<std::pair<std::uint32_t, MemoShape>> shapes;
+        for (auto n : memos.children()) {
+            if (!is(n, "memoPr")) continue;
+            MemoShape shape;
+            if (u32(n, "width") > 0) {
+                shape.width = u32(n, "width");
+                shape.lineWidth = static_cast<std::uint8_t>(u32(n, "lineWidth"));
+                static const char* lineTypes[] = {"NONE", "SOLID", "DOT", "DASH", "DASH_DOT", "DASH_DOT_DOT",
+                                                  "LONG_DASH", "CIRCLE", "DOUBLE_SLIM", "SLIM_THICK", "THICK_SLIM",
+                                                  "SLIM_THICK_SLIM", "WAVE", "DOUBLEWAVE", "THICK3D", "THICKREV3D",
+                                                  "3D", "REV3D"};
+                const std::string type = str(n, "lineType");
+                for (std::uint8_t k = 0; k < std::size(lineTypes); ++k) {
+                    if (type == lineTypes[k]) shape.lineType = k;
+                }
+                if (const std::string c = str(n, "lineColor"); !c.empty()) shape.lineColor = c;
+                if (const std::string c = str(n, "fillColor"); !c.empty()) shape.fillColor = c;
+                if (const std::string c = str(n, "activeColor"); !c.empty()) shape.activeColor = c;
+                static const char* memoTypes[] = {"NOMAL", "USER_INSERT", "USER_DELETE", "USER_UPDATE"};
+                const std::string mt = str(n, "memoType");
+                for (std::uint32_t k = 0; k < 4; ++k) {
+                    if (mt == memoTypes[k]) shape.memoType = k == 0 ? 0u : (0x80000000u | k);
+                }
+            }
+            shapes.emplace_back(u32(n, "id"), shape);
+        }
+        std::sort(shapes.begin(), shapes.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (auto& [id, shape] : shapes) h.memoShapes.push_back(shape);
+    }
     if (auto nums = child(refList, "numberings")) {
         for (auto n : nums.children()) {
             if (!is(n, "numbering")) continue;
@@ -812,6 +867,7 @@ void Parser::parseParaShape(const pugi::xml_node& node) {
     ps.tabDefId = u32(node, "tabPrIDRef");
     ps.condense = std::min<std::int32_t>(75, static_cast<std::int32_t>(u32(node, "condense")));
     ps.snapToGrid = flag(node, "snapToGrid");
+    ps.suppressLineNumbers = flag(node, "suppressLineNumbers");
     ps.fontLineHeight = flag(node, "fontLineHeight");
     if (auto a = child(node, "align")) {
         ps.align = str(a, "horizontal");
@@ -901,6 +957,15 @@ void Parser::parseSection(const pugi::xml_node& sec, Section& section) {
                     section.hideFirstFooter = item.control.hideFirstFooter;
                     section.hideFirstMaster = item.control.hideFirstMaster;
                     section.hideFirstPageNum = item.control.hideFirstPageNum;
+                    section.startsOn = item.control.startsOn;
+                    section.pictureStart = item.control.pictureStart;
+                    section.tableStart = item.control.tableStart;
+                    section.equationStart = item.control.equationStart;
+                    section.borderShow = item.control.borderShow;
+                    section.fillShow = item.control.fillShow;
+                    section.hideFirstEmptyLine = item.control.hideFirstEmptyLine;
+                    section.lineNumbers = item.control.lineNumbers;
+                    section.memoShapeId = item.control.memoShapeId;
                     section.footnote = item.control.footnoteShape;
                     section.endnote = item.control.endnoteShape;
                     section.pageBorders = item.control.pageBorders;
@@ -1018,6 +1083,11 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
             control.ctrlId = "tdut";
             control.text = collectText(child(c, "mainText"));
             control.subText = collectText(child(c, "subText"));
+            if (const char* v = c.attribute("posType").as_string(nullptr)) control.dutmalPos = v;
+            control.dutmalSizeRatio = c.attribute("szRatio").as_uint(0);
+            control.dutmalOption = c.attribute("option").as_uint(0);
+            control.dutmalStyle = c.attribute("styleIDRef").as_uint(0);
+            if (const char* v = c.attribute("align").as_string(nullptr)) control.dutmalAlign = v;
             out.items.push_back(InlineItem::makeControl(std::move(control)));
         } else if (name == "compose") {
             flush();
@@ -1025,6 +1095,12 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
             control.kind = ControlKind::Compose;
             control.ctrlId = "tcps";
             control.text = str(c, "composeText");
+            if (const char* v = c.attribute("circleType").as_string(nullptr)) control.composeCircle = v;
+            control.composeCharSize = static_cast<std::int8_t>(c.attribute("charSz").as_int(0));
+            if (const char* v = c.attribute("composeType").as_string(nullptr)) control.composeType = v;
+            for (auto pr : c.children()) {
+                if (is(pr, "charPr")) control.composeCharShapes.push_back(pr.attribute("prIDRef").as_uint(0xFFFFFFFFu));
+            }
             out.items.push_back(InlineItem::makeControl(std::move(control)));
         }
     }
@@ -1093,10 +1169,11 @@ std::int32_t noteLengthOf(const std::string& text) {
         if (c >= 'a' && c <= 'z') c = static_cast<unsigned char>(c - 'a' + 'A');
         key.push_back(static_cast<char>(c));
     }
-    if (key == "COLUMN/3" || key == "COLUMN3") return -1;
-    if (key == "COLUMN") return 0x7FFFFFFF;
-    if (key == "5CM") return mmToHu(50);
-    if (key == "2CM") return mmToHu(20);
+    // 한글 2024 값: -1 5cm, -2 2cm, -3 단 너비의 1/3, -4 단 너비. 이름으로 쓴 파일도 같은 값으로 읽는다.
+    if (key == "COLUMN/3" || key == "COLUMN3") return -3;
+    if (key == "COLUMN") return -4;
+    if (key == "5CM") return -1;
+    if (key == "2CM") return -2;
     if (key == "0" || key == "NONE") return 0;
     return static_cast<std::int32_t>(std::strtoll(text.c_str(), nullptr, 10));
 }
@@ -1167,7 +1244,15 @@ Control Parser::parseSecPr(const pugi::xml_node& node) {
     const std::int32_t tabRaw = i32(node, "tabStop");
     c.defaultTab = tabVal > 0 ? tabVal : (tabRaw > 0 ? tabRaw / 2 : 4000);
     if (const std::int32_t gap = i32(node, "spaceColumns"); gap > 0) c.columnRegionGap = gap;
-    if (auto start = child(node, "startNum")) c.number = u32(start, "page");
+    if (auto start = child(node, "startNum")) {
+        c.number = u32(start, "page");
+        // 한글 2024 는 사용자 시작 번호(종류 3)일 때 pageStartsOn 을 쓰지 않는다.
+        const std::string on = str(start, "pageStartsOn");
+        c.startsOn = on == "EVEN" ? 1 : on == "ODD" ? 2 : on.empty() ? (c.number > 0 ? 3 : 0) : 0;
+        c.pictureStart = static_cast<std::uint16_t>(u32(start, "pic"));
+        c.tableStart = static_cast<std::uint16_t>(u32(start, "tbl"));
+        c.equationStart = static_cast<std::uint16_t>(u32(start, "equation"));
+    }
     // 글자 방향 이름: 0 HORIZONTAL, 1 VERTICAL, 2 VERTICALALL (한글 2024 와 같은 차례).
     {
         const std::string dir = str(node, "textDirection");
@@ -1178,11 +1263,22 @@ Control Parser::parseSecPr(const pugi::xml_node& node) {
         c.charGrid = i32(grid, "charGrid");
         c.wongoji = i32(grid, "wonggojiFormat") != 0;
     }
+    c.memoShapeId = static_cast<std::uint16_t>(u32(node, "memoShapeIDRef"));
     if (auto vis = child(node, "visibility")) {
         c.hideFirstHeader = flag(vis, "hideFirstHeader");
         c.hideFirstFooter = flag(vis, "hideFirstFooter");
         c.hideFirstMaster = flag(vis, "hideFirstMasterPage");
         c.hideFirstPageNum = flag(vis, "hideFirstPageNum");
+        c.hideFirstEmptyLine = flag(vis, "hideFirstEmptyLine");
+        c.lineNumbers.show = flag(vis, "showLineNumber");
+        if (const std::string border = str(vis, "border"); !border.empty()) c.borderShow = border;
+        if (const std::string fill = str(vis, "fill"); !fill.empty()) c.fillShow = fill;
+    }
+    if (auto ln = child(node, "lineNumberShape")) {
+        c.lineNumbers.restart = static_cast<std::uint8_t>(u32(ln, "restartType"));
+        c.lineNumbers.countBy = static_cast<std::uint16_t>(u32(ln, "countBy"));
+        c.lineNumbers.distance = u32(ln, "distance");
+        c.lineNumbers.start = static_cast<std::uint16_t>(u32(ln, "startNumber"));
     }
     for (auto page : node.children()) {
         if (!is(page, "masterPage")) continue;
@@ -1237,6 +1333,8 @@ void Parser::parseMasterPage(const std::string& id, Section& section) {
     MasterPage master;
     if (const std::string type = str(root, "type"); !type.empty()) master.applyPageType = type;
     master.printOnTop = flag(root, "pageFront");
+    master.duplicate = flag(root, "pageDuplicate");
+    master.pageNumber = u32(root, "pageNumber");
     if (auto sub = child(root, "subList")) master.content = parseSubList(sub);
     if (!master.content.paragraphs.empty()) section.masterPages.push_back(std::move(master));
 }
@@ -1295,6 +1393,9 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
         c.ctrlId = "pghd";
         c.hideHeader = flag(node, "hideHeader");
         c.hideFooter = flag(node, "hideFooter");
+        c.hideMaster = flag(node, "hideMasterPage");
+        c.hideBorder = flag(node, "hideBorder");
+        c.hideFill = flag(node, "hideFill");
         c.hidePageNum = flag(node, "hidePageNum");
     } else if (name == "pageNum") {
         c.kind = ControlKind::PageNumPos;
@@ -1314,13 +1415,32 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
         c.kind = ControlKind::Field;
         c.ctrlId = fieldCtrlId(str(node, "type"));
         c.name = str(node, "name");
+        c.fieldId = u32(node, "id");
+        if (str(node, "editable") == "1") c.fieldProps |= 1u;
+        if (str(node, "dirty") == "1") c.fieldProps |= 0x8000u;
         for (auto param : child(node, "parameters").children()) {
             if (is(param, "stringParam") && str(param, "name") == "Command") {
                 c.command = collectText(param);
+            } else if (is(param, "integerParam") && str(param, "name") == "Prop") {
+                c.fieldExtra = static_cast<std::uint8_t>(std::stoul("0" + collectText(param)));
+            } else if (is(param, "integerParam") && str(param, "name") == "Number") {
+                c.memoNumber = static_cast<std::uint32_t>(std::stoul("0" + collectText(param)));
             }
         }
+        // 메모 글은 필드 안 subList 다(HWP 는 마지막 구역 끝 MEMO_LIST).
+        if (isMemoField(c)) {
+            if (auto sub = child(node, "subList")) c.subLists.push_back(parseSubList(sub));
+        } else if (proofKindOf(c) != ProofKind::None) {
+            // 교정 부호 차례(zorder). 띄움표 같은 %sig 는 -1 이고 HWP 에서는 0 이다.
+            const int order = node.attribute("zorder").as_int(0);
+            c.memoNumber = order > 0 ? static_cast<std::uint32_t>(order) : 0u;
+        } else {
+            c.memoNumber = 0;
+        }
     } else if (name == "fieldEnd") {
-        return false;  // HWP 에서도 인라인 문자일 뿐 컨트롤이 아니다
+        // 필드 범위의 끝. 버리면 저장한 하이퍼링크가 범위를 잃는다.
+        c.kind = ControlKind::FieldEnd;
+        c.ctrlId = "fend";
     } else if (name == "hiddenComment" || name == "memo") {
         c.kind = ControlKind::HiddenComment;
         c.ctrlId = name == "memo" ? "memo" : "tcmt";
@@ -1596,6 +1716,7 @@ Control Parser::parseObject(const pugi::xml_node& node) {
                 cell.borderFillId = u32(tc, "borderFillIDRef");
                 cell.hasMargin = flag(tc, "hasMargin");
                 cell.header = flag(tc, "header");
+                cell.name = str(tc, "name");
                 if (auto addr = child(tc, "cellAddr")) {
                     cell.col = u32(addr, "colAddr");
                     cell.row = u32(addr, "rowAddr");

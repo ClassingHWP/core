@@ -39,6 +39,7 @@
 #include "chwp/unit.hpp"
 #include "chwp/render/scene.hpp"
 #include "chwp/render/view.hpp"
+#include "chwp/render/guides.hpp"
 #include "render/equation_draw.hpp"
 #include "render/line_breaker.hpp"
 #include "render/page_texture_cache.hpp"
@@ -82,6 +83,10 @@
 #include "include/gpu/graphite/BackendTexture.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
+#include "include/gpu/graphite/PrecompileContext.h"
+#include "include/gpu/graphite/precompile/PaintOptions.h"
+#include "include/gpu/graphite/precompile/Precompile.h"
+#include "include/gpu/graphite/precompile/PrecompileShader.h"
 #include "include/gpu/graphite/Image.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
@@ -1009,7 +1014,97 @@ std::int32_t tableBorderBleed(const Node& node) {
     return bleed;
 }
 
+// Graphite 가 파이프라인을 만들 때마다 여기에 적는다. 컴파일 스레드에서도 부를 수 있다.
+struct PipelineTallyState {
+    std::mutex mu;
+    PipelineTally tally;
+    // 미리 만든(또는 미리 그려 만든) 파이프라인 이름.
+    std::unordered_set<std::string> prepared;
+};
 
+PipelineTallyState& pipelineTallyState() {
+    static PipelineTallyState state;
+    return state;
+}
+
+// 미리 만들기가 직접 그려서 만드는 동안(경로·글자 쿼드·표 테두리) 켠다. 그때 만든 것도 미리 만든 것이다.
+std::atomic<bool> gWarmingPipelines{false};
+
+// Graphite 가 파이프라인을 만들거나(made) 캐시에서 찾을(found) 때 부른다. 미리 만들지 않은 것을 쓰면 적는다.
+void notePipelineUse(const std::string& label, bool made, bool precompiled) {
+    PipelineTallyState& state = pipelineTallyState();
+    std::lock_guard lock(state.mu);
+    if (precompiled || (made && gWarmingPipelines.load(std::memory_order_relaxed))) {
+        if (made && state.prepared.insert(label).second) ++state.tally.precompiled;
+        return;
+    }
+    if (state.prepared.count(label)) return;
+    if (std::find(state.tally.drawnFirst.begin(), state.tally.drawnFirst.end(), label) != state.tally.drawnFirst.end()) {
+        return;
+    }
+    state.tally.drawnFirst.push_back(label);
+    if (made) std::fprintf(stderr, "[ClassingHWP] 그리다 만든 파이프라인 %s\n", label.c_str());
+}
+
+// 첫 화면이 쓰는 그리기 조합. 장치가 붙으면 문서를 기다리지 않고 이 표대로 파이프라인을 만든다.
+// GPU 셰이더 컴파일은 처음 한 번 수백 ms 걸리고, 그동안 화면 내보내기가 기다린다.
+// 표에 없는 조합은 그릴 때 만든다(pipelineTally().drawnFirst 에 남는다).
+enum class PipeTarget : std::uint8_t {
+    Screen,      // 화면 표면. 경로가 없는 프레임(깊이만, 표본 1)
+    ScreenPath,  // 화면 표면. 경로를 그리는 프레임(깊이·스텐실, 표본 4)
+    Offscreen,   // 화면 밖 RGBA8 그림판(칸 텍스처, 쪽 그림)
+};
+// 경로·글자 쿼드·표 테두리는 그리는 방식(경로 나누기, 정점 꼴, 메시 셰이더)이 여럿이라 Precompile 로 적으면
+// 쓰지 않는 조합까지 수십 개를 만든다. 이 셋은 화면과 같은 그리기 함수로 작은 그림판에 한 번 그린다.
+enum class PipeShape : std::uint8_t {
+    FillRect,
+    RRect,
+    EdgeAAQuad,
+    RulerPath,   // 눈금자 숫자 윤곽(안티에일리어싱 경로)
+    GlyphQuads,  // 글자 마스크 쿼드(drawVertices)
+    BorderMesh,  // 표 테두리 메시
+};
+enum class PipeInk : std::uint8_t {
+    Solid,       // 단색
+    Image,       // RGBA8 그림, 하드웨어 자르기
+    ClampImage,  // RGBA8 그림, 셰이더 자르기
+    CubicImage,  // RGBA8 그림, 3차 보간(1:1 이 아닌 그림: 고배율 화면, 쪽 그림)
+    AlphaImage,  // A8 글자 마스크를 칠 색으로 물들인 것
+};
+enum class PipeBlend : std::uint8_t { Src, SrcOver };
+
+struct PipeCombo {
+    PipeTarget target;
+    PipeShape shape;
+    PipeInk ink;
+    PipeBlend blend;
+};
+
+// 첫 화면이 쓰는 조합. 순서가 컴파일 순서다. 칸을 합치는 화면 밖 그림판부터 두고,
+// 1:1 이 아닐 때만 쓰는 3차 보간 그림은 맨 뒤에 둔다.
+constexpr PipeCombo kFirstScreenPipes[] = {
+    {PipeTarget::Offscreen, PipeShape::FillRect, PipeInk::Image, PipeBlend::Src},
+    {PipeTarget::Offscreen, PipeShape::FillRect, PipeInk::ClampImage, PipeBlend::Src},
+    {PipeTarget::Offscreen, PipeShape::FillRect, PipeInk::Image, PipeBlend::SrcOver},
+    {PipeTarget::Offscreen, PipeShape::GlyphQuads, PipeInk::AlphaImage, PipeBlend::SrcOver},
+    {PipeTarget::Offscreen, PipeShape::EdgeAAQuad, PipeInk::Image, PipeBlend::SrcOver},
+    {PipeTarget::Offscreen, PipeShape::BorderMesh, PipeInk::Solid, PipeBlend::SrcOver},
+    {PipeTarget::Screen, PipeShape::FillRect, PipeInk::Solid, PipeBlend::Src},
+    {PipeTarget::Screen, PipeShape::FillRect, PipeInk::Image, PipeBlend::SrcOver},
+    {PipeTarget::Screen, PipeShape::RRect, PipeInk::Solid, PipeBlend::SrcOver},
+    {PipeTarget::ScreenPath, PipeShape::FillRect, PipeInk::Solid, PipeBlend::Src},
+    {PipeTarget::ScreenPath, PipeShape::FillRect, PipeInk::Image, PipeBlend::SrcOver},
+    {PipeTarget::ScreenPath, PipeShape::RRect, PipeInk::Solid, PipeBlend::SrcOver},
+    {PipeTarget::ScreenPath, PipeShape::RulerPath, PipeInk::Solid, PipeBlend::SrcOver},
+    {PipeTarget::Offscreen, PipeShape::FillRect, PipeInk::CubicImage, PipeBlend::Src},
+    {PipeTarget::Offscreen, PipeShape::FillRect, PipeInk::CubicImage, PipeBlend::SrcOver},
+    {PipeTarget::Offscreen, PipeShape::EdgeAAQuad, PipeInk::CubicImage, PipeBlend::SrcOver},
+};
+
+// 그려서 만드는 모양인가. 나머지는 Precompile 로 만든다.
+constexpr bool drawnToWarm(PipeShape shape) {
+    return shape == PipeShape::RulerPath || shape == PipeShape::GlyphQuads || shape == PipeShape::BorderMesh;
+}
 
 #if CHWP_HAS_GPU
 // GPU 장치는 Graphite 에 넘기는 WebGPU 장치 하나다. 웹은 브라우저 WebGPU, 네이티브는 Dawn(D3D12·Metal·Vulkan)이 준다.
@@ -1141,6 +1236,120 @@ bool enableRasterFallback(GpuSlot& slot, const char* reason) {
     return slot.raster;
 }
 
+// 그려서 만드는 모양(drawnToWarm)을 화면과 같은 칠로 작은 그림판에 그린다. 내용은 상관없고 조합만 같으면 된다.
+void warmByDrawing(GpuSlot& slot, PipeShape shape, SkColorType target) {
+    sk_sp<SkSurface> surface =
+        SkSurfaces::RenderTarget(slot.recorder.get(), SkImageInfo::Make(32, 32, target, kPremul_SkAlphaType));
+    if (!surface) return;
+    SkCanvas* canvas = surface->getCanvas();
+    switch (shape) {
+        case PipeShape::RulerPath: {
+            // drawRulerNumber 와 같은 칠: 안티에일리어싱, 불투명 단색. 숫자 0 처럼 곡선 윤곽 두 개.
+            SkPathBuilder path;
+            path.moveTo(16, 4).quadTo(26, 4, 26, 16).quadTo(26, 28, 16, 28).quadTo(6, 28, 6, 16).quadTo(6, 4, 16, 4).close();
+            path.moveTo(16, 8).quadTo(10, 8, 10, 16).quadTo(10, 24, 16, 24).quadTo(22, 24, 22, 16).quadTo(22, 8, 16, 8).close();
+            SkPaint ink;
+            ink.setAntiAlias(true);
+            ink.setColor(SkColorSetARGB(255, 92, 98, 108));
+            canvas->drawPath(path.detach(), ink);
+            break;
+        }
+        case PipeShape::GlyphQuads: {
+            // 글자 아틀라스와 같은 A8 그림을 칠 셰이더로 두고, 쿼드 정점 색과 DstIn 으로 섞는다.
+            std::array<std::uint8_t, 16> alpha{};
+            alpha.fill(255);
+            const SkPixmap pixmap(SkImageInfo::Make(4, 4, kAlpha_8_SkColorType, kPremul_SkAlphaType), alpha.data(), 4);
+            const sk_sp<SkImage> raster = SkImages::RasterFromPixmapCopy(pixmap);
+            const sk_sp<SkImage> atlas = raster ? SkImages::TextureFromImage(slot.recorder.get(), raster.get()) : nullptr;
+            if (!atlas) return;
+            SkPaint paint;
+            paint.setShader(atlas->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, SkSamplingOptions()));
+            SkVertices::Builder builder(SkVertices::kTriangles_VertexMode, 4, 6,
+                                        SkVertices::kHasTexCoords_BuilderFlag | SkVertices::kHasColors_BuilderFlag);
+            if (!builder.isValid()) return;
+            const SkPoint corners[4] = {{0, 0}, {4, 0}, {4, 4}, {0, 4}};
+            const std::uint16_t order[6] = {0, 1, 2, 0, 2, 3};
+            for (int i = 0; i < 4; ++i) {
+                builder.positions()[i] = corners[i];
+                builder.texCoords()[i] = corners[i];
+                builder.colors()[i] = SK_ColorBLACK;
+            }
+            std::copy(std::begin(order), std::end(order), builder.indices());
+            canvas->drawVertices(builder.detach().get(), SkBlendMode::kDstIn, paint);
+            break;
+        }
+        case PipeShape::BorderMesh: {
+            std::vector<paint_detail::BorderPiece> pieces(1);
+            pieces[0].x1 = 100;
+            pieces[0].widthHu = 10;
+            const paint_detail::BorderMesh mesh = paint_detail::makeBorderMesh(pieces);
+            if (mesh.chunks.empty()) return;
+            paint_detail::drawBorderMesh(canvas, mesh, 1.f, 1.f, 1.f, SkPoint::Make(0, 0), SkRect::MakeWH(32, 32));
+            break;
+        }
+        default: break;
+    }
+}
+
+// kFirstScreenPipes 를 Graphite 미리 만들기로 옮긴다. 무엇을 만들지는 표가 정한다.
+// 화면 표면의 색 형식은 장치가 준 값(slot.format)이다.
+void precompileFirstScreen(GpuSlot& slot) {
+    namespace gr = skgpu::graphite;
+    const auto started = std::chrono::steady_clock::now();
+    std::unique_ptr<gr::PrecompileContext> precompile = slot.context->makePrecompileContext();
+    if (!precompile) return;
+    const SkColorType screenType =
+        slot.format == wgpu::TextureFormat::BGRA8Unorm ? kBGRA_8888_SkColorType : kRGBA_8888_SkColorType;
+    const gr::RenderPassProperties screen{gr::DepthStencilFlags::kDepth, screenType, nullptr, false};
+    const gr::RenderPassProperties screenPath{gr::DepthStencilFlags::kDepthStencil, screenType, nullptr, true};
+    const gr::RenderPassProperties offscreen{gr::DepthStencilFlags::kDepth, kRGBA_8888_SkColorType, nullptr, false};
+    const SkColorInfo premul(kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
+    const SkTileMode clamp = SkTileMode::kClamp;
+    gWarmingPipelines.store(true, std::memory_order_relaxed);
+    bool drew = false;
+    // 화면 표면이 없으면(시험·agent 의 쪽 그림만) 화면 표면 조합은 쓰지 않는다.
+    const bool hasScreen = static_cast<bool>(slot.surface);
+    for (const PipeCombo& combo : kFirstScreenPipes) {
+        if (combo.target != PipeTarget::Offscreen && !hasScreen) continue;
+        if (drawnToWarm(combo.shape)) {
+            warmByDrawing(slot, combo.shape, combo.target == PipeTarget::Offscreen ? kRGBA_8888_SkColorType : screenType);
+            drew = true;
+            continue;
+        }
+        const gr::RenderPassProperties& pass = combo.target == PipeTarget::Screen       ? screen
+                                               : combo.target == PipeTarget::ScreenPath ? screenPath
+                                                                                        : offscreen;
+        gr::PaintOptions paint;
+        const SkBlendMode mode = combo.blend == PipeBlend::Src ? SkBlendMode::kSrc : SkBlendMode::kSrcOver;
+        paint.setBlendModes({&mode, 1});
+        if (combo.ink == PipeInk::Image || combo.ink == PipeInk::ClampImage || combo.ink == PipeInk::CubicImage) {
+            // 자르기 방식을 주지 않으면 하드웨어 자르기 하나만, 주면 그 방식과 하드웨어 자르기를 만든다.
+            // 3차 보간을 켜면 하드웨어 자르기와 3차 보간을 만든다. 이미 만든 것은 다시 만들지 않는다.
+            const sk_sp<gr::PrecompileShader> image = gr::PrecompileShaders::Image(
+                combo.ink == PipeInk::CubicImage ? gr::PrecompileShaders::ImageShaderFlags::kCubicSampling
+                                                 : gr::PrecompileShaders::ImageShaderFlags::kNone,
+                {&premul, 1},
+                combo.ink == PipeInk::ClampImage ? SkSpan<const SkTileMode>(&clamp, 1) : SkSpan<const SkTileMode>());
+            paint.setShaders({&image, 1});
+        }
+        gr::DrawTypeFlags draw = gr::DrawTypeFlags::kNonAAFillRect;
+        if (combo.shape == PipeShape::RRect) draw = gr::DrawTypeFlags::kAnalyticRRect;
+        if (combo.shape == PipeShape::EdgeAAQuad) draw = gr::DrawTypeFlags::kPerEdgeAAQuad;
+        gr::Precompile(precompile.get(), paint, draw, {&pass, 1});
+    }
+    if (drew) {
+        std::unique_ptr<gr::Recording> recording = slot.recorder->snap();
+        if (recording) {
+            gr::InsertRecordingInfo info;
+            info.fRecording = recording.get();
+            if (slot.context->insertRecording(info) == gr::InsertStatus::kSuccess) slot.context->submit(gr::SyncToCpu::kNo);
+        }
+    }
+    gWarmingPipelines.store(false, std::memory_order_relaxed);
+    std::fprintf(stderr, "[ClassingHWP] 첫 화면 파이프라인 %d 개를 미리 만들었다 (%.0fms)\n", pipelineTally().precompiled,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+
 void finishDawnDevice(wgpu::Device device) {
     GpuSlot& slot = gpuSlot();
     if (!device) {
@@ -1153,7 +1362,13 @@ void finishDawnDevice(wgpu::Device device) {
     backend.fInstance = slot.instance;
     backend.fDevice = slot.device;
     backend.fQueue = slot.queue;
-    slot.context = skgpu::graphite::ContextFactory::MakeDawn(backend, {});
+    skgpu::graphite::ContextOptions options;
+    options.fPipelineCachingCallback = [](void*, skgpu::graphite::ContextOptions::PipelineCacheOp op,
+                                          const std::string& label, uint32_t, bool fromPrecompile, sk_sp<SkData>) {
+        notePipelineUse(label, op == skgpu::graphite::ContextOptions::PipelineCacheOp::kAddingPipeline,
+                        fromPrecompile);
+    };
+    slot.context = skgpu::graphite::ContextFactory::MakeDawn(backend, options);
     if (!slot.context) {
         enableRasterFallback(slot, "Skia Dawn off");
         return;
@@ -1176,6 +1391,7 @@ void finishDawnDevice(wgpu::Device device) {
     slot.vectors = true;
     slot.ready = true;
     std::fprintf(stderr, "[ClassingHWP] Skia Dawn glyph atlas\n");
+    precompileFirstScreen(slot);
 }
 
 bool beginDawnSurface() {
@@ -2006,6 +2222,18 @@ std::vector<std::pair<std::int32_t, std::int32_t>> columnRuleSpans(const Node* p
 
 }  // namespace paint_detail
 
+PipelineTally pipelineTally() {
+    PipelineTallyState& state = paint_detail::pipelineTallyState();
+    std::lock_guard lock(state.mu);
+    return state.tally;
+}
+
+void clearDrawnPipelines() {
+    PipelineTallyState& state = paint_detail::pipelineTallyState();
+    std::lock_guard lock(state.mu);
+    state.tally.drawnFirst.clear();
+}
+
 namespace {
 
 // 글자처럼 넣은 개체 테두리의 왼쪽. 줄 원점 기준이고, 글자 폭을 나중에 잰 펜·정렬과 같다.
@@ -2294,7 +2522,7 @@ PageBitmap renderPageBitmap(const model::Document& doc, const Node& page, int pi
     painter.pass = layer;
     painter.floatCaptions = true;
     painter.scale = static_cast<float>(pixelHeight) / static_cast<float>(page.height);
-    const int fullW = std::max(1, static_cast<int>(page.width * painter.scale + 0.5f));
+    const int fullW = std::max(1, static_cast<int>(viewWidthOf(page) * painter.scale + 0.5f));
     const int fullH = std::max(1, pixelHeight);
     if (viewW <= 0 || viewH <= 0) {
         viewX = 0;
@@ -2632,6 +2860,8 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
                                                    (node.lineData().deferTabs ? 4 : 0) | (node.lineData().matchFontBaseline ? 8 : 0)));
         h = fnvMixStr64(h, node.align);
         h = fnvMixStr64(h, node.vertAlign);
+        // 반전 글자 겹치기 안 글자 줄(reverse)은 같은 글자라도 흰색이다. 글자 자리를 같은 해시로 나눠 쓰지 않는다.
+        h = fnvMixStr64(h, node.role);
 
         for (int i = 0; i < static_cast<int>(node.children.size()); ++i) {
             Node& child = node.children[static_cast<std::size_t>(i)];
@@ -2803,6 +3033,36 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
     node.huBoundsReady = true;
 }
 
+// 보기 표시가 줄 칸 밖으로 나가는 몫(HU). 칸이 그 그림을 잘라 내지 않게 늘린다.
+struct ViewInkPad {
+    std::int32_t left = 0;
+    std::int32_t right = 0;
+    std::int32_t top = 0;
+    std::int32_t bottom = 0;
+};
+
+ViewInkPad viewInkPad(const Node& line, const model::Document* doc) {
+    ViewInkPad pad;
+    if (!doc) return pad;
+    const std::int32_t em = std::max<std::int32_t>(line.fontSize > 0 ? line.fontSize : 1000, line.lineData().textHeight);
+    if (paint_detail::lineHasProofInk(line, doc)) {
+        // 줄 붙임표·줄 비움표는 왼쪽 여백, 자리 옮김표는 줄 위아래로 1.2em 까지 나간다.
+        pad.left = em;
+        pad.right = em / 2;
+        pad.top = em * 13 / 10;
+        pad.bottom = em;
+    }
+    if (viewMarks().control && line.story > 0) {
+        Painter painter;
+        painter.doc = doc;
+        std::int32_t labels = 0;
+        for (const Painter::LineLabel& label : painter.lineLabels(line, painter.collectMarks(line))) labels += label.width;
+        pad.right = std::max(pad.right, labels + em);
+    }
+    if (viewMarks().paragraphMarks()) pad.right = std::max(pad.right, em);
+    return pad;
+}
+
 struct FrameWalk {
     int pageIndex = 0;
     int pixelHeight = 0;
@@ -2862,10 +3122,15 @@ struct FrameWalk {
         frame.pixelHeight = pixelHeight;
         frame.inObject = inObject;
         frame.baseOnly = baseOnly;
-        frame.huX = x;
-        frame.huY = y;
-        frame.huW = w;
-        frame.huH = h;
+        // 화면 자리를 다시 셀 때(다른 배율, 잘라 내기)는 종이 상자를 쓰고, 칸을 그릴 때는 틀 상자를 쓴다.
+        frame.huX = paperX;
+        frame.huY = paperY;
+        frame.huW = paperW;
+        frame.huH = paperH;
+        frame.drawHuX = x;
+        frame.drawHuY = y;
+        frame.drawHuW = w;
+        frame.drawHuH = h;
         frame.originX = originX;
         frame.originY = originY;
         frame.turned = turned;
@@ -3043,11 +3308,15 @@ struct FrameWalk {
         std::int64_t nextStep = step > 0 ? step : 1;
         bool nextIn = inObject;
         if (!isPage && node.kind == NodeKind::Line) {
+            // 보기 표시가 줄 밖으로 나가는 몫: 교정 부호(여백의 괄호·줄 위아래 표시)와 조판 부호 이름표(줄 끝 넘침).
+            const ViewInkPad pad = viewInkPad(node, doc);
             if (node.huBoundsReady) {
-                if (!misses(node.lineData().lineBoxX, node.lineData().lineBoxY, node.lineData().lineBoxW, node.lineData().lineBoxH)) {
-                    emit(node, 0, node.lineData().lineBoxX, node.lineData().lineBoxY, node.lineData().lineBoxW, node.lineData().lineBoxH, x, y, layer, z, path,
-                         inObject);
-                }
+                const LineContent& box = node.lineData();
+                const std::int32_t bx = box.lineBoxX - pad.left;
+                const std::int32_t by = box.lineBoxY - pad.top;
+                const std::int32_t bw = box.lineBoxW + pad.left + pad.right;
+                const std::int32_t bh = box.lineBoxH + pad.top + pad.bottom;
+                if (!misses(bx, by, bw, bh)) emit(node, 0, bx, by, bw, bh, x, y, layer, z, path, inObject);
                 bool hasInlineObj = false;
                 for (const Node& child : node.children) {
                     if (child.kind == NodeKind::Object && child.treatAsChar) {
@@ -3131,6 +3400,10 @@ struct FrameWalk {
                     coveredBelow = bottom;
                 }
             }
+            extraLeft = std::max(extraLeft, pad.left);
+            extraRight = std::max(extraRight, pad.right);
+            top -= pad.top;
+            height += pad.top + pad.bottom;
             if (misses(x - extraLeft, top, node.width + extraLeft + extraRight, height)) return;
             emit(node, 0, x - extraLeft, top, node.width + extraLeft + extraRight, height, x, y, layer, z, path,
                  inObject);
@@ -3337,6 +3610,7 @@ bool lineHasGlyphSource(const Node& line) {
 
 bool lineHasBitmapInk(const Node& line, const model::Document* doc) {
     if (line.lineData().auditLine) return true;
+    if (paint_detail::lineHasProofInk(line, doc)) return true;
     const auto set = [](const std::string* name, const char* none) { return name && *name != none; };
     for (const LineRun& run : lineGlyphs(line).runs) {
         if (run.kind == RunKind::Object) continue;
@@ -3498,7 +3772,8 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
     painter.skipInlineObjects = true;
     painter.seedObjectHosts(page, frame.path);
     const bool clippedByAncestor =
-        painter.seedAncestorClips(page, frame.path, padHu, frame.huX, frame.huY, frame.huW, frame.huH);
+        painter.seedAncestorClips(page, frame.path, padHu, frame.drawHuX, frame.drawHuY, frame.drawHuW,
+                                 frame.drawHuH);
     FrameGlyphs captured;
     if (!placed && screenVectors() && !clippedByAncestor) painter.glyphSink = &captured;
     // 개체 칸의 그림은 굽지 않고 화면이 텍스처로 그린다. 조상이 자르는 범위는 그림마다 적어 둔다.
@@ -3516,16 +3791,16 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
         std::int32_t stripX1 = -1;
         if (frame.kind >= 3 && node->role == "table") {
             const std::int32_t bleed = tableBorderBleed(*node);
-            stripY0 = std::max<std::int32_t>(0, (frame.huY - frame.originY) + bleed);
-            stripY1 = stripY0 + std::max<std::int32_t>(0, frame.huH - bleed * 2);
-            stripX0 = std::max<std::int32_t>(0, (frame.huX - frame.originX) + bleed);
-            stripX1 = stripX0 + std::max<std::int32_t>(0, frame.huW - bleed * 2);
+            stripY0 = std::max<std::int32_t>(0, (frame.drawHuY - frame.originY) + bleed);
+            stripY1 = stripY0 + std::max<std::int32_t>(0, frame.drawHuH - bleed * 2);
+            stripX0 = std::max<std::int32_t>(0, (frame.drawHuX - frame.originX) + bleed);
+            stripX1 = stripX0 + std::max<std::int32_t>(0, frame.drawHuW - bleed * 2);
         } else if (frame.kind >= 3 && node->kind == NodeKind::Column) {
             const std::int32_t bleed = std::max<std::int32_t>(node->ext().borderRight.width, 100);
             stripY0 = 0;
-            stripY1 = std::max<std::int32_t>(0, frame.huH - bleed * 2);
+            stripY1 = std::max<std::int32_t>(0, frame.drawHuH - bleed * 2);
         }
-        painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.huX, padHu + frame.originY - frame.huY,
+        painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.drawHuX, padHu + frame.originY - frame.drawHuY,
                            frame.inObject, stripY0, stripY1, stripX0, stripX1);
     }
     if (!placed && !turned) {
@@ -3606,7 +3881,7 @@ void writeLinePlace(const model::Document& doc, const Node& page, const FrameDes
     std::vector<GlyphSpot> spots;
     painter.placeSink = &spots;
     const std::int32_t padHu = static_cast<std::int32_t>(std::lround(static_cast<double>(kFramePad) / painter.scale));
-    painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.huX, padHu + frame.originY - frame.huY,
+    painter.paintPiece(*node, frame.kind, padHu + frame.originX - frame.drawHuX, padHu + frame.originY - frame.drawHuY,
                        frame.inObject);
     spotsToPage(spots, frame, padHu);
     keepLinePlaces(frame, std::move(spots));
@@ -4170,7 +4445,7 @@ std::vector<SelectionImage> paintSelection(const model::Document& doc, const std
         const Node& page = pages[static_cast<std::size_t>(pageIndex)];
         if (page.width <= 0 || page.height <= 0) continue;
         int pixelH = pagePixelHeight(page.height, percent);
-        int pixelW = pagePixelWidth(page.width, page.height, pixelH);
+        int pixelW = pagePixelWidth(viewWidthOf(page), page.height, pixelH);
         if (pixelH < 32) continue;
         bool hasBox = false;
         for (const BlockBox& box : boxes) {
@@ -4194,9 +4469,9 @@ std::vector<SelectionImage> paintSelection(const model::Document& doc, const std
         for (const BlockBox& box : boxes) {
             if (box.page != pageIndex || box.width <= 0 || box.height <= 0) continue;
             PixelBox pixel;
-            pixel.x = scaleHu(box.x, page.width, pixelW);
+            pixel.x = scaleHu(box.x, viewWidthOf(page), pixelW);
             pixel.y = scaleHu(box.y, page.height, pixelH);
-            const int edgeX = scaleHu(box.x + box.width, page.width, pixelW);
+            const int edgeX = scaleHu(box.x + box.width, viewWidthOf(page), pixelW);
             const int edgeY = scaleHu(box.y + box.height, page.height, pixelH);
             pixel.w = std::max(1, edgeX - pixel.x);
             pixel.h = std::max(1, edgeY - pixel.y);
@@ -4260,11 +4535,11 @@ std::vector<SelectionImage> paintSelection(const model::Document& doc, const std
         cursor.page = pageIndex;
         cursor.pageW = pixelW;
         cursor.pageH = pixelH;
-        cursor.x = std::clamp(scaleHu(caret.x, page.width, pixelW), 0, std::max(0, pixelW - 1));
+        cursor.x = std::clamp(scaleHu(caret.x, viewWidthOf(page), pixelW), 0, std::max(0, pixelW - 1));
         cursor.y = std::clamp(scaleHu(caret.y, page.height, pixelH), 0, std::max(0, pixelH - 1));
         if (caret.turned) {
             // 세로쓰기 커서는 누운 막대다.
-            const int cursorW = std::max(1, scaleHu(caret.height, page.width, pixelW));
+            const int cursorW = std::max(1, scaleHu(caret.height, viewWidthOf(page), pixelW));
             cursor.width = std::min(cursorW, std::max(1, pixelW - cursor.x));
             cursor.height = 1;
         } else {
@@ -4381,6 +4656,8 @@ CursorStyle cursorStyleForCaret(const model::Document& doc, const CaretPlace& ca
     if (ps) {
         st.paraShapeId = ps->id;
         st.align = ps->align.empty() ? "JUSTIFY" : ps->align;
+        st.headingType = ps->headingType.empty() ? "NONE" : ps->headingType;
+        st.headingLevel = ps->headingLevel;
         st.lineSpacingType = ps->lineSpacingType.empty() ? "PERCENT" : ps->lineSpacingType;
         st.lineSpacing = ps->lineSpacing > 0 ? ps->lineSpacing : 160;
     } else {
@@ -4393,12 +4670,33 @@ CursorStyle cursorStyleForCaret(const model::Document& doc, const CaretPlace& ca
     if (cs) {
         st.charShapeId = cs->id;
         st.font = Painter::resolveCharShapeFontName(doc, *cs);
+        for (std::size_t slot = 0; slot < model::kLangCount && slot < doc.header.fonts.size(); ++slot) {
+            for (const model::Font& f : doc.header.fonts[slot]) {
+                if (f.id == cs->fontRef[slot]) st.langFonts[slot] = f.face;
+            }
+        }
         st.fontSize = cs->height > 0 ? cs->height : 1000;
         st.bold = cs->bold;
         st.italic = cs->italic;
         st.underlineType = cs->underline.empty() ? "NONE" : cs->underline;
         st.underline = st.underlineType != "NONE";
         st.strikeout = cs->strikeout;
+        st.superscript = cs->superscript;
+        st.subscript = cs->subscript;
+        const auto hex = [](const model::Color& c) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "#%06X", static_cast<unsigned>(c.value_or(0) & 0xFFFFFFu));
+            return std::string(buf);
+        };
+        st.underlineColor = hex(cs->underlineColor);
+        st.strikeColor = hex(cs->strikeColor);
+        st.charBorder = false;
+        for (const model::BorderFill& fill : doc.header.borderFills) {
+            if (fill.id != cs->borderFillId) continue;
+            for (const model::BorderSide* side : {&fill.left, &fill.right, &fill.top, &fill.bottom}) {
+                if (!side->type.empty() && side->type != "NONE") st.charBorder = true;
+            }
+        }
         if (cs->textColor) {
             char buf[8];
             std::snprintf(buf, sizeof(buf), "#%06x", static_cast<unsigned>(*cs->textColor & 0xFFFFFFu));
@@ -4470,11 +4768,19 @@ void markMixed(const model::Document& doc, const std::vector<Node>& pages, const
             if (length <= 0 || pos <= from || runFrom >= to) continue;
             const CursorStyle& cs = charStyle(run.charShapeId);
             st.mixed.font = st.mixed.font || cs.font != st.font;
+            for (std::size_t slot = 0; slot < model::kLangCount; ++slot) {
+                st.mixed.langFonts[slot] = st.mixed.langFonts[slot] || cs.langFonts[slot] != st.langFonts[slot];
+            }
             st.mixed.fontSize = st.mixed.fontSize || cs.fontSize != st.fontSize;
             st.mixed.bold = st.mixed.bold || cs.bold != st.bold;
             st.mixed.italic = st.mixed.italic || cs.italic != st.italic;
             st.mixed.underline = st.mixed.underline || cs.underlineType != st.underlineType;
             st.mixed.strikeout = st.mixed.strikeout || cs.strikeout != st.strikeout;
+            st.mixed.superscript = st.mixed.superscript || cs.superscript != st.superscript;
+            st.mixed.subscript = st.mixed.subscript || cs.subscript != st.subscript;
+            st.mixed.underlineColor = st.mixed.underlineColor || cs.underlineColor != st.underlineColor;
+            st.mixed.strikeColor = st.mixed.strikeColor || cs.strikeColor != st.strikeColor;
+            st.mixed.charBorder = st.mixed.charBorder || cs.charBorder != st.charBorder;
             st.mixed.color = st.mixed.color || cs.color != st.color;
         }
     }
@@ -4581,7 +4887,21 @@ CaretStatus caretStatus(const model::Document& doc, const std::vector<Node>& pag
     // 블록이면 끄는 쪽 끝(focus)을 센다. 커서가 없으면 마지막으로 놓은 캐럿을 쓴다.
     const PointerCursor cur = pointerCursor();
     const PointerHold& hold = pointerHold();
-    if (hold.bandStory > 0) st.band = hold.bandHeader ? 1 : 2;
+    if (hold.bandStory > 0 && !hold.bandMaster) st.band = hold.bandHeader ? 1 : 2;
+    st.master = hold.bandStory > 0 && hold.bandMaster;
+    if (hold.drag.mode == DragMode::Cells && hold.drag.control) {
+        st.table = true;
+        st.cellBlock = true;
+    } else if (cur.active && cur.story > 0) {
+        const model::StorySlot* slot = resolveStory(doc, cur.story);
+        st.table = slot && slot->tableCell;
+        if (slot && slot->kind == model::StoryKind::SubList && slot->control) {
+            if (slot->control->kind == model::ControlKind::Footnote) st.note = 1;
+            if (slot->control->kind == model::ControlKind::Endnote) st.note = 2;
+        }
+        st.cellStart = st.table && !cur.hasSelection && cur.paragraph == 0 &&
+                       paint_detail::offsetToCharIndex(doc, pages, cur.story, cur.paragraph, cur.offset) == 0;
+    }
     CaretPlace caret;
     if (cur.active && cur.story > 0) {
         const int para = cur.focusParagraph >= 0 ? cur.focusParagraph : cur.paragraph;
@@ -6902,6 +7222,225 @@ void drawRulerNumber(SkCanvas* canvas, int value, float centerX, float baseY, fl
     }
 }
 
+// 안내선 색. 그리기 안내선은 한글 2024 화면에서 잰 하늘색 점선(6화소 그림·6화소 빔, 종이 밖으로 7화소)이고, 개체가 붙으면
+// 실선이 된다. 개체 이동 안내선과 손잡이는 한글 도움말 그림의 남색이다. 풍선은 한글 크기 풍선의 연노랑이다.
+constexpr SkColor kDrawGuideColor = SkColorSetARGB(255, 143, 222, 255);
+constexpr SkColor kDrawGuideHeldColor = SkColorSetARGB(255, 0, 150, 255);
+constexpr SkColor kMoveGuideColor = SkColorSetARGB(255, 71, 71, 162);
+constexpr SkColor kGuideTipFill = SkColorSetARGB(255, 252, 244, 206);
+constexpr SkColor kGuideTipEdge = SkColorSetARGB(255, 222, 208, 150);
+constexpr SkColor kGuideTipInk = SkColorSetARGB(255, 51, 51, 51);
+constexpr float kDrawGuideDash = 6.f;
+constexpr float kDrawGuideOverhang = 7.f;
+
+// 풍선 글자의 윤곽(함초롬돋움, 없으면 받아 둔 기본 글꼴). 한 번 뜬 글자는 다시 찾지 않는다. 글꼴이 아직 없으면 다음에 다시 뜬다.
+const RulerDigit& uiGlyph(char32_t cp) {
+    static std::unordered_map<char32_t, RulerDigit> glyphs;
+    static std::mutex mu;
+    std::lock_guard lock(mu);
+    RulerDigit& glyph = glyphs[cp];
+    if (glyph.ready) return glyph;
+    // 문서가 함초롬돋움을 받지 않았으면 받아 둔 기본 글꼴로 그린다.
+    const GlyphMem* mem = nullptr;
+    for (const char* face : {"함초롬돋움", "함초롬바탕", "맑은 고딕", "바탕", "돋움"}) {
+        mem = glyphMemory(face, cp);
+        if (mem && mem->face) break;
+    }
+    if (!mem || !mem->face) return glyph;
+    glyph.commands = hangulCurves(mem, false, false, 0);
+    glyph.advance1000 = mem->advance1000;
+    glyph.fitX = mem->fitX;
+    glyph.fitY = mem->fitY;
+    glyph.ready = true;
+    return glyph;
+}
+
+float uiTextWidth(const std::string& text, float emPx) {
+    float total = 0.f;
+    std::size_t index = 0;
+    char32_t cp = 0;
+    while (nextCp(text, index, cp)) total += uiGlyph(cp).advance1000 * emPx / 1000.f;
+    return total;
+}
+
+void drawUiText(SkCanvas* canvas, const std::string& text, float x, float baseY, float emPx, const SkPaint& ink) {
+    std::size_t index = 0;
+    char32_t cp = 0;
+    float pen = x;
+    while (nextCp(text, index, cp)) {
+        const RulerDigit& glyph = uiGlyph(cp);
+        if (!glyph.commands.empty()) {
+            canvas->drawPath(glyphPath(glyph.commands, emPx, 100, pen, baseY, glyph.fitX, glyph.fitY), ink);
+        }
+        pen += glyph.advance1000 * emPx / 1000.f;
+    }
+}
+
+// HU 를 한글 풍선처럼 cm 둘째 자리로.
+std::string guideCm(double hu) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2fcm", hu * 2.54 / 7200.0);
+    return buf;
+}
+
+// 축에 나란한 1화소 선. dash 가 0 이면 실선이다.
+void guideLine(SkCanvas* canvas, bool vertical, float at, float from, float to, float width, float dash,
+               const SkPaint& paint) {
+    if (to <= from) return;
+    const float pos = std::round(at);
+    if (dash <= 0) {
+        canvas->drawRect(vertical ? SkRect::MakeXYWH(pos, from, width, to - from)
+                                  : SkRect::MakeXYWH(from, pos, to - from, width),
+                         paint);
+        return;
+    }
+    for (float t = from; t < to; t += dash * 2.f) {
+        const float end = std::min(to, t + dash);
+        canvas->drawRect(vertical ? SkRect::MakeXYWH(pos, t, width, end - t) : SkRect::MakeXYWH(t, pos, end - t, width),
+                         paint);
+    }
+}
+
+// 상자 (x, y) 바로 위에 풍선을 띄운다. 화면 밖으로 나가지 않게 민다.
+void drawGuideTip(SkCanvas* canvas, const std::string& text, float x, float y, float dpr, int viewW, int viewH) {
+    const float em = 12.f * dpr;
+    const float pad = 4.f * dpr;
+    const float w = uiTextWidth(text, em) + pad * 2.f;
+    const float h = em * 1.6f;
+    float left = x;
+    float top = y - h - 4.f * dpr;
+    if (top < 0) top = y + 4.f * dpr;
+    left = std::clamp(left, 0.f, std::max(0.f, static_cast<float>(viewW) - w));
+    top = std::clamp(top, 0.f, std::max(0.f, static_cast<float>(viewH) - h));
+    SkPaint fill;
+    fill.setColor(kGuideTipFill);
+    canvas->drawRect(SkRect::MakeXYWH(left, top, w, h), fill);
+    SkPaint edge;
+    edge.setColor(kGuideTipEdge);
+    const float line = std::max(1.f, std::round(dpr));
+    canvas->drawRect(SkRect::MakeXYWH(left, top, w, line), edge);
+    canvas->drawRect(SkRect::MakeXYWH(left, top + h - line, w, line), edge);
+    canvas->drawRect(SkRect::MakeXYWH(left, top, line, h), edge);
+    canvas->drawRect(SkRect::MakeXYWH(left + w - line, top, line, h), edge);
+    SkPaint ink;
+    ink.setAntiAlias(true);
+    ink.setColor(kGuideTipInk);
+    drawUiText(canvas, text, left + pad, top + h * 0.5f + em * 0.36f, em, ink);
+}
+
+// 그리기 안내선과 개체 이동 안내선. 선은 쪽 그림 위·캐럿 아래에(tips 거짓), 풍선은 옮기는 개체 미리보기 위에(tips 참) 그린다.
+void drawViewGuides(SkCanvas* canvas, const std::vector<ViewPage>& pages, int scrollX, int scrollY, int viewW,
+                    int viewH, double dpr, bool tips) {
+    const ViewGuides guides = viewGuides();
+    const GuideSettings& guide = guides.guide;
+    const PointerHold& hold = pointerHold();
+    const float scale = static_cast<float>(dpr > 0 ? dpr : 1.0);
+    const float px = std::max(1.f, std::round(scale));
+    // 쪽 HU → 화면 화소.
+    struct Mapped {
+        bool ok = false;
+        float left = 0, top = 0, sx = 0, sy = 0;
+        PaperBox box;
+    };
+    const auto mapPage = [&](int index) {
+        Mapped m;
+        const ViewPage* page = sheetOf(pages, index);
+        if (!page || page->w <= 0 || page->h <= 0) return m;
+        const std::optional<PaperBox> box = screenPaperBox(index);
+        if (!box || box->width <= 0 || box->height <= 0) return m;
+        m.ok = true;
+        m.box = *box;
+        m.left = static_cast<float>(page->x - scrollX);
+        m.top = static_cast<float>(page->y - scrollY);
+        m.sx = static_cast<float>(page->w) / static_cast<float>(box->width);
+        m.sy = static_cast<float>(page->h) / static_cast<float>(box->height);
+        return m;
+    };
+    if (guide.drawShow && !tips) {
+        for (const ViewPage& page : pages) {
+            const Mapped m = mapPage(page.index);
+            if (!m.ok) continue;
+            const float w = static_cast<float>(m.box.width) * m.sx;
+            const float h = static_cast<float>(m.box.height) * m.sy;
+            const float over = kDrawGuideOverhang * scale;
+            const float gx = m.left + static_cast<float>(guide.drawX.value_or(m.box.width / 2)) * m.sx;
+            const float gy = m.top + static_cast<float>(guide.drawY.value_or(m.box.height / 2)) * m.sy;
+            const bool here = (hold.moving && hold.movePage == page.index) || (hold.guideDrag != 0 && hold.movePage == page.index);
+            const bool heldX = here && (hold.guideSnapX || hold.guideDrag == 1);
+            const bool heldY = here && (hold.guideSnapY || hold.guideDrag == 2);
+            SkPaint plain;
+            plain.setColor(kDrawGuideColor);
+            SkPaint held;
+            held.setColor(kDrawGuideHeldColor);
+            guideLine(canvas, true, gx, m.top - over, m.top + h + over, px, heldX ? 0.f : kDrawGuideDash * scale,
+                      heldX ? held : plain);
+            guideLine(canvas, false, gy, m.left - over, m.left + w + over, px, heldY ? 0.f : kDrawGuideDash * scale,
+                      heldY ? held : plain);
+        }
+    }
+    if (!guide.moveShow) return;
+    // 옮기는 개체: 3×3 안내선, 손잡이, 위치 풍선.
+    if (hold.moving && !hold.boxes.empty()) {
+        const Mapped m = mapPage(hold.movePage);
+        if (m.ok) {
+            const HeldBox& held = hold.boxes.front();
+            const std::int32_t leftHu = held.x + hold.moveDX;
+            const std::int32_t topHu = held.y + hold.moveDY;
+            const float x0 = m.left + static_cast<float>(leftHu) * m.sx;
+            const float y0 = m.top + static_cast<float>(topHu) * m.sy;
+            const float x1 = x0 + static_cast<float>(held.width) * m.sx;
+            const float y1 = y0 + static_cast<float>(held.height) * m.sy;
+            const float xm = (x0 + x1) * 0.5f;
+            const float ym = (y0 + y1) * 0.5f;
+            SkPaint line;
+            line.setColor(kMoveGuideColor);
+            const float dash = guide.dashed ? 3.f * scale : 0.f;
+            if (!tips) {
+                for (const float x : {x0, xm, x1}) {
+                    guideLine(canvas, true, x, 0.f, static_cast<float>(viewH), px, dash, line);
+                }
+                for (const float y : {y0, ym, y1}) {
+                    guideLine(canvas, false, y, 0.f, static_cast<float>(viewW), px, dash, line);
+                }
+                const float knob = 3.f * scale;
+                for (const float x : {x0, xm, x1}) {
+                    for (const float y : {y0, ym, y1}) {
+                        if (x == xm && y == ym) continue;
+                        canvas->drawRect(SkRect::MakeXYWH(x - knob, y - knob, knob * 2.f, knob * 2.f), line);
+                    }
+                }
+            }
+            if (tips && guide.tipPosition) {
+                const double baseX = guide.fromPaper ? 0.0 : static_cast<double>(m.box.bodyLeft);
+                const double baseY = guide.fromPaper ? 0.0 : static_cast<double>(m.box.bodyTop);
+                const std::string text = "가로 = " + guideCm(leftHu - baseX) + ", 세로 = " + guideCm(topHu - baseY);
+                drawGuideTip(canvas, text, x0, y0, scale, viewW, viewH);
+            }
+        }
+    }
+    if (!tips || !guide.tipSize) return;
+    // 키우는 개체와 그리는 도형: 크기 풍선(한글: 너비 = 2.80cm, 높이 = 4.55cm).
+    if (hold.resizeHandle >= 0 && !hold.boxes.empty()) {
+        const Mapped m = mapPage(hold.resizePage);
+        if (m.ok) {
+            const HeldBox& held = hold.boxes.front();
+            const std::string text = "너비 = " + guideCm(held.width) + ", 높이 = " + guideCm(held.height);
+            drawGuideTip(canvas, text, m.left + static_cast<float>(held.x) * m.sx, m.top + static_cast<float>(held.y) * m.sy,
+                         scale, viewW, viewH);
+        }
+    }
+    if (hold.drawing && hold.drawPage >= 0) {
+        const Mapped m = mapPage(hold.drawPage);
+        if (m.ok) {
+            const std::int32_t w = std::abs(hold.drawX1 - hold.drawX0);
+            const std::int32_t h = std::abs(hold.drawY1 - hold.drawY0);
+            const std::string text = "너비 = " + guideCm(w) + ", 높이 = " + guideCm(h);
+            drawGuideTip(canvas, text, m.left + static_cast<float>(std::min(hold.drawX0, hold.drawX1)) * m.sx,
+                         m.top + static_cast<float>(std::min(hold.drawY0, hold.drawY1)) * m.sy, scale, viewW, viewH);
+        }
+    }
+}
+
 // 눈금 간격은 화면에 3픽셀 이상 벌어지는 가장 작은 mm 다. 숫자는 서로 닿지 않는 가장 작은 간격마다 붙인다.
 void rulerSteps(double pxPerMm, double unit, int& minor, int& label) {
     static constexpr int kSteps[] = {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000};
@@ -7031,12 +7570,124 @@ int screenImageKey(const SkImage* image) {
                                static_cast<const std::uint8_t*>(pixmap.addr()), pixmap.rowBytes());
 }
 
+// 격자 색(한글 2024 화면에서 잰 값): 선 격자는 회색, 점 격자는 남색 1화소 점이다.
+constexpr SkColor kGridLineColor = SkColorSetARGB(255, 192, 192, 192);
+constexpr SkColor kGridDotColor = SkColorSetARGB(255, 0, 0, 128);
+// 한 칸이 이보다 좁으면 격자가 면처럼 뭉개져 그리지 않는다(장치 화소).
+constexpr float kGridMinSpanPx = 2.f;
+// 2D 화면에서 점 격자를 사각형으로 찍는 한도. 넘으면 그 쪽 점은 찍지 않는다.
+constexpr std::size_t kGridMaxDots2D = 40000;
+
+// 격자 셰이더. 화소 p 가 격자 자리(origin + k*span 을 반올림한 화소)에 들면 칠한다.
+// kind: 0 점, 1 가로선, 2 세로선, 3 가로/세로선.
+const sk_sp<SkRuntimeEffect>& gridEffect() {
+    static const sk_sp<SkRuntimeEffect> effect = [] {
+        const char* sksl =
+            "uniform float2 origin;\n"
+            "uniform float2 span;\n"
+            "uniform float kind;\n"
+            "uniform half4 color;\n"
+            "half4 main(float2 p) {\n"
+            "    float2 d = p - origin + 0.5;\n"
+            "    float2 m = d - span * floor(d / span);\n"
+            "    bool onX = m.x < 1.0;\n"
+            "    bool onY = m.y < 1.0;\n"
+            "    bool on = kind < 0.5 ? (onX && onY) : (kind < 1.5 ? onY : (kind < 2.5 ? onX : (onX || onY)));\n"
+            "    return on ? color : half4(0);\n"
+            "}\n";
+        auto made = SkRuntimeEffect::MakeForShader(SkString(sksl));
+        if (!made.effect) std::fprintf(stderr, "[ClassingHWP] 격자 셰이더 실패: %s\n", made.errorText.c_str());
+        return made.effect;
+    }();
+    return effect;
+}
+
+// 한 쪽의 격자를 그린다. paperX·paperY 는 그 쪽 종이 왼쪽 위 화소, scaleX·scaleY 는 HU 당 화소, clip 은 그릴 수 있는 범위다.
+// 셰이더를 못 쓰는 화면(2D 그림 목록)은 선과 점을 1화소 사각형으로 찍는다.
+void drawPaperGrid(SkCanvas* canvas, const GridPlan& plan, float paperX, float paperY, float scaleX, float scaleY,
+                   const SkRect& clip, bool useShader) {
+    if (!canvas || !plan.show || scaleX <= 0 || scaleY <= 0) return;
+    const float spanX = static_cast<float>(plan.spanX) * scaleX;
+    const float spanY = static_cast<float>(plan.spanY) * scaleY;
+    if (spanX < kGridMinSpanPx || spanY < kGridMinSpanPx) return;
+    SkRect area = SkRect::MakeLTRB(paperX + static_cast<float>(plan.left) * scaleX,
+                                   paperY + static_cast<float>(plan.top) * scaleY,
+                                   paperX + static_cast<float>(plan.right) * scaleX,
+                                   paperY + static_cast<float>(plan.bottom) * scaleY);
+    area.roundOut(&area);
+    if (!area.intersect(clip)) return;
+    const float originX = paperX + static_cast<float>(plan.originX) * scaleX;
+    const float originY = paperY + static_cast<float>(plan.originY) * scaleY;
+    const SkColor color = plan.kind == GridKind::Dots ? kGridDotColor : kGridLineColor;
+    if (useShader && gridEffect()) {
+        const float kind = plan.kind == GridKind::Dots         ? 0.f
+                           : plan.kind == GridKind::Horizontal ? 1.f
+                           : plan.kind == GridKind::Vertical   ? 2.f
+                                                               : 3.f;
+        SkRuntimeShaderBuilder builder(gridEffect());
+        builder.uniform("origin") = SkV2{originX, originY};
+        builder.uniform("span") = SkV2{spanX, spanY};
+        builder.uniform("kind") = kind;
+        builder.uniform("color") = SkColor4f::FromColor(color).premul();
+        SkPaint paint;
+        paint.setShader(builder.makeShader());
+        canvas->drawRect(area, paint);
+        return;
+    }
+    SkPaint paint;
+    paint.setColor(color);
+    // 화면 화소를 HU 로 되돌려 그 범위의 격자 자리만 고른다.
+    const auto huX = [&](float px) { return static_cast<double>((px - paperX) / scaleX); };
+    const auto huY = [&](float py) { return static_cast<double>((py - paperY) / scaleY); };
+    const std::vector<double> xs = gridStops(plan.originX, plan.spanX, huX(area.fLeft), huX(area.fRight));
+    const std::vector<double> ys = gridStops(plan.originY, plan.spanY, huY(area.fTop), huY(area.fBottom));
+    const auto pxX = [&](double hu) { return std::round(paperX + static_cast<float>(hu) * scaleX); };
+    const auto pxY = [&](double hu) { return std::round(paperY + static_cast<float>(hu) * scaleY); };
+    if (plan.kind == GridKind::Dots) {
+        if (xs.size() * ys.size() > kGridMaxDots2D) return;
+        for (const double y : ys) {
+            for (const double x : xs) canvas->drawRect(SkRect::MakeXYWH(pxX(x), pxY(y), 1.f, 1.f), paint);
+        }
+        return;
+    }
+    if (plan.kind == GridKind::Vertical || plan.kind == GridKind::Both) {
+        for (const double x : xs) canvas->drawRect(SkRect::MakeXYWH(pxX(x), area.fTop, 1.f, area.height()), paint);
+    }
+    if (plan.kind == GridKind::Horizontal || plan.kind == GridKind::Both) {
+        for (const double y : ys) canvas->drawRect(SkRect::MakeXYWH(area.fLeft, pxY(y), area.width(), 1.f), paint);
+    }
+}
+
+// 화면에 놓인 쪽 종이(quad)의 격자. 그 쪽 종이·본문 영역은 세션이 프레임마다 넣는다.
+void drawQuadGrid(SkCanvas* canvas, const GridSettings& grid, const ScreenSprite& quad, const SkRect& clip,
+                  bool useShader) {
+    if (!grid.show || quad.page < 0 || quad.w <= 0 || quad.h <= 0) return;
+    const std::optional<PaperBox> box = screenPaperBox(quad.page);
+    if (!box || box->width <= 0 || box->height <= 0) return;
+    drawPaperGrid(canvas, gridPlanFor(grid, *box), static_cast<float>(quad.x), static_cast<float>(quad.y),
+                  static_cast<float>(quad.w) / static_cast<float>(box->width),
+                  static_cast<float>(quad.h) / static_cast<float>(box->height), clip, useShader);
+}
+
 // 한 쪽의 칸 조각(바탕 비트맵·그림·테두리·글자 쿼드)을 GPU 캔버스 pageCanvas 에 차례대로 굽는다.
 // 화면의 쪽 텍스처와 쪽 그림(renderPageGpu)이 같이 쓴다. origin 은 조각 좌표에서 뺄 쪽 왼쪽 위다.
 void bakePageSprites(SkCanvas* pageCanvas, GpuSlot& slot, const std::vector<const ScreenSprite*>& pageSprites,
                      int originX, int originY, int bakeW, int bakeH, int cacheZoom, int maskZoom, int cacheW,
-                     int cacheH, bool dragging, int& mipmapUpgrades, bool& pageIncomplete, bool& pagePicturesCoarse) {
+                     int cacheH, bool dragging, int& mipmapUpgrades, bool& pageIncomplete, bool& pagePicturesCoarse,
+                     int gridPage = -1) {
     pageCanvas->clear(SK_ColorWHITE);
+    // 화면 쪽 텍스처는 글 뒤 격자를 종이 위·칸 아래에 품는다. 쪽 그림(gridPage < 0)에는 넣지 않는다.
+    if (gridPage >= 0) {
+        const GridSettings grid = viewGuides().grid;
+        if (grid.show && !grid.front) {
+            ScreenSprite quad;
+            quad.page = gridPage;
+            quad.w = bakeW;
+            quad.h = bakeH;
+            drawQuadGrid(pageCanvas, grid, quad, SkRect::MakeWH(static_cast<float>(bakeW), static_cast<float>(bakeH)),
+                         !slot.raster);
+        }
+    }
     std::vector<std::vector<GlyphQuad>> pSharp;
     std::vector<std::vector<GlyphQuad>> pScaled;
     GlyphRect pBatchBounds;
@@ -7147,20 +7798,20 @@ PageBitmap renderPageGpu(const model::Document& doc, std::vector<Node>& pages, i
     if (!slot.ready || slot.raster || !slot.context || !slot.recorder) return out;
     const Node& scene = pages[static_cast<std::size_t>(pageIndex)];
     if (scene.height <= 0 || scene.width <= 0) return out;
-    const int pixelW = pagePixelWidth(scene.width, scene.height, pixelHeight);
+    const int pixelW = pagePixelWidth(viewWidthOf(scene), scene.height, pixelHeight);
     const int fullH = pagePixelHeight(scene.height, 100);
     const int percent = std::max(1, static_cast<int>(std::lround(100.0 * pixelHeight / std::max(1, fullH))));
     // 화면과 같이 칸을 굽는다. 100% 보다 작으면 100% 칸을 줄여 놓는다.
     // 칸을 고르는 범위는 구운 배율의 쪽 크기다. 100% 보다 작게 그려도 100% 칸 전부가 들어오게 넓힌다.
     ViewPlan plan;
-    plan.viewW = std::max(pixelW, pagePixelWidth(scene.width, scene.height, fullH));
+    plan.viewW = std::max(pixelW, pagePixelWidth(viewWidthOf(scene), scene.height, fullH));
     plan.viewH = std::max(pixelHeight, fullH);
     plan.percent = percent;
     ViewPage view;
     view.index = pageIndex;
     view.w = pixelW;
     view.h = pixelHeight;
-    view.widthHu = scene.width;
+    view.widthHu = viewWidthOf(scene);
     view.heightHu = scene.height;
     plan.pages.push_back(view);
     frames.bakeVisibleNow(doc, pages, plan);
@@ -7256,6 +7907,8 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
     registerAtlasPool();
     registerSkiaGpuPool();
     pageTextures().ensureRegistered();
+    // 격자·안내선. 격자 모양이 바뀌면 세션이 쪽 텍스처를 먼저 버린다(applyViewGuides).
+    const ViewGuides guides = viewGuides();
     keepPictureBudget();
     if (viewW <= 0 || viewH <= 0) return presentFailed("화면 크기가 없습니다");
     // 화면에 걸친 쪽의 텍스처를 그리기 전에 모두 이번 프레임 것으로 표시한다.
@@ -7383,7 +8036,7 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
                 bool pageIncomplete = false;
                 bool pagePicturesCoarse = false;
                 bakePageSprites(pageCanvas, slot, pageSprites, quad.x, quad.y, bakeW, bakeH, cacheZoom, maskZoom,
-                                cacheW, cacheH, dragging, mipmapUpgrades, pageIncomplete, pagePicturesCoarse);
+                                cacheW, cacheH, dragging, mipmapUpgrades, pageIncomplete, pagePicturesCoarse, quad.page);
                 if (sk_sp<SkImage> pageImg = SkSurfaces::AsImage(pageSurface)) {
                     if (onScreen) {
                         const SkSamplingOptions pageSampling =
@@ -7434,6 +8087,14 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
         }
     }
     papersTimer.stop();
+    const SkRect viewClip = SkRect::MakeWH(static_cast<float>(viewW), static_cast<float>(viewH));
+    // 글 뒤 격자: 쪽 텍스처로 그린 쪽은 텍스처가 품었다. 흰 종이 위에 칸을 바로 얹는 쪽만 여기서 깐다.
+    if (guides.grid.show && !guides.grid.front) {
+        for (const ScreenSprite& quad : papers) {
+            if (handledPages.count(quad.page)) continue;
+            drawQuadGrid(canvas, guides.grid, quad, viewClip, !slot.raster);
+        }
+    }
     FramePhaseTimer backsTimer(FramePhase::Overlay);
     const std::vector<SkRect> invertBacks =
         placeInvertBacks(canvas, pages, scrollX, scrollY, viewW, viewH, handledPages);
@@ -7507,7 +8168,13 @@ bool presentScreen(int viewW, int viewH, const std::vector<ScreenSprite>& papers
     spritesTimer.stop();
     {
         const FramePhaseTimer timer(FramePhase::Overlay);
+        // 글 앞 격자는 글자·개체 위에 깐다.
+        if (guides.grid.show && guides.grid.front) {
+            for (const ScreenSprite& quad : papers) drawQuadGrid(canvas, guides.grid, quad, viewClip, !slot.raster);
+        }
+        drawViewGuides(canvas, pages, scrollX, scrollY, viewW, viewH, dpr, false);
         drawCaret(canvas, slot.recorder.get(), pages, scrollX, scrollY, !invertBacks.empty(), dpr);
+        drawViewGuides(canvas, pages, scrollX, scrollY, viewW, viewH, dpr, true);
         drawRulers(canvas, viewW, viewH, ruler, pages, scrollX, scrollY);
         drawScrollbar(canvas, barX);
         drawScrollbar(canvas, barY);

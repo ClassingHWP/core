@@ -489,6 +489,8 @@ private:
         if (atom.control) {
             spans_->flush();
             Node child = host_.inlineObject(atom, pen_);
+            // 덧말 높이는 줄 간격 비율의 바탕에 든다(한글: 10pt 위 50% 덧말 줄은 1500의 60%인 900).
+            if (child.role == "glyphGroup") fill_.shapeHeight = std::max(fill_.shapeHeight, child.height);
             child.charShapeId = atom.charShapeId;
             child.fontSize = atom.fontSize > 0 ? atom.fontSize : kEm;
             child.font = atom.font;

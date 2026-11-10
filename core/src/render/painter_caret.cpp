@@ -238,6 +238,7 @@ void Painter::hitLine(const Node& node, std::int32_t lineX, std::int32_t lineY, 
 
 void Painter::walkCaret(const Node& node, std::int32_t ox, std::int32_t oy, std::int32_t px, std::int32_t py,
                         CaretPlace& best, bool drag, int anchorPara, int anchorOff) {
+    if (node.role == "lineNumbers" || node.role == "memos") return;
     // 세로쓰기 틀은 돌린 틀에서 찾는다. 점은 종이 그대로 넘기고, 줄에서 틀 점으로 바꾼다(hitLine).
     const CaretTurnScope scope(*this);
     bool uprightBox = false;

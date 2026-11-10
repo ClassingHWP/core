@@ -109,17 +109,28 @@ val packCaretStatus(const chwp::render::CaretStatus& st) {
     out.set("line", st.line);
     out.set("char", st.character);
     out.set("band", st.band);
+    out.set("table", st.table);
+    out.set("cellBlock", st.cellBlock);
+    out.set("cellStart", st.cellStart);
+    out.set("note", st.note);
+    out.set("master", st.master);
     out.set("overwrite", st.overwrite);
     return out;
 }
 
+// 모양이 앞서 보낸 것과 같으면(styleChanged 가 거짓) 모양 칸은 빼고 styleChanged:false 만, 캐럿 상태가 같으면 caret 을 뺀다.
 val packCursorStyle(const app::StyleReport& report) {
     const chwp::render::CursorStyle& st = report.style;
     val out = val::object();
+    out.set("styleChanged", report.styleChanged);
+    if (report.statusChanged) out.set("caret", packCaretStatus(report.status));
+    if (!report.styleChanged) return out;
     out.set("active", st.active);
     out.set("styleId", st.styleId);
     out.set("styleName", st.styleName);
     out.set("styleEngName", st.styleEngName);
+    out.set("headingType", st.headingType);
+    out.set("headingLevel", st.headingLevel);
     out.set("styleType", st.styleType);
     out.set("paraShapeId", st.paraShapeId);
     out.set("align", st.align);
@@ -130,6 +141,11 @@ val packCursorStyle(const app::StyleReport& report) {
     out.set("charShapeId", st.charShapeId);
     out.set("font", st.font);
     out.set("fontSwapTo", st.fontSwapTo);
+    {
+        val langFonts = val::array();
+        for (std::size_t i = 0; i < st.langFonts.size(); ++i) langFonts.set(i, st.langFonts[i]);
+        out.set("langFonts", langFonts);
+    }
     out.set("fontSize", st.fontSize);
     out.set("fontSizePt", st.fontSizePt());
     val sizes = val::object();
@@ -140,6 +156,11 @@ val packCursorStyle(const app::StyleReport& report) {
     out.set("underline", st.underline);
     out.set("underlineType", st.underlineType);
     out.set("strikeout", st.strikeout);
+    out.set("superscript", st.superscript);
+    out.set("subscript", st.subscript);
+    out.set("underlineColor", st.underlineColor);
+    out.set("strikeColor", st.strikeColor);
+    out.set("charBorder", st.charBorder);
     out.set("color", st.color);
     val mixed = val::object();
     mixed.set("style", st.mixed.style);
@@ -149,11 +170,18 @@ val packCursorStyle(const app::StyleReport& report) {
     mixed.set("italic", st.mixed.italic);
     mixed.set("underline", st.mixed.underline);
     mixed.set("strikeout", st.mixed.strikeout);
+    mixed.set("superscript", st.mixed.superscript);
+    mixed.set("subscript", st.mixed.subscript);
+    mixed.set("charBorder", st.mixed.charBorder);
     mixed.set("color", st.mixed.color);
     mixed.set("align", st.mixed.align);
+    {
+        val langFonts = val::array();
+        for (std::size_t i = 0; i < st.mixed.langFonts.size(); ++i) langFonts.set(i, st.mixed.langFonts[i]);
+        mixed.set("langFonts", langFonts);
+    }
     mixed.set("lineSpacing", st.mixed.lineSpacing);
     out.set("mixed", mixed);
-    out.set("caret", packCaretStatus(report.status));
     return out;
 }
 
@@ -207,6 +235,11 @@ val packEditReport(const app::EditReport& report) {
     out.set("canUndo", report.canUndo);
     out.set("canRedo", report.canRedo);
     out.set("docState", report.docState);
+    out.set("error", report.error);
+    out.set("notice", report.notice);
+    out.set("dialog", report.dialog);
+    out.set("count", report.count);
+    out.set("found", report.found);
     out.set("needsFontSwap", res.needsFontSwap);
     out.set("dirtySection", res.dirtySection);
     out.set("dirtyStory", res.dirtyStory);
@@ -224,7 +257,7 @@ val packEditReport(const app::EditReport& report) {
     out.set("caretTurned", res.caret.turned);
     out.set("scrollX", report.scrollX);
     out.set("scrollY", report.scrollY);
-    out.set("cursorStyle", packCursorStyle(report.style));
+    if (const app::StyleReport sent = app::styleToSend(report.style); sent.changed()) out.set("cursorStyle", packCursorStyle(sent));
     out.set("text", report.text);
     val underlines = val::array();
     for (const chwp::render::SelectionMark& mark : res.compositionUnderlines) {
@@ -486,6 +519,7 @@ val packInput(const app::InputReport& report) {
     out.set("pageStepY", camera.pageStepY);
     out.set("page", report.page);
     out.set("pageCount", report.pageCount);
+    out.set("pageCounting", report.pageCounting);
     out.set("ownsScroll", report.ownsScroll);
     out.set("settled", report.settled);
     out.set("needsTick", report.needsTick);
@@ -514,10 +548,11 @@ val packInput(const app::InputReport& report) {
             out.set("select", true);
             out.set("selectPhase", sel.selectPhase);
             if (sel.pinTap) out.set("pinTap", true);
+            if (!sel.dialog.empty()) out.set("dialog", sel.dialog);
             out.set("active", sel.active);
             out.set("caret", sel.caret);
             if (sel.styled) {
-                out.set("cursorStyle", packCursorStyle(sel.style));
+                if (const app::StyleReport sent = app::styleToSend(sel.style); sent.changed()) out.set("cursorStyle", packCursorStyle(sent));
                 out.set("text", sel.text);
             }
             if (!sel.event.empty()) out.set("event", sel.event);
@@ -638,6 +673,7 @@ void notifyCamera(const app::CameraNote& n) {
     note.set("pinching", n.pinching);
     note.set("page", n.page);
     note.set("pageCount", n.pageCount);
+    note.set("pageCounting", n.pageCounting);
     note.set("viewW", n.viewW);
     note.set("viewH", n.viewH);
     note.set("maxScrollX", n.maxScrollX);
@@ -807,7 +843,7 @@ val pointerEvent(int kind, int page, int x, int y, int percent) {
     out.set("offset", report.cursor.offset);
     out.set("hasSelection", report.cursor.hasSelection);
     if (report.styled) {
-        out.set("cursorStyle", packCursorStyle(report.style));
+        if (const app::StyleReport sent = app::styleToSend(report.style); sent.changed()) out.set("cursorStyle", packCursorStyle(sent));
         out.set("text", report.text);
     }
     if (!report.event.empty()) out.set("event", report.event);
@@ -928,6 +964,15 @@ val editField(const val& event) {
 val editUndo() { return packEditReport(app::editUndo()); }
 val editRedo() { return packEditReport(app::editRedo()); }
 val editInsertTable(int rows, int cols) { return packEditReport(app::editInsertTable(rows, cols)); }
+val editInsertBreak(const std::string& kind) { return packEditReport(app::editInsertBreak(kind)); }
+val editShortcut(const std::string& command) { return packEditReport(app::editShortcut(command)); }
+val editFindReplace(const std::string& mode, const std::string& text, const std::string& replacement, bool matchCase) {
+    return packEditReport(app::editFindReplace(mode, text, replacement, matchCase));
+}
+val editTable(const std::string& kind, bool after, int count, int rows, int cols, const std::string& border,
+              const std::string& color, const std::string& lineType, int lineWidth, const std::string& lineColor) {
+    return packEditReport(app::editTable(kind, after, count, rows, cols, border, color, lineType, lineWidth, lineColor));
+}
 val editInsertPicture(const val& input) { return packEditReport(app::editInsertPicture(toBytes(input))); }
 
 // chosenVal 은 셸에서 고른 {막힌 글꼴: 바꿀 글꼴}이다.
@@ -1007,6 +1052,54 @@ val packFieldValue(const chwp::render::FormatValue& value) {
     return val(std::get<std::string>(value));
 }
 
+val editNoteShape(const val& fields, bool endnote, bool whole) {
+    return packEditReport(app::editNoteShape(fieldsOf(fields), endnote, whole));
+}
+val noteShapeView(bool endnote) { return packFields(app::noteShapeViewNow(endnote)); }
+val editCaption(const std::string& caption) { return packEditReport(app::editCaption(caption)); }
+val editBookmark(const std::string& action, const std::string& name, const std::string& newName) {
+    return packEditReport(app::editBookmark(action, name, newName));
+}
+val editGoToPage(int page) { return packEditReport(app::editGoToPage(page)); }
+val editGoToSection(int section) { return packEditReport(app::editGoToSection(section)); }
+val editGoTo(const val& fields) { return packEditReport(app::editGoTo(fieldsOf(fields))); }
+val goToView() { return packFields(app::goToViewNow()); }
+val editExchangeNotes(int mode) { return packEditReport(app::editExchangeNotes(mode)); }
+val editCopyShape(const std::string& action, int type) { return packEditReport(app::editCopyShape(action, type)); }
+val editTableText(const val& fields) { return packEditReport(app::editTableText(fieldsOf(fields))); }
+val editDeleteMarks(const val& fields) { return packEditReport(app::editDeleteMarks(fieldsOf(fields))); }
+val bookmarkView() { return packFields(app::bookmarkViewNow()); }
+val editTableProperties(const val& fields) { return packEditReport(app::editTableProperties(fieldsOf(fields))); }
+val tablePropertiesView() { return packFields(app::tablePropertiesViewNow()); }
+val editGlyphGroup(const val& fields) { return packEditReport(app::editGlyphGroup(fieldsOf(fields))); }
+val glyphGroupView() { return packFields(app::glyphGroupViewNow()); }
+val editConvertText(const val& fields) { return packEditReport(app::editConvertText(fieldsOf(fields))); }
+val editSortParagraphs(const val& fields) { return packEditReport(app::editSortParagraphs(fieldsOf(fields))); }
+val sortView(const val& fields) { return packFields(app::sortViewNow(fieldsOf(fields))); }
+val tableFormulaView() { return packFields(app::tableFormulaViewNow()); }
+val editSectionSettings(const val& fields) { return packEditReport(app::editSectionSettings(fieldsOf(fields))); }
+val sectionSettingsView() { return packFields(app::sectionSettingsViewNow()); }
+val editColumns(const val& fields) { return packEditReport(app::editColumns(fieldsOf(fields))); }
+val columnView(const val& fields) { return packFields(app::columnViewNow(fieldsOf(fields))); }
+val viewGuides(const val& fields) { return packFields(app::viewGuidesNow(fieldsOf(fields))); }
+val applyViewGuides(const val& fields) { return packFields(app::applyViewGuides(fieldsOf(fields))); }
+val editInsertNote(bool endnote) { return packEditReport(app::editInsertNote(endnote)); }
+val editInsertHyperlink(const std::string& text, const std::string& url) {
+    return packEditReport(app::editInsertHyperlink(text, url));
+}
+
+// 표 편집. 이름과 값은 코어(editTableFields)가 정한다.
+val editTableFields(const std::string& kind, const val& fields) {
+    return packEditReport(app::editTableFields(kind, fieldsOf(fields)));
+}
+
+// 쪽 탭 컨트롤. 이름과 값은 코어(editPageControl)가 정한다.
+val editPageControl(const std::string& kind, const val& fields) {
+    return packEditReport(app::editPageControl(kind, fieldsOf(fields)));
+}
+
+val pageControlFields(const std::string& kind) { return packFields(app::pageControlFieldsNow(kind)); }
+
 val formatDialogView(int kind, const val& patch) {
     const chwp::render::FormatView view = app::formatDialogView(kind, fieldsOf(patch));
     val values = val::object();
@@ -1060,6 +1153,8 @@ val keyBindings() {
         item.set("command", binding.command);
         item.set("editKey", binding.editKey);
         item.set("editorOnly", binding.editorOnly);
+        item.set("when", binding.when);
+        item.set("next", binding.next);
         out.call<void>("push", item);
     }
     return out;
@@ -1130,6 +1225,42 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("editKey", &editKey);
     emscripten::function("editUndo", &editUndo);
     emscripten::function("editInsertTable", &editInsertTable);
+    emscripten::function("editTable", &editTable);
+    emscripten::function("editInsertBreak", &editInsertBreak);
+    emscripten::function("editPageControl", &editPageControl);
+    emscripten::function("editTableFields", &editTableFields);
+    emscripten::function("editInsertNote", &editInsertNote);
+    emscripten::function("editColumns", &editColumns);
+    emscripten::function("viewGuides", &viewGuides);
+    emscripten::function("applyViewGuides", &applyViewGuides);
+    emscripten::function("editSectionSettings", &editSectionSettings);
+    emscripten::function("editTableProperties", &editTableProperties);
+    emscripten::function("editBookmark", &editBookmark);
+    emscripten::function("editCaption", &editCaption);
+    emscripten::function("editGoToPage", &editGoToPage);
+    emscripten::function("editGoToSection", &editGoToSection);
+    emscripten::function("editGoTo", &editGoTo);
+    emscripten::function("goToView", &goToView);
+    emscripten::function("editExchangeNotes", &editExchangeNotes);
+    emscripten::function("editCopyShape", &editCopyShape);
+    emscripten::function("editTableText", &editTableText);
+    emscripten::function("editDeleteMarks", &editDeleteMarks);
+    emscripten::function("bookmarkView", &bookmarkView);
+    emscripten::function("tablePropertiesView", &tablePropertiesView);
+    emscripten::function("editGlyphGroup", &editGlyphGroup);
+    emscripten::function("glyphGroupView", &glyphGroupView);
+    emscripten::function("editConvertText", &editConvertText);
+    emscripten::function("editSortParagraphs", &editSortParagraphs);
+    emscripten::function("sortView", &sortView);
+    emscripten::function("tableFormulaView", &tableFormulaView);
+    emscripten::function("editNoteShape", &editNoteShape);
+    emscripten::function("noteShapeView", &noteShapeView);
+    emscripten::function("sectionSettingsView", &sectionSettingsView);
+    emscripten::function("columnView", &columnView);
+    emscripten::function("editInsertHyperlink", &editInsertHyperlink);
+    emscripten::function("pageControlFields", &pageControlFields);
+    emscripten::function("editShortcut", &editShortcut);
+    emscripten::function("editFindReplace", &editFindReplace);
     emscripten::function("setDrawTool", &chwp::render::setDrawTool);
     emscripten::function("editInsertPicture", &editInsertPicture);
     emscripten::function("editRedo", &editRedo);

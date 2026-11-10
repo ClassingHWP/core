@@ -5,6 +5,16 @@ set(_chwp_core_sources
     src/container/cfb.cpp
     src/container/zip.cpp
     src/model/document.cpp
+    src/model/table_edit.cpp
+    src/model/table_fill.cpp
+    src/model/table_sort.cpp
+    src/model/table_formula.cpp
+    src/model/memo.cpp
+    src/model/proofreading.cpp
+    src/model/block_calc.cpp
+    src/model/collate.cpp
+    src/model/collate_data.cpp
+    src/model/hangul_jamo_data.cpp
     src/hwp/records.cpp
     src/hwp/hwp_reader.cpp
     src/hwp/hwp_writer.cpp
@@ -18,12 +28,34 @@ set(_chwp_core_sources
     src/render/scene.cpp
     src/render/line_breaker.cpp
     src/render/scene_edit.cpp
+    src/render/table_commands.cpp
+    src/render/page_commands.cpp
+    src/render/note_commands.cpp
+    src/render/column_commands.cpp
+    src/render/section_commands.cpp
+    src/render/table_props.cpp
+    src/render/object_commands.cpp
+    src/render/glyph_group.cpp
+    src/render/glyph_group_commands.cpp
+    src/render/text_convert.cpp
+    src/render/goto_commands.cpp
+    src/render/guides.cpp
+    src/render/table_text.cpp
+    src/render/sort_commands.cpp
+    src/render/formula_commands.cpp
+    src/render/edit_events.cpp
+    src/render/memo_layout.cpp
+    src/render/bookmark_commands.cpp
+    src/render/note_shape_commands.cpp
+    src/render/find_text.cpp
+    src/render/page_layout.cpp
     src/render/paragraph_layout.cpp
     src/render/glyph_path.cpp
     src/render/paint.cpp
     src/render/edit_state.cpp
     src/render/pointer_hold.cpp
     src/render/painter_draw.cpp
+    src/render/painter_proof.cpp
     src/render/picture.cpp
     src/render/picture_upload.cpp
     src/render/border_mesh.cpp

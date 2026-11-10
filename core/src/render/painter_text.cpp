@@ -1,11 +1,14 @@
 #include "render/painter.hpp"
 
+#include "chwp/render/paint.hpp"
+
 #include "export/font_metrics.hpp"
 #include "export/layout.hpp"
 #include "chwp/common/unicode.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
 #include "render/line_breaker.hpp"
+#include "render/scene_detail.hpp"
 
 // Painter: 줄 그리기: 글자 표시, 글자 꾸밈, 문단 꾸밈, 조판 보고, 트리 순회
 
@@ -140,12 +143,27 @@ Painter::LinePlacement Painter::placeLine(const Node& node, const std::vector<Ma
     place.fit = fitLine(node, marks);
     const LineFit& fit = place.fit;
     place.at.reserve(marks.size());
+    // 조판 부호 이름표는 정렬과 줄 나눔을 그대로 두고, 놓인 자리부터 뒤 글자를 그 폭만큼 민다(한글 화면에서 확인).
+    place.labels = lineLabels(node, marks);
+    place.labelAt.reserve(place.labels.size());
+    std::size_t nextLabel = 0;
+    std::int32_t labelShift = 0;
     std::int32_t extra = 0;
     std::int32_t spaceLeft = fit.spaceLeft;
     std::int32_t charLeft = fit.charLeft;
     for (std::size_t i = 0; i < marks.size(); ++i) {
         const Mark& mark = marks[i];
-        place.at.push_back(fit.slide + mark.x + fit.shift + extra);
+        // 빈칸을 대신하는 이름표는 그 빈칸 자리에 그리고, 빈칸 폭 대신 이름표 폭만큼 뒤 마크를 민다.
+        std::int32_t replaceShift = 0;
+        while (nextLabel < place.labels.size() && place.labels[nextLabel].before <= i) {
+            const LineLabel& label = place.labels[nextLabel];
+            place.labelAt.push_back(fit.slide + mark.x + fit.shift + extra + labelShift);
+            if (label.replaces && label.before == i) replaceShift += label.width - mark.width;
+            else labelShift += label.width;
+            ++nextLabel;
+        }
+        place.at.push_back(fit.slide + mark.x + fit.shift + extra + labelShift);
+        labelShift += replaceShift;
         // 늘리거나 줄인 공백은 그 공백 다음 마크부터 민다. 나머지 1 HU 는 앞 공백부터 하나씩 나눈다.
         if (mark.adjustable && static_cast<int>(i) >= fit.firstGlyph && static_cast<int>(i) < fit.contentCount) {
             extra += fit.perSpace;
@@ -172,7 +190,195 @@ Painter::LinePlacement Painter::placeLine(const Node& node, const std::vector<Ma
         const Mark& last = marks.back();
         place.end = fit.slide + last.x + last.width + fit.shift + extra;
     }
+    place.end += labelShift;
+    for (; nextLabel < place.labels.size(); ++nextLabel) {
+        place.labelAt.push_back(place.end);
+        place.end += place.labels[nextLabel].width;
+    }
     return place;
+}
+
+ViewMarks Painter::shownMarks() const { return viewMarks(); }
+
+namespace {
+
+const char* numberKindName(const std::string& numType) {
+    if (numType == "PAGE") return "쪽";
+    if (numType == "FOOTNOTE") return "각주";
+    if (numType == "ENDNOTE") return "미주";
+    if (numType == "PICTURE") return "그림";
+    if (numType == "TABLE") return "표";
+    if (numType == "EQUATION") return "수식";
+    return nullptr;
+}
+
+// 필드 이름. 하이퍼링크·누름틀·메모·계산식·날짜 코드·사용자 정보·책갈피 영역·상호 참조·파일 경로·문서 정보는 한글
+// 화면에서 [이름 시작]·[이름 끝]을 확인했다. 메일 머지는 한글 조판 부호 목록 이름이다.
+const char* fieldMarkName(const std::string& ctrlId) {
+    if (ctrlId == "%hlk") return "하이퍼링크";
+    if (ctrlId == "%clk") return "누름틀";
+    if (ctrlId == "%%me") return "메모";
+    if (ctrlId == "%xrf") return "상호 참조";
+    if (ctrlId == "%dte" || ctrlId == "%ddt") return "날짜 코드";
+    if (ctrlId == "%pat") return "파일 경로";
+    if (ctrlId == "%smr") return "문서 정보";
+    if (ctrlId == "%usr") return "사용자 정보";
+    if (ctrlId == "%mmg") return "메일 머지";
+    if (ctrlId == "%fmu") return "계산식";
+    if (ctrlId == "%bmk") return "책갈피 영역";
+    return "필드";
+}
+
+// 필드 이름표. 교정 부호는 한글 교정 부호 이름이다([지움표 시작] 등, 한글 화면에서 확인).
+std::string fieldLabelName(const model::Control& c) {
+    if (model::proofKindOf(c) != model::ProofKind::None) return model::proofName(c);
+    return fieldMarkName(c.ctrlId);
+}
+
+const char* pageSideName(const std::string& applyPageType) {
+    // 한글 2024 화면: 양쪽은 붙여 쓰고 홀수·짝수는 띄어 쓴다.
+    if (applyPageType == "EVEN") return "(짝수 쪽)";
+    if (applyPageType == "ODD") return "(홀수 쪽)";
+    return "(양쪽)";
+}
+
+// 컨트롤의 조판 부호 이름. 비면 보이지 않는다. 한글 2024 화면에서 확인한 이름: 쪽 번호 위치, 머리말(양쪽),
+// 꼬리말(양쪽), 머리말·꼬리말(홀수 쪽·짝수 쪽), 새 쪽 번호, 쪽 번호, 감추기, 책갈피, 글자 겹치기, 덧말, 각주, 미주,
+// 미주 번호, 표, 그림, 수식, 숨은 설명, 사각형, 타원, 선, 그리기(묶음 개체).
+// 구역 정의·단 정의는 구역 첫머리에서 보이지 않는다. 나머지는 한글 조판 부호 목록 이름을 쓴다.
+std::string controlMarkName(const model::Control& c) {
+    using K = model::ControlKind;
+    switch (c.kind) {
+        case K::Table: return "표";
+        case K::Picture: return "그림";
+        case K::Equation: return "수식";
+        case K::Shape: {
+            // 도형 종류 이름. 사각형(글상자도)·타원·선은 한글 화면에서 확인했다.
+            if (c.shapeType == "rect") return "사각형";
+            if (c.shapeType == "ellipse") return "타원";
+            if (c.shapeType == "line") return "선";
+            if (c.shapeType == "arc") return "호";
+            if (c.shapeType == "polygon") return "다각형";
+            if (c.shapeType == "curve") return "곡선";
+            if (c.shapeType == "textart") return "글맵시";
+            return "그리기";
+        }
+        case K::Container: return "그리기";
+        case K::Ole: return "OLE 개체";
+        case K::Header: return std::string("머리말") + pageSideName(c.applyPageType);
+        case K::Footer: return std::string("꼬리말") + pageSideName(c.applyPageType);
+        case K::Footnote: return "각주";
+        case K::Endnote: return "미주";
+        case K::PageHiding: return "감추기";
+        case K::PageNumPos: return "쪽 번호 위치";
+        case K::Bookmark: return "책갈피";
+        case K::Dutmal: return "덧말";
+        case K::Compose: return "글자 겹치기";
+        case K::HiddenComment: return c.ctrlId == "tcmt" ? "숨은 설명" : "";
+        case K::AutoNumber: {
+            if (c.numType == "TOTAL_PAGE") return "전체 쪽수";
+            const char* kind = numberKindName(c.numType);
+            return kind ? std::string(kind) + " 번호" : "";
+        }
+        case K::NewNumber: {
+            const char* kind = numberKindName(c.numType);
+            return kind ? std::string("새 ") + kind + " 번호" : "";
+        }
+        default: return "";
+    }
+}
+
+}  // namespace
+
+std::vector<Painter::LineLabel> Painter::lineLabels(const Node& node, const std::vector<Mark>& marks) const {
+    std::vector<LineLabel> out;
+    if (!doc || node.kind != NodeKind::Line || node.story <= 0 || node.paragraph < 0 || node.start < 0) return out;
+    if (!shownMarks().control) return out;
+    const model::Paragraph* para = storyParagraph(*doc, node.story, node.paragraph);
+    if (!para) return out;
+    // 줄 자리(start·end)는 저장된 줄 정보로 놓은 문단이면 lineseg 칸(탭·컨트롤 8칸), 아니면 커서 칸이다
+    // (buildAtoms·offsetToCharIndex 와 같은 셈).
+    const bool stored = !para->lineSegs.empty();
+    const int lineStart = node.start;
+    const int lineEnd = std::max(node.end, node.start);
+    const bool lastLine = node.lineData().lastLine;
+    // 커서 칸 k 앞 → 마크 번호. 자동 번호 대신 넣은 글자(synthetic)는 커서 칸이 없어 그 뒤에 둔다.
+    std::vector<std::size_t> caretToMark;
+    caretToMark.reserve(marks.size() + 1);
+    for (std::size_t i = 0; i < marks.size(); ++i) {
+        if (!marks[i].synthetic) caretToMark.push_back(i);
+    }
+    caretToMark.push_back(marks.size());
+    const auto markBefore = [&](int caret) {
+        const int last = static_cast<int>(caretToMark.size()) - 1;
+        return caretToMark[static_cast<std::size_t>(std::clamp(caret, 0, last))];
+    };
+    const auto add = [&](std::size_t before, const std::string& name, std::uint32_t charShapeId, bool replaces = false) {
+        if (name.empty()) return;
+        LineLabel label;
+        label.before = before;
+        label.replaces = replaces;
+        label.text = "[" + name + "]";
+        label.charShapeId = charShapeId;
+        const model::CharShape* shape = findCharShape(*doc, charShapeId);
+        const int size = shape && shape->height > 0 ? shape->height : 1000;
+        std::vector<std::int32_t> inks;
+        measureText(doc, label.text, charShapeId, size, 100, label.advances, inks);
+        for (const std::int32_t w : label.advances) label.width += w;
+        out.push_back(std::move(label));
+    };
+    // 열린 필드. 끝 이름표는 짝인 시작의 이름을 쓴다. 앞 문단에서 시작한 필드는 이름을 몰라 "필드"다.
+    std::vector<const model::Control*> openFields;
+    int pos = 0;
+    int caret = 0;  // 이 줄 안에서 지난 커서 칸 수
+    const auto inLine = [&](int at, bool zeroWidth) {
+        if (at >= lineStart && at < lineEnd) return true;
+        return zeroWidth && lastLine && at == lineEnd;
+    };
+    for (const model::Run& run : para->runs) {
+        for (const model::InlineItem& item : run.items) {
+            if (item.type == model::InlineItem::Type::Text) {
+                std::size_t idx = 0;
+                char32_t cp = 0;
+                while (nextCp(item.text, idx, cp)) {
+                    const int units = stored ? (cp == '\t' ? 8 : (cp > 0xFFFF ? 2 : 1)) : 1;
+                    if (inLine(pos, false) && cp != '\n') {
+                        // 고정폭·묶음 빈 칸은 이름표가 그 빈칸을 대신한다(한글 화면: 앞뒤에 빈칸 틈이 없다).
+                        if (cp == 0x2007) add(markBefore(caret), "고정폭 빈 칸", run.charShapeId, true);
+                        if (cp == 0x00A0) add(markBefore(caret), "묶음 빈 칸", run.charShapeId, true);
+                        ++caret;
+                    }
+                    pos += units;
+                }
+                continue;
+            }
+            const model::Control& c = item.control;
+            const bool caretChar = isCaretCharControl(c);
+            const int units = stored ? 8 : (caretChar ? 1 : 0);
+            std::string name;
+            if (c.kind == model::ControlKind::Field) {
+                openFields.push_back(&c);
+                name = fieldLabelName(c) + " 시작";
+            } else if (c.kind == model::ControlKind::FieldEnd) {
+                const model::Control* begin = openFields.empty() ? nullptr : openFields.back();
+                if (!openFields.empty()) openFields.pop_back();
+                name = (begin ? fieldLabelName(*begin) : std::string("필드")) + " 끝";
+            } else {
+                name = controlMarkName(c);
+            }
+            if (caretChar) {
+                if (inLine(pos, false)) {
+                    ++caret;
+                    add(markBefore(caret), name, run.charShapeId);
+                }
+            } else if (inLine(pos, true)) {
+                add(markBefore(caret), name, run.charShapeId);
+            }
+            pos += units;
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const LineLabel& a, const LineLabel& b) { return a.before < b.before; });
+    return out;
 }
 
 void Painter::appendLineSeg(std::string& out, const model::LineSeg& seg, std::int32_t rise, std::int32_t below,
@@ -984,6 +1190,9 @@ void Painter::drawHeading(const Node& line, std::int32_t x, std::int32_t y, std:
 }
 
 void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObject) {
+    // 덧말·글자 겹치기 묶음 안 줄(glyph_group.cpp). 글자 줄은 글자·효과·강조점만, 장식 줄은 밑줄·취소선·음영·테두리만 그린다.
+    const bool glyphOnly = node.role == "glyph" || node.role == "reverse";
+    const bool decoOnly = node.role == "glyphDeco";
     std::vector<Mark> marks = collectMarks(node);
     const LinePlacement place = placeLine(node, marks);
     if (!placesOnly && node.lineData().auditLine && (pass == PaintLayer::All || pass == PaintLayer::Text)) {
@@ -991,6 +1200,7 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
     }
 
     drawHeading(node, x, y, place.fit.shift, place.fit.slide);
+    drawProofBackgrounds(node, x, y, place);
 
     // 글자 자리 번호는 커서 칸이다. 자동 번호 대신 넣은 글자는 칸을 세지 않고, 번호 없이(-1) 그린다.
     int caretIndex = 0;
@@ -1040,15 +1250,15 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
                 const int y1 = px(top + mark.size);
                 if (x1 > x0 && y1 > y0) fillRect(bitmap, x0, y0, x1 - x0, y1 - y0, br, bg, bb);
             };
-            fillBand(mark.background);
-            if (!placesOnly && !mark.hatchStyle.empty() && mark.band > 0 && mark.size > 0) {
+            if (!glyphOnly) fillBand(mark.background);
+            if (!glyphOnly && !placesOnly && !mark.hatchStyle.empty() && mark.band > 0 && mark.size > 0) {
                 const std::int32_t top = y + node.marginTop + baseline - ownBase;
                 const int x0 = px(at);
                 const int y0 = px(top);
                 hatchRect(x0, y0, px(at + mark.band) - x0, px(top + mark.size) - y0, mark.hatchStyle, mark.hatchColor);
             }
-            fillBand(mark.shade);
-            fillBand(mark.markpen);
+            if (!glyphOnly) fillBand(mark.shade);
+            if (!glyphOnly) fillBand(mark.markpen);
             if (mark.cp == '\t' && !placesOnly) {
                 const std::string leader = canonicalLeader(mark.leader);
                 const int slotHu = std::max(figureSlot(mark.size), 4);
@@ -1105,6 +1315,8 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
                     const std::int32_t glyphBase = y + node.marginTop + baseline + drawShift;
                     const model::CharShape* deco = doc ? findCharShape(*doc, glyphMark.charShapeId) : nullptr;
                     std::string glyphColor = glyphMark.color.empty() ? "#000000" : glyphMark.color;
+                    // 반전 모양 글자 겹치기(●■▲◆)의 안 글자는 흰색이다.
+                    if (node.role == "reverse") glyphColor = "#FFFFFF";
                     if (deco && deco->outline != 0) {
                         if (!glyphMark.shade.empty() && glyphMark.shade != "none") glyphColor = glyphMark.shade;
                         else if (!glyphMark.background.empty() && glyphMark.background != "none")
@@ -1126,7 +1338,7 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
                         glyphTurn.dx = corner ? -static_cast<float>(drawSize) * scale / 2.f : 0.f;
                         glyphTurn.dy = glyphTurn.dx;
                     }
-                    if (deco) {
+                    if (deco && !decoOnly) {
                         paintGlyphEffects(*deco, glyphMark, pen, glyphBase, drawSize, node.story, node.paragraph,
                                           slot);
                     }
@@ -1135,7 +1347,19 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
                     glyphTurn.on = false;
                     if (deco) {
                         const int lineBox = node.lineData().textHeight > 0 ? node.lineData().textHeight : glyphMark.size;
-                        paintBitmapDeco(*deco, glyphMark, pen, y + node.marginTop, lineBox, glyphBase, drawSize);
+                        if (glyphOnly || decoOnly) {
+                            model::CharShape part = *deco;
+                            if (glyphOnly) {
+                                part.underline = "NONE";
+                                part.strikeout = false;
+                                part.borderFillId = 0;
+                            } else {
+                                part.emphasis = 0;
+                            }
+                            paintBitmapDeco(part, glyphMark, pen, y + node.marginTop, lineBox, glyphBase, drawSize);
+                        } else {
+                            paintBitmapDeco(*deco, glyphMark, pen, y + node.marginTop, lineBox, glyphBase, drawSize);
+                        }
                     }
                     if (!note) break;
                     pen += glyphMark.width;
@@ -1144,6 +1368,74 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
             }
         }
     }
+    drawLineMarks(node, x, y, marks, place);
+    drawProofMarks(node, x, y, marks, place);
+}
+
+void Painter::drawLineMarks(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
+                            const LinePlacement& place) {
+    // 화면 글자는 자리만 남겼다가(placesOnly·placeSink) 다시 그린다. 부호 글자도 같은 길로 남긴다.
+    if (!(showGlyphs() || placesOnly) || node.role == "glyph" || node.role == "reverse" || node.role == "glyphDeco") return;
+    const ViewMarks shown = shownMarks();
+    if (!shown.paragraphMarks()) return;
+    // 부호 글자는 함초롬바탕(늘 들고 있는 글꼴)의 ↵ ↓ ⇥ ∨ 다. 크기는 본문 글자의 60%다.
+    // 색은 한글 화면에서 잰 파란색(문단 부호·빈칸·탭)과 주황색(이름표)이다.
+    static const std::string kFace = "함초롬바탕";
+    static const std::string kBlue = "#4169E1";
+    static const std::string kOrange = "#FF6F00";
+    // 글자처럼 넣은 개체만 있는 줄은 글자 기준선이 비어 있다. 그 줄은 lineseg 기준선(개체 높이의 85%)에 둔다.
+    bool objectLine = false;
+    for (const Node& child : node.children) objectLine = objectLine || (child.kind == NodeKind::Object && child.treatAsChar);
+    const LineContent& lineData = node.lineData();
+    const std::int32_t storedBase =
+        objectLine && lineData.lineBaseline < 0 && lineData.storedSeg.textHeight > 0 ? lineData.storedSeg.baseline : 0;
+    const auto baseOf = [&](int size, const std::string& font, int offset) {
+        return y + node.marginTop + std::max(glyphBaseIn(node, size, font, offset).baseline, storedBase);
+    };
+    const auto markSize = [](int size) { return std::max(1, (size > 0 ? size : 1000) * 6 / 10); };
+    const auto sign = [&](char32_t cp, std::int32_t at, int size, const std::string& font, int offset) {
+        glyph(cp, kFace, markSize(size), 100, false, false, kBlue, at, baseOf(size, font, offset));
+    };
+    if (shown.control) {
+        for (std::size_t i = 0; i < marks.size() && i < place.at.size(); ++i) {
+            const Mark& mark = marks[i];
+            if (mark.object || mark.synthetic) continue;
+            if (mark.cp == U' ' || mark.cp == 0x3000) {
+                sign(0x2228, x + place.at[i] + mark.width / 10, mark.size, mark.font, mark.charOffset);
+            } else if (mark.cp == U'\t') {
+                sign(0x21E5, x + place.at[i], mark.size, mark.font, mark.charOffset);
+            }
+        }
+        for (std::size_t k = 0; k < place.labels.size() && k < place.labelAt.size() && doc; ++k) {
+            const LineLabel& label = place.labels[k];
+            const model::CharShape* shape = findCharShape(*doc, label.charShapeId);
+            const model::CharShape& face = shape ? *shape : detail::fallbackCharShape();
+            const int size = face.height > 0 ? face.height : 1000;
+            std::int32_t pen = x + place.labelAt[k];
+            std::size_t index = 0;
+            std::size_t nth = 0;
+            char32_t cp = 0;
+            while (nextCp(label.text, index, cp)) {
+                const detail::GlyphFace drawn = detail::glyphFace(*doc, face, cp, false, true);
+                glyph(cp, drawn.font, size, drawn.ratio > 0 ? drawn.ratio : 100, false, false, kOrange, pen,
+                      baseOf(size, drawn.font, 0));
+                pen += nth < label.advances.size() ? label.advances[nth] : size;
+                ++nth;
+            }
+        }
+    }
+    // 문단 끝 ↵, 강제 줄 바꿈 ↓. 줄의 마지막 글자(이름표 포함) 바로 뒤다.
+    const LineContent& data = lineData;
+    if (!data.lastLine && !data.lineBreak) return;
+    int size = node.fontSize;
+    std::string font = node.font;
+    int offset = 0;
+    if (!marks.empty()) {
+        size = marks.back().size;
+        font = marks.back().font;
+        offset = marks.back().charOffset;
+    }
+    sign(data.lineBreak ? 0x2193 : 0x21B5, x + place.end, size, font, offset);
 }
 
 void Painter::strokePageBorderNode(const Node& node, std::int32_t x, std::int32_t y) {
@@ -1346,8 +1638,10 @@ void Painter::paintStackedChildren(const Node& node, std::int32_t x, std::int32_
     std::vector<const Node*> front;
     std::vector<const Node*> bands;
     std::vector<const Node*> flow;
+    const bool masterOnly = node.kind == NodeKind::Paper && masterView();
     for (const auto& child : node.children) {
         if (child.role == "caption" || child.role == "pageFill" || child.role == "pageBorder") continue;
+        if (masterOnly && !child.fromMaster) continue;
         if (child.pageBand) {
             bands.push_back(&child);
             continue;

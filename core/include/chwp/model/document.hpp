@@ -149,6 +149,7 @@ struct ParaShape {
     bool fontLineHeight = false;   // 글꼴에 어울리는 줄 높이. 기준선을 글꼴 어센더에 둔다
     bool autoSpacingEng = false;   // 한글과 영어 사이 자동 간격
     bool autoSpacingNum = false;   // 한글과 숫자 사이 자동 간격
+    bool suppressLineNumbers = false;  // 줄 번호 숨기기(한글 SuppressLineNumbers). 이 문단 줄은 번호를 쓰지도 세지도 않는다
     std::string lineWrap = "BREAK";
     std::int32_t borderOffsetLeft = 0;
     std::int32_t borderOffsetRight = 0;
@@ -257,6 +258,18 @@ struct TabDef {
     std::vector<TabStop> stops;
 };
 
+// 메모 모양(HWP DocInfo MEMO_SHAPE, HWPX hh:memoPr). 기본값은 한글 새 메모 모양이다.
+struct MemoShape {
+    std::uint32_t width = 15591;      // HWPUNIT. 메모 상자 너비(55mm)
+    std::uint8_t lineType = 1;        // 선 종류 번호(0 없음, 1 실선, 2 점선, 3 파선 …)
+    std::uint8_t lineWidth = 1;       // 선 굵기 번호
+    std::string lineColor = "#B6D7AE";
+    std::string fillColor = "#F0FFE9";
+    std::string activeColor = "#CFF1C7";  // 고른 메모 채우기
+    std::uint32_t memoType = 0;       // 0 NOMAL, 1 USER_INSERT … 높은 비트는 파일 그대로
+    bool operator==(const MemoShape&) const = default;
+};
+
 struct DocHeader {
     std::uint32_t sectionCount = 0;
     BeginNumbers beginNumbers;
@@ -266,6 +279,7 @@ struct DocHeader {
     std::vector<CharShape> charShapes;
     std::vector<ParaShape> paraShapes;
     std::vector<Style> styles;
+    std::vector<MemoShape> memoShapes;  // 1 부터 센다(구역·메모 필드의 모양 번호)
     std::vector<Numbering> numberings;
     std::vector<Bullet> bullets;
     std::vector<TabDef> tabDefs;
@@ -419,10 +433,29 @@ struct Placement {
 struct Paragraph;
 
 // 문단 리스트: 셀, 머리말/꼬리말, 각주/미주, 글상자, 캡션이 공통으로 쓴다.
+// 줄 번호(한글 2024 구역 설정의 줄 번호). 숨긴 한글 2024 의 PDF 로 확인한 그리기:
+//   - 번호는 단 왼쪽에서 distance 만큼 떨어진 자리에 오른쪽 끝을 맞추고, 그 줄과 기준선을 같게 둔다(문단 여백·정렬과 무관).
+//   - 본문 줄마다 하나씩 센다(빈 줄, 표가 든 줄 포함, 표 칸·글상자 안 줄은 세지 않는다). 단은 차례대로 잇는다.
+//   - countBy 의 배수인 번호만 쓴다. 시작 번호 0 은 1 이다. 글자는 글자 모양 0 번이다.
+//   - restart: 0 문서 끝까지 이어서, 1 쪽마다 새로, 2 구역마다 새로.
+// HWP 는 구역 정의 속성 비트 24(보이기)와 레코드 38 바이트 restart(u8), countBy(u16), distance(u32), start(u16)다.
+struct LineNumberShape {
+    bool show = false;
+    std::uint8_t restart = 0;
+    std::uint16_t countBy = 0;
+    std::uint32_t distance = 0;  // HWPUNIT
+    std::uint16_t start = 0;
+    bool operator==(const LineNumberShape&) const = default;
+};
+
 struct SubList {
     std::string vertAlign;  // TOP, CENTER, BOTTOM. 비어 있으면 위
     std::uint8_t textDirection = 0;  // 글상자·칸 글자 방향. 0 가로, 1 세로(영문 눕힘), 2 세로(영문 세움)
-    std::string applyPageType;     // 바탕쪽: BOTH, EVEN, ODD
+    std::string applyPageType;     // 바탕쪽: BOTH, EVEN, ODD, LAST_PAGE, OPTIONAL_PAGE
+    // 바탕쪽(HWP 읽기): 임의 쪽 차례, 겹치게 하기, 인쇄 시 맨 위.
+    std::uint32_t masterPageNumber = 0;
+    bool masterDuplicate = false;
+    bool masterFront = false;
     std::uint32_t textWidth = 0;   // 머리말/꼬리말 글 영역. 0이면 본문 너비
     std::uint32_t textHeight = 0;  // 머리말/꼬리말 글 영역. 0이면 머리말·꼬리말 여백
     std::vector<Paragraph> paragraphs;
@@ -443,6 +476,7 @@ struct TableCell {
     std::int32_t marginTop = 0;
     std::int32_t marginBottom = 0;
     std::string vertAlign;
+    std::string name;  // 셀 필드 이름(표/셀 속성 셀 탭). 계산식 LEFT:이름·ALL:이름 이 이 이름으로 셀을 고른다
     SubList content;
 };
 
@@ -451,7 +485,8 @@ struct Table {
     std::uint32_t colCount = 0;
     std::uint32_t cellSpacing = 0;
     std::uint32_t borderFillId = 0;
-    std::string pageBreak = "CELL";  // NONE, TABLE, CELL
+    // 쪽 경계에서: CELL 나눔(HWP 2), TABLE 셀 단위로 나눔(HWP 1), NONE 나누지 않음(HWP 0). 한글 2024 표/셀 속성 [표] 탭으로 확인.
+    std::string pageBreak = "CELL";
     bool repeatHeader = false;
     bool noAdjust = false;
     std::int32_t marginLeft = 0;  // 칸이 자체 여백을 쓰지 않을 때의 안쪽 여백
@@ -494,9 +529,18 @@ enum class ControlKind {
     Field,        // %hlk, %clk ...
     HiddenComment,// tcmt
     Dutmal,       // tdut : 덧말
-    Compose       // tcps : 글자 겹침
+    Compose,      // tcps : 글자 겹침
+    FieldEnd      // 필드 끝. 앞의 Field(하이퍼링크 등)의 범위가 여기서 끝난다. 글자 칸은 없다
 };
 const char* controlKindName(ControlKind kind);
+// 덧말·글자 겹치기 값의 HWP 번호 ↔ HWPX 이름. 번호 차례는 HWP 5.0 문서 형식(덧말 자리 0 위·1 아래·2 가운데,
+// 정렬은 문단 정렬 차례)과 OWPML 열거 차례다. 글자 겹치기 CHAR 0·SHAPE_CIRCLE 1 은 한글 2024 파일로 확인했다.
+const char* dutmalPosName(std::uint32_t code);
+std::uint32_t dutmalPosCode(const std::string& name);
+const char* dutmalAlignName(std::uint32_t code);
+std::uint32_t dutmalAlignCode(const std::string& name);
+const char* composeCircleName(std::uint32_t code);
+std::uint32_t composeCircleCode(const std::string& name);
 // 개체 번호 범주. 읽은 값이 있으면 그대로, 없으면 표 TABLE, 수식 EQUATION, 그림 PICTURE, 그 밖 NONE.
 // 한글은 캡션 자동 번호와 범주가 맞지 않는 HWP 를 열지 않는다.
 const char* objectNumberingType(ControlKind kind, const std::string& stored);
@@ -541,7 +585,8 @@ struct NoteShape {
     int place = 0;       // 각주 0 단마다, 1 통단, 2 오른쪽 단. 미주 0 문서 끝, 1 구역 끝
     int numbering = 0;   // 0 이어서, 1 구역마다, 2 쪽마다
     std::uint16_t startNumber = 1;
-    std::int32_t lineLength = -1;  // 0 선 없음, 음수 단의 1/3, 양수는 HWPUNIT
+    // 0 선 없음, -1 5cm, -2 2cm, -3 단 너비의 1/3, -4 단 너비(한글 2024 목록), 양수는 HWPUNIT
+    std::int32_t lineLength = -1;
     std::string lineType = "SOLID";
     std::int32_t lineWidth = 34;  // 0.12mm. 메뉴의 첫 굵기
     std::string lineColor = "#000000";
@@ -603,7 +648,7 @@ struct Control {
     std::string columnLineType;             // 단 구분선. 비어 있거나 NONE 이면 그리지 않는다
     std::int32_t columnLineWidth = 0;
     std::string columnLineColor;
-    std::string columnType;    // NEWSPAPER, PARALLEL, NORMAL
+    std::string columnType;    // HWPX 이름: NEWSPAPER(일반), BALANCED_NEWSPAPER(배분), PARALLEL(평행)
     std::string columnLayout;  // LEFT, RIGHT, BOTH
     std::optional<Table> table;   // Table
     std::string binItemId;        // Picture
@@ -623,15 +668,51 @@ struct Control {
     bool hideFooter = false;
     bool hideMaster = false;      // 바탕쪽 감춤
     bool hidePageNum = false;
+    bool hideBorder = false;      // PageHiding: 쪽 테두리 감춤
+    bool hideFill = false;        // PageHiding: 쪽 배경 감춤
     bool hideFirstHeader = false;  // 구역 첫 쪽만
     bool hideFirstFooter = false;
     bool hideFirstMaster = false;
     bool hideFirstPageNum = false;
+    // SectionDef: 구역 설정(한글 2024 구역 설정 대화 상자). 시작 쪽 번호 종류: 0 이어서, 1 짝수, 2 홀수, 3 사용자(쪽 번호 값).
+    std::uint8_t startsOn = 0;
+    std::uint16_t pictureStart = 0;   // 그림 시작 번호. 0 은 이어서
+    std::uint16_t tableStart = 0;     // 표 시작 번호
+    std::uint16_t equationStart = 0;  // 수식 시작 번호
+    std::uint16_t memoShapeId = 0;    // 구역 메모 모양(1 부터, 0 은 기본 모양)
+    // 쪽 테두리·배경을 보일 쪽: SHOW_ALL, HIDE_FIRST(첫 쪽만 감춤), SHOW_FIRST(첫 쪽만 보임).
+    std::string borderShow = "SHOW_ALL";
+    std::string fillShow = "SHOW_ALL";
+    bool hideFirstEmptyLine = false;  // 빈 줄 감추기
+    LineNumberShape lineNumbers;
     std::uint32_t number = 0;
     std::string name;             // Bookmark/Field 이름
     std::string command;          // Field 명령 (하이퍼링크 URL 등)
+    // Field 속성(HWP CTRL_HEADER 의 속성 u32: bit0 고칠 수 있음, bit15 내용이 고쳐짐)과 기타 속성 u8(HWPX
+    // parameters 의 Prop). 한글 계산식은 기타 속성이 8 이다.
+    std::uint32_t fieldProps = 0;
+    std::uint8_t fieldExtra = 0;
+    // 필드 고유 id(HWP CTRL_HEADER 명령 뒤 u32, HWPX fieldBegin@id). 0 이면 저장할 때 매긴다.
+    std::uint32_t fieldId = 0;
+    // 메모 필드(%%me): 메모 번호(HWP MEMO_LIST 짝, 저장할 때 다시 매김), 답글이면 원 메모의 필드 고유 id.
+    std::uint32_t memoNumber = 0;
+    std::uint32_t memoParentId = 0;
     std::string text;             // Dutmal 본말, Compose 겹칠 글자
     std::string subText;          // Dutmal 덧말
+    // 덧말(tdut) 모양. HWP 레코드 차례(본말, 덧말, 자리 u32, 크기 비율 u32, option u32, 스타일 u32, 정렬 u32)와
+    // HWPX hp:dutmal 속성(posType, szRatio, option, styleIDRef, align)이 같은 값이다.
+    std::string dutmalPos = "TOP";       // TOP, BOTTOM, CENTER
+    std::uint32_t dutmalSizeRatio = 0;   // 덧말 글자 크기 %(0 은 한글 기본)
+    std::uint32_t dutmalOption = 0;
+    std::uint32_t dutmalStyle = 0;
+    std::string dutmalAlign = "JUSTIFY"; // 문단 정렬 이름(JUSTIFY, LEFT, RIGHT, CENTER, DISTRIBUTE, DISTRIBUTE_SPACE)
+    // 글자 겹치기(tcps) 모양. HWP 레코드: 겹칠 글자, 테두리 u8, 글자 크기 i8, 겹치기 u8, 글자 모양 수 u8, 글자 모양 u32×수.
+    // HWPX hp:compose circleType·charSz·composeType·charPrCnt·hp:charPr. 한글 2024 파일로 확인:
+    // CHAR 0, SHAPE_CIRCLE 1, OVERLAP 1, 글자 모양은 10 칸(쓰지 않는 칸은 0xFFFFFFFF).
+    std::string composeCircle = "CHAR";
+    std::int8_t composeCharSize = 0;
+    std::string composeType = "OVERLAP";  // OVERLAP, SPREAD
+    std::vector<std::uint32_t> composeCharShapes;
     std::optional<Caption> caption;
     std::int32_t boxPadLeft = 0;    // 글상자 안쪽 여백. 글상자 안 줄 폭에서 빼는 값.
     std::int32_t boxPadRight = 0;
@@ -714,10 +795,15 @@ inline InlineItem InlineItem::makeControl(Control c) {
     return item;
 }
 
-// 바탕쪽. 화면에서는 본문 뒤에 깔린다. applyPageType 은 BOTH, EVEN, ODD.
+// 바탕쪽. 화면에서는 본문 뒤에 깔린다. applyPageType 은 BOTH, EVEN, ODD, LAST_PAGE(구역 마지막 쪽),
+// OPTIONAL_PAGE(구역 안 pageNumber 번째 쪽, 1 부터).
 // printOnTop 은 한글의 "인쇄 시 맨 위"다. 켜지면 인쇄할 때 본문보다 위에 그린다.
+// duplicate 는 "기존 바탕쪽과 겹치게 하기"다. 마지막 쪽·임의 쪽 바탕쪽이 켜면 그 쪽의 양쪽·홀수·짝수 바탕쪽 위에 겹친다.
+// 쪽마다 고르는 규칙은 숨긴 한글 2024 의 PDF 로 확인했다(scene.cpp masterPagesFor).
 struct MasterPage {
     std::string applyPageType = "BOTH";
+    std::uint32_t pageNumber = 0;
+    bool duplicate = false;
     bool printOnTop = false;
     SubList content;
 };
@@ -744,6 +830,17 @@ struct Section {
     bool hideFirstFooter = false;
     bool hideFirstMaster = false;
     bool hideFirstPageNum = false;
+    // 구역 설정(한글 2024 구역 설정 대화 상자). 시작 쪽 번호 종류: 0 이어서, 1 짝수, 2 홀수, 3 사용자(쪽 번호 값).
+    std::uint8_t startsOn = 0;
+    std::uint16_t pictureStart = 0;   // 그림 시작 번호. 0 은 이어서
+    std::uint16_t tableStart = 0;     // 표 시작 번호
+    std::uint16_t equationStart = 0;  // 수식 시작 번호
+    std::uint16_t memoShapeId = 0;    // 구역 메모 모양(1 부터, 0 은 기본 모양)
+    // 쪽 테두리·배경을 보일 쪽: SHOW_ALL, HIDE_FIRST(첫 쪽만 감춤), SHOW_FIRST(첫 쪽만 보임).
+    std::string borderShow = "SHOW_ALL";
+    std::string fillShow = "SHOW_ALL";
+    bool hideFirstEmptyLine = false;  // 빈 줄 감추기
+    LineNumberShape lineNumbers;
     std::vector<MasterPage> masterPages;
     NoteShape footnote;
     NoteShape endnote;

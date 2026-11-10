@@ -37,6 +37,8 @@ struct CameraNote {
     bool pinching = false;
     int page = 0;
     int pageCount = 0;
+    // 열 때 다 쌓지 못해 쪽을 아직 세는 중이다. pageCount 는 지금까지 쌓은 쪽 수다.
+    bool pageCounting = false;
     bool fitPage = false;
     bool fitWidth = false;
     int viewW = 0;
@@ -155,8 +157,17 @@ int ensurePageSpans(int page);
 struct StyleReport {
     render::CursorStyle style;
     render::CaretStatus status;
+    // 셸에 보낼 때(styleToSend) 앞서 보낸 값과 다른가. 같으면 셸은 알리지 않는다(키마다 서식 막대를 다시 그리지 않게).
+    // 보고를 만들 때는 늘 참이다.
+    bool styleChanged = true;
+    bool statusChanged = true;
+    [[nodiscard]] bool changed() const { return styleChanged || statusChanged; }
 };
 StyleReport cursorStyleNow();
+// 셸이 보고를 실제로 넘기기 바로 앞에 부른다. 앞서 넘긴 값과 비교해 styleChanged·statusChanged 를 정하고,
+// 넘길 값을 기억한다. 넘기지 않은 보고(조합 중간, 화면만 바뀐 입력)는 기억에 들지 않는다.
+// 캐럿이 잡히지 않은 모양(조합 중 등)은 넘기지 않아 셸이 마지막 모양을 그대로 둔다. 문서를 새로 열면 기억을 비운다.
+StyleReport styleToSend(StyleReport report);
 // 문서 스타일 이름(스타일 표 차례). 리본 스타일 목록이 쓴다.
 std::vector<std::string> styleNames();
 // 글꼴 고르기 목록: 받을 수 있는 글꼴과 지금 문서에 쓰인 글꼴. 라이선스로 막힌 글꼴은 뺀다.
@@ -223,8 +234,23 @@ struct EditReport {
     std::string text;
     std::vector<PageSize> pages;  // 문서 전체를 다시 놓았을 때만
     std::string docState;         // DocSession::documentState
+    std::string error;            // 고치지 못한 까닭(표 구조 편집 등). 셸은 알림으로 보인다
+    std::string notice;           // 알릴 일(찾기: 못 찾음·처음부터 다시 찾음, 모두 바꾸기: 바꾼 수). 셸은 알림으로 보인다
+    int count = 0;                // 모두 바꾸기에서 바꾼 수
+    std::string dialog;           // 셸이 열 대화 상자(단축키: "find")
+    bool found = false;           // 찾기·바꾸기에서 다음 찾은 곳을 골랐다
 };
 EditReport editText(const std::string& text, bool composing);
+// 찾기·바꾸기. mode 는 "find"(다음 찾기), "findBack"(앞 찾기), "replace"(고른 글을 바꾸고 다음 찾기), "replaceAll".
+// 찾지 못하거나 끝을 돌았거나 몇 개 바꿨는지는 report.notice 에 적는다(셸은 알림으로 보인다).
+EditReport editFindReplace(const std::string& mode, const std::string& text, const std::string& replacement,
+                           bool matchCase);
+// 단축키 명령(keyBindings 의 command). 한글 2024 단축키와 같다.
+//   breakPage(Ctrl+Enter·Ctrl+J), breakColumn(Ctrl+Shift+Enter), breakColumnDef(Ctrl+Alt+Enter),
+//   breakSection(Shift+Alt+Enter), appendRow(표 칸 Ctrl+Enter: 캐럿 줄 아래에 줄 하나, 칸 블록이면 하지 않는다),
+//   subtractRow(칸 맨 앞 Ctrl+Backspace: 캐럿 줄을 지운다), mergeCells·equalWidth·equalHeight(칸 블록 M·W·H),
+//   repeatFind(Ctrl+L: 마지막 찾기를 다시. 찾은 적이 없으면 report.dialog 가 "find").
+EditReport editShortcut(const std::string& command);
 EditReport editCommit();
 EditReport editKey(int key, bool shift, bool ctrl, bool alt);
 // 고른 글을 지운다(오려두기·블록 지우기). 고른 글이 없으면 아무것도 하지 않는다. 클립보드에 넣는 일은 셸이 한다.
@@ -247,6 +273,73 @@ FieldResult editField(const chwp::input::FieldEvent& event);
 EditReport editUndo();
 EditReport editRedo();
 EditReport editInsertTable(int rows, int cols);
+// 나누기. kind 는 page, column, columnDef, section 이다. 구역 본문 밖이면 문서를 고치지 않는다.
+EditReport editInsertBreak(const std::string& kind);
+// 쪽 탭 컨트롤. kind 는 header, footer, deleteBand, pageNumber, newNumber, pageHiding 이고 값 이름은
+// render::editPageControl 과 같다. 하지 못하면 문서는 그대로이고 error 에 이유가 있다.
+EditReport editPageControl(const std::string& kind, const render::FormatFields& fields);
+// 주석 모양(값 이름은 render::noteShapeView). 하지 못하면 error 에 이유가 있다.
+EditReport editNoteShape(const render::FormatFields& fields, bool endnote, bool wholeDocument);
+render::FormatFields noteShapeViewNow(bool endnote);
+// 캡션(고른 개체, 아니면 캐럿 표). 하지 못하면 error 에 이유가 있다.
+EditReport editCaption(const std::string& caption);
+// 책갈피(action: insert·delete·goto)와 찾아가기(쪽은 0 부터). 하지 못하면 error 에 이유가 있다.
+EditReport editBookmark(const std::string& action, const std::string& name, const std::string& newName = {});
+EditReport editGoToPage(int page);
+EditReport editGoToSection(int section);
+// 찾아가기의 줄·스타일·조판 부호(값 이름은 render::goToNow·goToView).
+EditReport editGoTo(const render::FormatFields& fields);
+render::FormatFields goToViewNow();
+// 각주↔미주 바꾸기(mode 0 각주→미주, 1 미주→각주, 2 서로).
+EditReport editExchangeNotes(int mode);
+// 모양 복사(action copy·paste). Alt+C 는 editShortcut("copyShape"): 블록과 기억한 모양이 있으면 붙이고, 아니면 대화 상자다.
+EditReport editCopyShape(const std::string& action, int type);
+// 표를 문자열로·문자열을 표로(값 이름은 render::editTableText).
+EditReport editTableText(const render::FormatFields& fields);
+// 조판 부호 지우기(fields.marks).
+EditReport editDeleteMarks(const render::FormatFields& fields);
+render::FormatFields bookmarkViewNow();
+// 표/셀 속성(값 이름은 render::tablePropertiesView). 하지 못하면 error 에 이유가 있다.
+EditReport editTableProperties(const render::FormatFields& fields);
+render::FormatFields tablePropertiesViewNow();
+// 덧말 넣기·글자 겹치기(값 이름은 render::glyphGroupView). 하지 못하면 error 에 이유가 있다.
+EditReport editGlyphGroup(const render::FormatFields& fields);
+render::FormatFields glyphGroupViewNow();
+// 글자 바꾸기(대문자/소문자·전각/반각, 값 이름은 render::convertTextNow). 하지 못하면 error 에 이유가 있다.
+EditReport editConvertText(const render::FormatFields& fields);
+// 본문 정렬(글 블록, 값 이름은 render::sortParagraphsNow). 하지 못하면 error 에 이유가 있다.
+EditReport editSortParagraphs(const render::FormatFields& fields);
+// 정렬 대화 상자 값(render::sortView): 칸 블록인지 글 블록인지, 글 블록이면 필드 수.
+render::FormatFields sortViewNow(const render::FormatFields& fields);
+// 계산식 대화 상자 값(render::tableFormulaView).
+render::FormatFields tableFormulaViewNow();
+// 구역 설정(값 이름은 render::sectionSettingsView). 하지 못하면 error 에 이유가 있다.
+EditReport editSectionSettings(const render::FormatFields& fields);
+render::FormatFields sectionSettingsViewNow();
+// 단 설정(값 이름은 render::columnView). 하지 못하면 error 에 이유가 있다.
+EditReport editColumns(const render::FormatFields& fields);
+// 단 설정 대화 상자에 보일 값. 고른 값을 얹어 너비·간격을 다시 계산한다.
+render::FormatFields columnViewNow(const render::FormatFields& asked);
+// 보기 격자·안내선 설정(이름은 render::viewGuideFields). asked 를 얹어 계산한 값을 돌려주고 바꾸지는 않는다.
+// 기준 위치만 바꾸면 화면 가운데 쪽 본문 영역으로 시작점을 다시 잰다.
+render::FormatFields viewGuidesNow(const render::FormatFields& asked);
+// patch 를 얹어 바꾸고 다시 그린다. toggle(grid|drawGuides|moveGuides)은 그 보기를 뒤집는다. 바뀐 뒤의 값을 돌려준다.
+render::FormatFields applyViewGuides(const render::FormatFields& patch);
+// 각주(endnote 면 미주) 넣기. 넣지 못하면 error 에 이유가 있다.
+EditReport editInsertNote(bool endnote);
+// 하이퍼링크 넣기. text 가 비면 주소를 보인다. 고른 글은 바꾼다.
+EditReport editInsertHyperlink(const std::string& text, const std::string& url);
+// 쪽 번호·새 번호·감추기 대화 상자를 열 때 채울 값.
+render::FormatFields pageControlFieldsNow(const std::string& kind);
+// 표 구조 편집. kind 는 insertRows, insertColumns, deleteRows, deleteColumns, mergeCells, splitCell 이다.
+// 칸은 캐럿이 든 칸(칸 블록이면 그 범위)이고, 고칠 규칙은 코어가 정한다. after: 아래(오른쪽)에 넣기,
+// count: 넣을 줄(칸) 수, rows·cols: 나눌 줄·칸 수. 고치지 못하면 문서는 그대로다.
+EditReport editTable(const std::string& kind, bool after, int count, int rows, int cols,
+                     const std::string& border = {}, const std::string& color = {}, const std::string& lineType = {},
+                     int lineWidth = 0, const std::string& lineColor = {});
+// 표 편집을 이름-값으로. 이름은 render::TableEditCommand 의 필드 이름(after, count, rows, cols, border, color,
+// lineType, lineWidth, lineColor, vertAlign, horzAlign, direction, margin, preset, wrap, caption, comma)이다.
+EditReport editTableFields(const std::string& kind, const render::FormatFields& fields);
 EditReport editInsertPicture(const Bytes& image);
 EditReport editStyle(const render::FormatPatch& patch);
 EditReport editPageSetup(const render::FormatFields& fields, bool wholeDocument);
@@ -380,6 +473,7 @@ struct SelectionReport {
     std::string docState;  // edited 일 때 문서 상태
     int selectPhase = 0;
     bool pinTap = false;
+    std::string dialog;  // 두 번 누르기가 연 고치기 대화 상자(rubyEdit·composeEdit)
     bool active = false;
     bool caret = false;
     bool styled = false;
@@ -393,6 +487,7 @@ struct InputReport {
     render::Scrollbar barY;
     int page = 0;
     int pageCount = 0;
+    bool pageCounting = false;
     // 입력(휠·관성·끌기·핀치·막대·터치)이 스크롤을 쥐고 있다. 셸은 그동안 제 스크롤 막대를 덮어쓰지 않는다.
     bool ownsScroll = false;
     // 움직임이 멈췄다. 셸은 이때 제 스크롤 막대를 카메라 자리로 맞춘다.
@@ -418,10 +513,17 @@ struct KeyBinding {
     bool ctrl = false;  // Ctrl 또는 Cmd
     bool alt = false;
     // editKey(editKey 번호로 editKey 를 부른다), undo, redo, copy, cut, paste, open, save, pageUp, pageDown,
-    // charDialog, paraDialog, pageDialog. 메뉴의 단축키 표시도 이 표에서 읽는다.
+    // charDialog, paraDialog, pageDialog, findDialog, replaceDialog, splitCellDialog(…Dialog 는 셸이 대화 상자를 연다),
+    // 그 밖은 editShortcut 으로 넘기는 편집 명령이다. 메뉴의 단축키 표시도 이 표에서 읽는다.
     std::string command;
     int editKey = 0;
     bool editorOnly = false;  // 편집 입력칸에 있을 때만(대화 상자의 Esc 는 두려고)
+    // 이 키가 사는 캐럿 상태. 비면 늘, "table" 은 표 칸 안(블록 포함), "cellStart" 는 블록 없이 칸 맨 앞,
+    // "cellBlock" 은 칸 블록. 상태는 캐럿 상태(CaretStatus)의 같은 이름 값이다. 같은 키는 앞의 것이 먼저다.
+    std::string when;
+    // 두 번 누르는 단축키(한글 Ctrl+K,B 따위)의 다음 키. 비면 한 번이다. 다음 키는 앞 키의 Ctrl·Alt 를 쥔 채로도,
+    // 놓고도 누를 수 있다. 앞 키만 눌렀을 때는 아무 명령도 하지 않고 다음 키를 기다린다.
+    std::string next;
 };
 const std::vector<KeyBinding>& keyBindings();
 // 배율 대화 상자의 값들(JSON): 미리 정한 배율, 사용자 배율 한 걸음, 가장 작은 배율, 여러 쪽의 가장 큰 칸 수,

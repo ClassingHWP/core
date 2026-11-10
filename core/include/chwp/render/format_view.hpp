@@ -39,7 +39,8 @@ struct FormatView {
     std::vector<FieldSpec> specs;
 };
 
-enum class FormatViewKind { Char, Para, Page, Table };
+// PageBorder 는 쪽 테두리/배경(한글 2024 쪽 테두리/배경 대화 상자)이다.
+enum class FormatViewKind { Char, Para, Page, Table, PageBorder };
 
 // 표 넣기 한도와 처음 값. 표 넣기(editInsertTable)도 이 한도로 자른다.
 inline constexpr int kTableMaxRows = 500;

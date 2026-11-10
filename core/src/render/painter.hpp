@@ -31,6 +31,8 @@
 
 #include "chwp/render/decorate.hpp"
 #include "chwp/render/glyph_path.hpp"
+#include "chwp/render/guides.hpp"
+#include "chwp/model/proofreading.hpp"
 #include "chwp/render/paint.hpp"
 #include "chwp/render/scene.hpp"
 #include "render/paint_detail.hpp"
@@ -522,8 +524,10 @@ struct Painter {
     }
 
     // 묶음은 자식 개체의 위치와 너비를 모은 것이다. 적힌 묶음 너비로 자식을 자르지 않는다.
+    // 덧말·글자 겹치기 묶음은 자르지 않는다. 본말보다 긴 덧말은 한글처럼 오른쪽으로 넘친다.
     static bool clipsOwnBox(const Node& node) {
-        return node.kind == NodeKind::Object && node.role != "container" && !keepsFileHeight(node);
+        return node.kind == NodeKind::Object && node.role != "container" && node.role != "glyphGroup" &&
+               !keepsFileHeight(node);
     }
 
     bool missesView(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h) const;
@@ -753,10 +757,29 @@ struct Painter {
     // 들여쓰기, 가운데·오른쪽 밀기, 양쪽·배분 정렬로 늘린 공백까지 들어 있다.
     // 글자를 그리는 쪽, 캐럿·블록·클릭, 글자처럼 넣은 개체와 그 테두리는 모두 이 값만 쓴다.
     // 같은 식을 다른 곳에 다시 쓰면 캐럿과 글자가 어긋난다.
+    // 조판 부호 이름표 하나([각주], [메모 시작] 등). before 번째 마크 앞에 그 폭만큼 자리를 차지한다.
+    // before 가 마크 수면 줄 끝이다. 글자 모양은 그 자리 본문 글자 모양이다(한글 도움말 control_code).
+    struct LineLabel {
+        std::size_t before = 0;
+        std::string text;
+        std::uint32_t charShapeId = 0;
+        std::int32_t width = 0;
+        std::vector<std::int32_t> advances;
+        // 빈칸 글자(고정폭·묶음 빈 칸)를 대신한다. before 번째 마크 자리에 그리고 그 마크 폭 대신 이름표 폭을 쓴다.
+        bool replaces = false;
+    };
+    // 지금 보기 표시. 셸이 켜는 편집 화면 설정이라 agent 의 쪽 그림에는 늘 꺼져 있다.
+    ViewMarks shownMarks() const;
+    // 줄 안 조판 부호 이름표. 조판 부호를 켜지 않았으면 비어 있다. 줄은 다시 나누지 않는다.
+    std::vector<LineLabel> lineLabels(const Node& node, const std::vector<Mark>& marks) const;
+
     struct LinePlacement {
         LineFit fit;
         std::vector<std::int32_t> at;  // 마크 왼쪽
         std::int32_t end = 0;          // 마지막 마크 오른쪽. 마크가 없으면 들여쓰기 자리
+        // 조판 부호 이름표와 그 왼쪽(줄 x 에서 잰 HU). 이름표 폭은 뒤 마크와 end 를 민다.
+        std::vector<LineLabel> labels;
+        std::vector<std::int32_t> labelAt;
     };
     LinePlacement placeLine(const Node& node, const std::vector<Mark>& marks) const;
 
@@ -829,6 +852,33 @@ struct Painter {
     void drawHeading(const Node& line, std::int32_t x, std::int32_t y, std::int32_t shift, std::int32_t slide);
 
     void line(const Node& node, std::int32_t x, std::int32_t y, bool inObject);
+    // 투명 선(보기 표시) 한 줄. 표 칸·글상자의 선 없는 변이다.
+    void strokeTransparent(std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1);
+    // 교정 부호 한 줄 몫. x0·x1 은 줄 x 에서 잰 HU(범위 시작·끝, 자리만 있는 부호는 x0 하나)이고, head·tail 은 범위의
+    // 처음·끝이 이 줄에 있는지다. lineLeft 는 줄 머리(첫 마크 자리)다.
+    struct ProofSpan {
+        model::ProofKind kind = model::ProofKind::None;
+        int sign = 0;
+        std::string text;
+        std::int32_t x0 = 0;
+        std::int32_t x1 = 0;
+        std::int32_t lineLeft = 0;
+        bool head = false;
+        bool tail = false;
+        std::uint32_t charShapeId = 0;
+        std::int32_t split = -1;     // 자리 바꿈표: 이 줄 안 가른 자리(%spl). 없으면 -1
+        std::int32_t lineRight = 0;  // 줄 오른쪽 끝(줄 x 기준). 줄 서로 바꿈표가 쓴다
+        std::int32_t moveStart = 0;  // 자리 옮김표: 시작 위치·간격(HWPUNIT, 줄 머리에서)
+        std::int32_t moveGap = 0;
+    };
+    std::vector<ProofSpan> lineProofs(const Node& node, const std::vector<Mark>& marks, const LinePlacement& place) const;
+    void drawProofMarks(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
+                        const LinePlacement& place);
+    // 글 뒤에 까는 교정 부호 바탕(자료 연결의 회색). 글자보다 먼저 그린다.
+    void drawProofBackgrounds(const Node& node, std::int32_t x, std::int32_t y, const LinePlacement& place);
+    // 보기 표시: 문단 부호(↵ ↓)와 조판 부호(빈칸 ∨, 탭 ⇥, [이름표]). 화면에만 그린다.
+    void drawLineMarks(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
+                       const LinePlacement& place);
 
     void strokePageBorderNode(const Node& node, std::int32_t x, std::int32_t y);
 

@@ -428,6 +428,18 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
     }
 }
 
+namespace {
+// 글이 든 개체(글상자). 안쪽에 글 묶음 줄이 있다.
+bool holdsText(const Node& node) {
+    for (const Node& child : node.children) {
+        if (child.kind == NodeKind::Object) continue;
+        if ((child.kind == NodeKind::Line || child.kind == NodeKind::Paragraph) && child.story > 0) return true;
+        if (holdsText(child)) return true;
+    }
+    return false;
+}
+}  // namespace
+
 void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
     const PaintLayer place = objectPlace(node);
     if (node.ext().obj().shapeType == "ellipse" || node.ext().obj().shapeType == "arc") {
@@ -455,6 +467,15 @@ void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
         return;
     }
     box(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, node.role, place);
+    // 투명 선: 선이 없는 글상자(글이 든 도형) 테두리.
+    const BorderEdge& edge = node.ext().borderLeft;
+    if (node.role == "shape" && (edge.type.empty() || edge.type == "NONE") && shownMarks().transparent && !placesOnly &&
+        show(frameStroke()) && holdsText(node)) {
+        strokeTransparent(x, y, x + node.width, y);
+        strokeTransparent(x, y + node.height, x + node.width, y + node.height);
+        strokeTransparent(x, y, x, y + node.height);
+        strokeTransparent(x + node.width, y, x + node.width, y + node.height);
+    }
 }
 
 }  // namespace chwp::render::paint_detail

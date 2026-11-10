@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "chwp/common/unicode.hpp"
+#include "chwp/model/memo.hpp"
+#include "chwp/model/proofreading.hpp"
 #include "chwp/unit.hpp"
 #include "chwp/container/cfb.hpp"
 #include "chwp/hwp/records.hpp"
@@ -145,6 +147,7 @@ namespace {
 using namespace chwp::model;
 
 constexpr char kSignature[] = "HWP Document File";
+constexpr std::uint16_t kCellNameItem = 0x4000;  // 셀 필드 이름 파라미터 아이템
 
 constexpr std::uint32_t kFlagCompressed = 1u << 0;
 constexpr std::uint32_t kFlagEncrypted = 1u << 1;
@@ -533,7 +536,8 @@ private:
     void parseCaption(const RecordTree& tree, const RecordTree::Node& node, Control& control);
     void collectSubLists(const RecordTree& tree, const RecordTree::Node& node,
                          std::vector<SubList>& out);
-    void parseMasterPages(const RecordTree& tree, const RecordTree::Node& node, Control& control);
+    void parseMasterPages(const RecordTree& tree, const RecordTree::Node& node, Control& control, std::uint32_t secdAttr);
+    SubList readMasterList(const RecordTree& tree, const RecordTree::Node& node);
     static Placement readPlacement(ByteReader& r);
     static PageDef readPageDef(ByteView data);
 
@@ -548,6 +552,11 @@ private:
     cfb::CompoundFile cfb_;
     std::uint32_t flags_ = 0;
     std::vector<BinStorage> binStorage_;
+    // 구역 끝(마지막 문단 자식)의 마지막 쪽·임의 쪽 바탕쪽. parseSection 이 구역에 붙인다.
+    std::vector<SubList> extMasters_;
+    // 마지막 구역 끝의 메모 글(메모 번호, 글). 모든 구역을 읽은 뒤 번호가 같은 메모 필드에 붙인다.
+    std::vector<std::pair<std::uint32_t, SubList>> memoTexts_;
+    void attachMemos();
     std::size_t orphanControlChars_ = 0;
     std::size_t mismatchedControlChars_ = 0;
 };
@@ -611,12 +620,46 @@ bool Parser::run() {
              " control characters whose ctrlId does not match any CTRL_HEADER");
     }
 
+    attachMemos();
     parseSummaryInformation();
     parsePreviewText();
     loadBinData();
 
     result_.ok = true;
     return true;
+}
+
+// 메모 글(MEMO_LIST 번호)을 메모 필드에 붙이고, MemoExtended 흐름(태그 101: 개수, (답글 id, 원 id)…)으로 답글을 단다.
+void Parser::attachMemos() {
+    std::vector<Control*> memos = collectMemos(doc_);
+    for (auto& [number, text] : memoTexts_) {
+        for (Control* memo : memos) {
+            if (memo->memoNumber != number || !memo->subLists.empty()) continue;
+            text.vertAlign = "TOP";
+            memo->subLists.push_back(std::move(text));
+            break;
+        }
+    }
+    memoTexts_.clear();
+    Bytes extended;
+    if (!memos.empty() && loadStream("MemoExtended", doc_.format.compressed, extended)) {
+        std::vector<Record> records;
+        std::string error;
+        if (parseRecords(extended, records, &error)) {
+            for (const Record& rec : records) {
+                if (rec.tag != 101) continue;
+                ByteReader r(rec.data);
+                const std::uint32_t count = r.remaining() >= 4 ? r.u32() : 0;
+                for (std::uint32_t i = 0; i < count && r.remaining() >= 8; ++i) {
+                    const std::uint32_t id = r.u32();
+                    const std::uint32_t parent = r.u32();
+                    for (Control* memo : memos) {
+                        if (memo->fieldId == id) memo->memoParentId = parent;
+                    }
+                }
+            }
+        }
+    }
 }
 
 const cfb::Entry* Parser::findEntry(std::string_view path, bool ignoreCase) const {
@@ -731,6 +774,31 @@ void Parser::parseDocInfo(ByteView stream) {
             case tag::ParaShape: parseParaShape(r); break;
             case tag::TabDef: parseTabDef(r); break;
             case tag::Style: parseStyle(r); break;
+            case tag::MemoShape: {
+                // 메모 모양 22바이트: 너비, 선 종류, 선 굵기, 선 색, 채우기 색, 활성 채우기 색, 메모 종류.
+                // 너비가 0 이면 한글은 기본값 전체로 바꾼다.
+                MemoShape shape;
+                if (r.remaining() >= 22) {
+                    const std::uint32_t width = r.u32();
+                    const std::uint8_t lineType = r.u8();
+                    const std::uint8_t lineWidth = r.u8();
+                    const Color line = fromColorRef(r.u32());
+                    const Color fill = fromColorRef(r.u32());
+                    const Color active = fromColorRef(r.u32());
+                    const std::uint32_t memoType = r.u32();
+                    if (width > 0) {
+                        shape.width = width;
+                        shape.lineType = lineType;
+                        shape.lineWidth = lineWidth;
+                        shape.lineColor = hexColor(line);
+                        shape.fillColor = hexColor(fill);
+                        shape.activeColor = hexColor(active);
+                        shape.memoType = memoType;
+                    }
+                }
+                h.memoShapes.push_back(shape);
+                break;
+            }
             default: {
                 KeptRecord kept;
                 kept.tag = rec.tag;
@@ -984,6 +1052,7 @@ void Parser::parseParaShape(ByteReader& r) {
     ps.borderIgnoreMargin = ((attr1 >> 29) & 0x1) != 0;
     ps.autoSpacingEng = ((attr2 >> 4) & 0x1) != 0;
     ps.autoSpacingNum = ((attr2 >> 5) & 0x1) != 0;
+    ps.suppressLineNumbers = ((attr2 >> 6) & 0x1) != 0;
     static const char* wraps[] = {"BREAK", "SQUEEZE", "KEEP"};
     const std::uint32_t wrap = attr2 & 0x3;
     if (wrap < std::size(wraps)) ps.lineWrap = wraps[wrap];
@@ -1047,7 +1116,18 @@ void Parser::parseBinData(ByteReader& r) {
 // BodyText
 // ---------------------------------------------------------------------------
 
+MasterPage masterFromList(const SubList& list) {
+    MasterPage master;
+    master.applyPageType = list.applyPageType.empty() ? "BOTH" : list.applyPageType;
+    master.pageNumber = list.masterPageNumber;
+    master.duplicate = list.masterDuplicate;
+    master.printOnTop = list.masterFront;
+    master.content = list;
+    return master;
+}
+
 void Parser::parseSection(ByteView stream, Section& section) {
+    extMasters_.clear();
     std::vector<Record> records;
     std::string error;
     if (!parseRecords(stream, records, &error)) warn("BodyText: " + error);
@@ -1080,19 +1160,25 @@ void Parser::parseSection(ByteView stream, Section& section) {
                     section.hideFirstFooter = item.control.hideFirstFooter;
                     section.hideFirstMaster = item.control.hideFirstMaster;
                     section.hideFirstPageNum = item.control.hideFirstPageNum;
+                    section.startsOn = item.control.startsOn;
+                    section.pictureStart = item.control.pictureStart;
+                    section.tableStart = item.control.tableStart;
+                    section.equationStart = item.control.equationStart;
+                    section.borderShow = item.control.borderShow;
+                    section.fillShow = item.control.fillShow;
+                    section.hideFirstEmptyLine = item.control.hideFirstEmptyLine;
+                    section.lineNumbers = item.control.lineNumbers;
+                    section.memoShapeId = item.control.memoShapeId;
                     section.footnote = item.control.footnoteShape;
                     section.endnote = item.control.endnoteShape;
                     section.pageBorders = item.control.pageBorders;
-                    for (const auto& list : item.control.subLists) {
-                        MasterPage master;
-                        master.applyPageType = list.applyPageType.empty() ? "BOTH" : list.applyPageType;
-                        master.content = list;
-                        section.masterPages.push_back(std::move(master));
-                    }
+                    for (const auto& list : item.control.subLists) section.masterPages.push_back(masterFromList(list));
                 }
             }
         }
     }
+    for (const SubList& list : extMasters_) section.masterPages.push_back(masterFromList(list));
+    extMasters_.clear();
 }
 
 Paragraph Parser::parseParagraph(const RecordTree& tree, std::size_t index) {
@@ -1121,8 +1207,13 @@ Paragraph Parser::parseParagraph(const RecordTree& tree, std::size_t index) {
     };
     std::vector<RangeTag> ranges;
     std::vector<std::size_t> controls;
+    std::uint16_t lastTag = 0;
+    bool inExtMaster = false;
+    bool inMemo = false;
     for (std::size_t child : node.children) {
         const Record& rec = *tree.at(child).record;
+        const std::uint16_t prevTag = lastTag;
+        lastTag = rec.tag;
         switch (rec.tag) {
             case tag::ParaText: text = rec.data; break;
             case tag::ParaCharShape: {
@@ -1147,6 +1238,33 @@ Paragraph Parser::parseParagraph(const RecordTree& tree, std::size_t index) {
                 break;
             }
             default: {
+                // 마지막 쪽·임의 쪽 바탕쪽은 구역 마지막 문단의 자식 리스트 머리와 뒤따르는 문단(같은 레벨)이다.
+                // 메모 글도 같은 모양이지만 리스트 머리 앞에 메모 목록(MEMO_LIST)이 온다.
+                if (rec.tag == tag::MemoList) {
+                    // 메모 글: MEMO_LIST(메모 번호), LIST_HEADER, 문단(같은 레벨)이 메모마다 온다.
+                    ByteReader m(rec.data);
+                    memoTexts_.push_back({m.remaining() >= 4 ? m.u32() : 0u, SubList{}});
+                    inExtMaster = false;
+                    inMemo = true;
+                    break;
+                }
+                if (rec.tag == tag::ListHeader && prevTag == tag::MemoList && inMemo) break;
+                if (rec.tag == tag::ListHeader && prevTag != tag::MemoList) {
+                    extMasters_.push_back(readMasterList(tree, tree.at(child)));
+                    inExtMaster = true;
+                    inMemo = false;
+                    break;
+                }
+                if (rec.tag == tag::ParaHeader && inExtMaster) {
+                    Paragraph extPara = parseParagraph(tree, child);
+                    extMasters_.back().paragraphs.push_back(std::move(extPara));
+                    break;
+                }
+                if (rec.tag == tag::ParaHeader && inMemo) {
+                    Paragraph memoPara = parseParagraph(tree, child);
+                    memoTexts_.back().second.paragraphs.push_back(std::move(memoPara));
+                    break;
+                }
                 KeptRecord kept;
                 kept.tag = rec.tag;
                 kept.data.assign(rec.data.begin(), rec.data.end());
@@ -1271,6 +1389,14 @@ Paragraph Parser::parseParagraph(const RecordTree& tree, std::size_t index) {
                 break;
             case CharKind::Inline:
                 if (ch == 9) pending.push_back(MarkedChar{u'\t', i});
+                if (ch == 4) {
+                    // 필드 끝. 버리면 저장한 하이퍼링크가 범위를 잃는다.
+                    flushText();
+                    Control end;
+                    end.kind = ControlKind::FieldEnd;
+                    end.ctrlId = "fend";
+                    current.items.push_back(InlineItem::makeControl(std::move(end)));
+                }
                 i += 8;
                 break;
             case CharKind::Extended: {
@@ -1280,6 +1406,14 @@ Paragraph Parser::parseParagraph(const RecordTree& tree, std::size_t index) {
                 if ((i + 3) * 2 <= text.size()) ctrlId = readU32LE(text.data() + (i + 1) * 2);
                 if (const auto k = matcher.match(ctrlId)) {
                     InlineItem item = InlineItem::makeControl(parseControl(tree, controls[*k]));
+                    // 한글은 메모 등 HWP 5.0 규격 뒤에 생긴 필드의 CTRL_HEADER 를 %unk 로 쓰고 글 쪽에 진짜 id 를 둔다.
+                    // 종류는 글 쪽 id 다.
+                    if (item.control.kind == ControlKind::Field && item.control.ctrlId == "%unk" && ctrlId) {
+                        item.control.ctrlId = ctrlIdToString(*ctrlId);
+                    }
+                    if (!isMemoField(item.control) && proofKindOf(item.control) == ProofKind::None) {
+                        item.control.memoNumber = 0;
+                    }
                     item.markpen = markpenOver(i, i + 8);
                     current.items.push_back(std::move(item));
                 } else {
@@ -1436,15 +1570,34 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
             c.kind = ControlKind::SectionDef;
             if (r.remaining() >= 4) {
                 const std::uint32_t attr = r.u32();
-                c.hideHeader = (attr & 0x1) != 0;
-                c.hideFooter = (attr & 0x2) != 0;
-                c.hideMaster = (attr & 0x4) != 0;
-                c.hidePageNum = (attr & 0x20) != 0;
+                // 비트 0·1·2·5 는 첫 쪽에만 감추기다(한글 2024: HWPX visibility hideFirst* 와 같은 값으로 저장).
+                c.hideFirstHeader = (attr & 0x1) != 0;
+                c.hideFirstFooter = (attr & 0x2) != 0;
+                c.hideFirstMaster = (attr & 0x4) != 0;
+                c.hideFirstPageNum = (attr & 0x20) != 0;
+                c.borderShow = (attr & 0x8) ? "HIDE_FIRST" : ((attr & 0x100) ? "SHOW_FIRST" : "SHOW_ALL");
+                c.fillShow = (attr & 0x10) ? "HIDE_FIRST" : ((attr & 0x200) ? "SHOW_FIRST" : "SHOW_ALL");
+                c.hideFirstEmptyLine = (attr & (1u << 19)) != 0;
+                c.lineNumbers.show = (attr & (1u << 24)) != 0;
+                // 줄 번호: 47바이트 레코드의 38번째 바이트부터 restart, countBy, distance, start(숨긴 한글 2024 로 확인).
+                if (node.record->data.size() >= 47) {
+                    ByteReader ln(node.record->data);
+                    ln.seek(38);
+                    c.lineNumbers.restart = ln.u8();
+                    c.lineNumbers.countBy = ln.u16();
+                    c.lineNumbers.distance = ln.u32();
+                    c.lineNumbers.start = ln.u16();
+                }
+                c.startsOn = static_cast<std::uint8_t>((attr >> 20) & 0x3);
                 c.wongoji = (attr & (1u << 22)) != 0;
                 c.textDirection = static_cast<std::uint8_t>(std::min<std::uint32_t>((attr >> 16) & 0x7, 2));
                 c.sectionAttrKeep = attr & ~kSecdKnownBits;
                 // 한글 2024 는 속성 비트 16–18 을 비우고, 47바이트 레코드의 36번째 바이트에 방향 × 2 를 둔다.
-                // 가로 00, 세로(영문 눕힘) 02, 세로(영문 세움) 04 (tools/hwp_records.py 로 확인).
+                // 가로 00, 세로(영문 눕힘) 02, 세로(영문 세움) 04 (한글 2024 로 확인).
+                // 34번째 바이트(u16)는 구역 메모 모양 번호(1 부터, 0 기본)다(HWPX secPr@memoShapeIDRef 와 같다).
+                if (node.record->data.size() >= 36) {
+                    c.memoShapeId = static_cast<std::uint16_t>(node.record->data[34] | (node.record->data[35] << 8));
+                }
                 if (node.record->data.size() > 36) {
                     const unsigned ext = (node.record->data[36] >> 1) & 0x3u;
                     if (ext != 0 || c.textDirection == 0) c.textDirection = static_cast<std::uint8_t>(std::min(ext, 2u));
@@ -1459,6 +1612,11 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                     if (r.remaining() >= 4) {
                         r.u16();
                         c.number = r.u16();
+                    }
+                    if (r.remaining() >= 6) {
+                        c.pictureStart = r.u16();
+                        c.tableStart = r.u16();
+                        c.equationStart = r.u16();
                     }
                 }
             }
@@ -1483,7 +1641,15 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                     }
                 }
             }
-            parseMasterPages(tree, node, c);
+            {
+                std::uint32_t secdAttr = 0;
+                if (node.record->data.size() >= 8) {
+                    ByteReader head(node.record->data);
+                    head.u32();
+                    secdAttr = head.u32();
+                }
+                parseMasterPages(tree, node, c, secdAttr);
+            }
             break;
         case kCtrlCold:
             c.kind = ControlKind::ColumnDef;
@@ -1492,7 +1658,8 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                 c.columnCount = (attr >> 2) & 0xFF;
                 c.columnSameSize = ((attr >> 12) & 1) != 0;
                 const int kind = attr & 0x3;
-                c.columnType = kind == 2 ? "PARALLEL" : kind == 1 ? "NEWSPAPER" : "NORMAL";
+                // 단 종류 0 일반, 1 배분, 2 평행. 이름은 HWPX(OWPML)와 같다.
+                c.columnType = kind == 2 ? "PARALLEL" : kind == 1 ? "BALANCED_NEWSPAPER" : "NEWSPAPER";
                 const int dir = (attr >> 10) & 0x3;
                 c.columnLayout = dir == 1 ? "RIGHT" : dir == 2 ? "BOTH" : "LEFT";
             }
@@ -1608,6 +1775,8 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                 c.hideHeader = (attr & 0x01) != 0;
                 c.hideFooter = (attr & 0x02) != 0;
                 c.hideMaster = (attr & 0x04) != 0;
+                c.hideBorder = (attr & 0x08) != 0;
+                c.hideFill = (attr & 0x10) != 0;
                 c.hidePageNum = (attr & 0x20) != 0;
             }
             break;
@@ -1622,10 +1791,14 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
                     "OUTSIDE_BOTTOM", "INSIDE_TOP", "INSIDE_BOTTOM"};
                 const unsigned place = (attr >> 8) & 0xF;
                 c.pageNumPos = place < std::size(places) ? places[place] : "NONE";
+                // 사용자 기호, 앞·뒤 장식 문자, 줄표(HWPX sideChar) 차례다. 한글 2024 는 앞의 셋을 0 으로 두고
+                // 줄표 넣기를 켜면 넷째에 '-' 를 쓴다(한글 2024 로 확인). 줄표는 번호 앞뒤에 붙는다.
                 if (r.remaining() >= 6) {
                     r.u16();
                     c.prefix = oneWchar(r);
                     c.suffix = oneWchar(r);
+                    const std::string side = oneWchar(r);
+                    if (!side.empty()) c.prefix = c.suffix = side;
                 }
             }
             break;
@@ -1645,17 +1818,34 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
             c.kind = ControlKind::Dutmal;
             c.text = r.hwpString();
             c.subText = r.hwpString();
+            if (r.remaining() >= 20) {
+                c.dutmalPos = dutmalPosName(r.u32());
+                c.dutmalSizeRatio = r.u32();
+                c.dutmalOption = r.u32();
+                c.dutmalStyle = r.u32();
+                c.dutmalAlign = dutmalAlignName(r.u32());
+            }
             break;
         case kCtrlCompose:
             c.kind = ControlKind::Compose;
             c.text = r.hwpString();
+            if (r.remaining() >= 4) {
+                c.composeCircle = composeCircleName(r.u8());
+                c.composeCharSize = r.i8();
+                c.composeType = r.u8() == 0 ? "SPREAD" : "OVERLAP";
+                const std::uint8_t count = r.u8();
+                for (std::uint8_t i = 0; i < count && r.remaining() >= 4; ++i) c.composeCharShapes.push_back(r.u32());
+            }
             break;
         default:
             if (c.ctrlId[0] == '%') {
                 c.kind = ControlKind::Field;
-                r.u32();  // 속성
-                r.u8();   // 기타 속성
+                c.fieldProps = r.u32();  // 속성
+                c.fieldExtra = r.u8();   // 기타 속성
                 c.command = r.hwpString();
+                // 명령 뒤 u32 필드 고유 id, 메모 필드는 그 뒤 u32 메모 번호(MEMO_LIST 짝).
+                if (r.remaining() >= 4) c.fieldId = r.u32();
+                if (r.remaining() >= 4) c.memoNumber = r.u32();
                 if (const Record* data = findChild(tree, node, tag::CtrlData)) {
                     c.name = detail::findParameterString(data->data, detail::kParamItemName)
                                  .value_or("");
@@ -2036,6 +2226,16 @@ void Parser::parseTable(const RecordTree& tree, const RecordTree::Node& node, Co
             cell.marginTop = r.u16();
             cell.marginBottom = r.u16();
             cell.borderFillId = r.u16();
+            // 셀 필드 이름: 글 폭(u32) 뒤 바이트가 0 이 아니면 파라미터 셋(ID 0x021b)이 오고, 아이템 0x4000 문자열이
+            // 이름이다. 이름이 없으면 한글은 0 만 쓴다(숨긴 한글 2024 로 저장해 확인).
+            if (r.remaining() >= 5) {
+                r.skip(4);
+                if (r.u8() != 0) {
+                    if (auto name = detail::findParameterString(ByteView(rec.data).subspan(r.position()), kCellNameItem)) {
+                        cell.name = std::move(*name);
+                    }
+                }
+            }
             for (std::size_t grand : childNode.children) {
                 if (tree.at(grand).record->tag == tag::ParaHeader) {
                     cell.content.paragraphs.push_back(parseParagraph(tree, grand));
@@ -2049,41 +2249,72 @@ void Parser::parseTable(const RecordTree& tree, const RecordTree::Node& node, Co
     control.table = std::move(table);
 }
 
-void Parser::parseMasterPages(const RecordTree& tree, const RecordTree::Node& node, Control& control) {
-    static const char* pageTypes[] = {"BOTH", "EVEN", "ODD", "BOTH"};
+// 바탕쪽 리스트 머리(34바이트, 숨긴 한글 2024 로 저장해 확인): 문단 수, 속성, 글 너비, 글 높이, u16 0,
+// u32 종류(0 양쪽·홀수·짝수, 3 구역 마지막 쪽, 3+n 구역 안 n 번째 쪽), u32 비트(1 겹치게 하기, 2 인쇄 시 맨 위).
+SubList Parser::readMasterList(const RecordTree& tree, const RecordTree::Node& node) {
+    SubList list;
+    ByteReader header(node.record->data);
+    if (header.remaining() >= 8) {
+        header.u32();
+        const std::uint32_t attr = header.u32();
+        const unsigned valign = (attr >> 5) & 0x3;
+        if (valign == 1) list.vertAlign = "CENTER";
+        else if (valign == 2) list.vertAlign = "BOTTOM";
+        static const char* pageTypes[] = {"BOTH", "EVEN", "ODD", "BOTH"};
+        list.applyPageType = pageTypes[attr & 0x3];
+        if (header.remaining() >= 8) {
+            list.textWidth = header.u32();
+            list.textHeight = header.u32();
+        }
+        if (header.remaining() >= 10) {
+            header.u16();
+            const std::uint32_t code = header.u32();
+            const std::uint32_t bits = header.u32();
+            if (code == 3) {
+                list.applyPageType = "LAST_PAGE";
+            } else if (code > 3) {
+                list.applyPageType = "OPTIONAL_PAGE";
+                list.masterPageNumber = code - 3;
+            }
+            list.masterDuplicate = (bits & 0x1u) != 0;
+            list.masterFront = (bits & 0x2u) != 0;
+        }
+    }
+    for (std::size_t grand : node.children) {
+        if (tree.at(grand).record->tag == tag::ParaHeader) list.paragraphs.push_back(parseParagraph(tree, grand));
+    }
+    return list;
+}
+
+// 구역 정의 아래 바탕쪽(양쪽·짝수·홀수). 종류는 구역 정의 속성 비트 29·30·31 이 있는 차례다. 비트 수가 리스트 수와
+// 다르면(옛 저장) 리스트 머리 속성 아래 두 비트를 쓴다.
+void Parser::parseMasterPages(const RecordTree& tree, const RecordTree::Node& node, Control& control,
+                              std::uint32_t secdAttr) {
+    std::vector<SubList> lists;
     for (std::size_t child : node.children) {
         const auto& childNode = tree.at(child);
         const std::uint16_t t = childNode.record->tag;
         if (t == tag::ListHeader) {
-            SubList list;
-            ByteReader header(childNode.record->data);
-            if (header.remaining() >= 8) {
-                header.u32();
-                const std::uint32_t attr = header.u32();
-                const unsigned valign = (attr >> 5) & 0x3;
-                if (valign == 1) list.vertAlign = "CENTER";
-                else if (valign == 2) list.vertAlign = "BOTTOM";
-                list.applyPageType = pageTypes[attr & 0x3];
-                if (header.remaining() >= 8) {
-                    list.textWidth = header.u32();
-                    list.textHeight = header.u32();
-                }
-            }
-            if (list.applyPageType.empty()) list.applyPageType = "BOTH";
-            control.subLists.push_back(std::move(list));
-            for (std::size_t grand : childNode.children) {
-                if (tree.at(grand).record->tag == tag::ParaHeader) {
-                    control.subLists.back().paragraphs.push_back(parseParagraph(tree, grand));
-                }
-            }
+            lists.push_back(readMasterList(tree, childNode));
         } else if (t == tag::ParaHeader) {
-            if (control.subLists.empty()) {
+            if (lists.empty()) {
                 SubList list;
                 list.applyPageType = "BOTH";
-                control.subLists.push_back(std::move(list));
+                lists.push_back(std::move(list));
             }
-            control.subLists.back().paragraphs.push_back(parseParagraph(tree, child));
+            lists.back().paragraphs.push_back(parseParagraph(tree, child));
         }
+    }
+    std::vector<const char*> kinds;
+    if (secdAttr & (1u << 29)) kinds.push_back("BOTH");
+    if (secdAttr & (1u << 30)) kinds.push_back("EVEN");
+    if (secdAttr & (1u << 31)) kinds.push_back("ODD");
+    if (kinds.size() == lists.size()) {
+        for (std::size_t i = 0; i < lists.size(); ++i) lists[i].applyPageType = kinds[i];
+    }
+    for (SubList& list : lists) {
+        if (list.applyPageType.empty()) list.applyPageType = "BOTH";
+        control.subLists.push_back(std::move(list));
     }
 }
 

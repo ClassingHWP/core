@@ -11,12 +11,25 @@
 #include <unordered_set>
 
 #include "chwp/container/zip.hpp"
+#include "chwp/model/table_formula.hpp"
+#include "chwp/model/memo.hpp"
+#include "chwp/model/proofreading.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/unit.hpp"
 
 namespace chwp::hwpx {
 
 namespace {
+
+// 필드 시작·끝 짝. 시작마다 번호를 주고, 끝은 아직 닫히지 않은 마지막 시작을 가리킨다(문서마다 새로 센다).
+struct FieldIds {
+    std::uint32_t next = 1;
+    std::vector<std::uint32_t> open;
+    // 메모: 문서 차례 번호(1 부터)와 필드 고유 id. 쓰기 처음에 매긴다(답글 관계가 id 를 쓴다).
+    std::unordered_map<const chwp::model::Control*, std::uint32_t> memoNumber;
+    std::unordered_map<const chwp::model::Control*, std::uint32_t> memoId;
+};
+thread_local FieldIds gFieldIds;
 
 using namespace chwp::model;
 
@@ -106,6 +119,7 @@ const char* toHwpxPictureEffect(int effect) {
 }
 
 const char* toHwpxFieldType(std::string_view ctrlId) {
+    if (const char* proof = proofHwpxType(ctrlId)) return proof;
     if (ctrlId == "%hlk") return "HYPERLINK";
     if (ctrlId == "%clk") return "CLICK_HERE";
     if (ctrlId == "%bmk") return "BOOKMARK";
@@ -116,7 +130,7 @@ const char* toHwpxFieldType(std::string_view ctrlId) {
     if (ctrlId == "%xrf") return "CROSSREF";
     if (ctrlId == "%mmg") return "MAILMERGE";
     if (ctrlId == "%%me") return "MEMO";
-    if (ctrlId == "%smr") return "SUMMARY";
+    if (ctrlId == "%smr") return "SUMMERY";  // 한글 2024 가 쓰는 철자 그대로(SUMMARY 가 아니다)
     if (ctrlId == "%usr") return "USER_INFO";
     return "HYPERLINK";
 }
@@ -519,7 +533,7 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
         pp.append_attribute("condense") = ps.condense;
         pp.append_attribute("fontLineHeight") = ps.fontLineHeight ? 1 : 0;
         pp.append_attribute("snapToGrid") = ps.snapToGrid ? 1 : 0;
-        pp.append_attribute("suppressLineNumbers") = 0;
+        pp.append_attribute("suppressLineNumbers") = ps.suppressLineNumbers ? 1 : 0;
         pp.append_attribute("checked") = ps.checked ? 1 : 0;
 
         auto align = pp.append_child("hh:align");
@@ -610,6 +624,29 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
         st.append_attribute("nextStyleIDRef") = sd.nextStyleId;
         st.append_attribute("langID") = sd.langId != 0 ? sd.langId : 1042;
         st.append_attribute("lockForm") = 0;
+    }
+
+    // 9. 메모 모양(id 1 부터). 없으면 쓰지 않는다(한글 2024).
+    if (!h.memoShapes.empty()) {
+        auto memos = refList.append_child("hh:memoProperties");
+        memos.append_attribute("itemCnt") = static_cast<unsigned>(h.memoShapes.size());
+        static const char* lineTypes[] = {"NONE", "SOLID", "DOT", "DASH", "DASH_DOT", "DASH_DOT_DOT",
+                                          "LONG_DASH", "CIRCLE", "DOUBLE_SLIM", "SLIM_THICK", "THICK_SLIM",
+                                          "SLIM_THICK_SLIM", "WAVE", "DOUBLEWAVE", "THICK3D", "THICKREV3D",
+                                          "3D", "REV3D"};
+        static const char* memoTypes[] = {"NOMAL", "USER_INSERT", "USER_DELETE", "USER_UPDATE"};
+        for (std::size_t i = 0; i < h.memoShapes.size(); ++i) {
+            const MemoShape& m = h.memoShapes[i];
+            auto pr = memos.append_child("hh:memoPr");
+            pr.append_attribute("id") = static_cast<unsigned>(i + 1);
+            pr.append_attribute("width") = m.width;
+            pr.append_attribute("lineWidth") = static_cast<unsigned>(m.lineWidth);
+            pr.append_attribute("lineType") = lineTypes[std::min<std::size_t>(m.lineType, std::size(lineTypes) - 1)];
+            pr.append_attribute("lineColor") = m.lineColor.c_str();
+            pr.append_attribute("fillColor") = m.fillColor.c_str();
+            pr.append_attribute("activeColor") = m.activeColor.c_str();
+            pr.append_attribute("memoType") = memoTypes[std::min<std::uint32_t>(m.memoType & 0x77FFFFFFu, 3u)];
+        }
     }
 
     return serializeXml(xml);
@@ -739,7 +776,8 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
     secPr.append_attribute("tabStopVal") = defaultTab;
     secPr.append_attribute("tabStopUnit") = "HWPUNIT";
     secPr.append_attribute("outlineShapeIDRef") = 1;
-    secPr.append_attribute("memoShapeIDRef") = 0;
+    secPr.append_attribute("memoShapeIDRef") =
+        static_cast<unsigned>(secPtr ? secPtr->memoShapeId : (secCtrl ? secCtrl->memoShapeId : 0));
     secPr.append_attribute("textVerticalWidthHead") = 0;
     secPr.append_attribute("masterPageCnt") =
         static_cast<unsigned>(secPtr ? secPtr->masterPages.size() : 0);
@@ -749,22 +787,45 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
     grid.append_attribute("charGrid") = charGrid;
     grid.append_attribute("wonggojiFormat") = wongoji ? 1 : 0;
 
+    // 구역 설정은 구역 값이 기준이다. 구역이 없으면 구역 정의 컨트롤 값이다.
+    struct SectionSetting {
+        std::uint8_t startsOn = 0;
+        std::uint16_t pic = 0, tbl = 0, eq = 0;
+        std::string border = "SHOW_ALL", fill = "SHOW_ALL";
+        bool emptyLine = false;
+        LineNumberShape lineNumbers;
+    } setting;
+    if (secPtr) {
+        setting = {secPtr->startsOn, secPtr->pictureStart, secPtr->tableStart, secPtr->equationStart,
+                   secPtr->borderShow, secPtr->fillShow, secPtr->hideFirstEmptyLine, secPtr->lineNumbers};
+    } else if (secCtrl) {
+        setting = {secCtrl->startsOn, secCtrl->pictureStart, secCtrl->tableStart, secCtrl->equationStart,
+                   secCtrl->borderShow, secCtrl->fillShow, secCtrl->hideFirstEmptyLine, secCtrl->lineNumbers};
+    }
     auto startNum = secPr.append_child("hp:startNum");
-    startNum.append_attribute("pageStartsOn") = "BOTH";
+    // 한글 2024: 0 이어서 BOTH, 1 짝수 EVEN, 2 홀수 ODD, 3 사용자(쓰지 않음). 옛 모델은 사용자 번호만 있었다.
+    const unsigned startsOn = pageStart > 0 && setting.startsOn == 0 ? 3u : setting.startsOn;
+    if (startsOn != 3) startNum.append_attribute("pageStartsOn") = startsOn == 1 ? "EVEN" : startsOn == 2 ? "ODD" : "BOTH";
     startNum.append_attribute("page") = pageStart;
-    startNum.append_attribute("pic") = 0;
-    startNum.append_attribute("tbl") = 0;
-    startNum.append_attribute("equation") = 0;
+    startNum.append_attribute("pic") = setting.pic;
+    startNum.append_attribute("tbl") = setting.tbl;
+    startNum.append_attribute("equation") = setting.eq;
 
     auto vis = secPr.append_child("hp:visibility");
     vis.append_attribute("hideFirstHeader") = hideFirstHeader ? 1 : 0;
     vis.append_attribute("hideFirstFooter") = hideFirstFooter ? 1 : 0;
     vis.append_attribute("hideFirstMasterPage") = hideFirstMaster ? 1 : 0;
-    vis.append_attribute("border") = "SHOW_ALL";
-    vis.append_attribute("fill") = "SHOW_ALL";
+    vis.append_attribute("border") = setting.border.empty() ? "SHOW_ALL" : setting.border.c_str();
+    vis.append_attribute("fill") = setting.fill.empty() ? "SHOW_ALL" : setting.fill.c_str();
     vis.append_attribute("hideFirstPageNum") = hideFirstPageNum ? 1 : 0;
-    vis.append_attribute("hideFirstEmptyLine") = 0;
-    vis.append_attribute("showLineNumber") = 0;
+    vis.append_attribute("hideFirstEmptyLine") = setting.emptyLine ? 1 : 0;
+    vis.append_attribute("showLineNumber") = setting.lineNumbers.show ? 1 : 0;
+    // 한글 2024 는 visibility 바로 뒤에 줄 번호 모양을 늘 쓴다.
+    auto lineNumberShape = secPr.append_child("hp:lineNumberShape");
+    lineNumberShape.append_attribute("restartType") = static_cast<unsigned>(setting.lineNumbers.restart);
+    lineNumberShape.append_attribute("countBy") = static_cast<unsigned>(setting.lineNumbers.countBy);
+    lineNumberShape.append_attribute("distance") = setting.lineNumbers.distance;
+    lineNumberShape.append_attribute("startNumber") = static_cast<unsigned>(setting.lineNumbers.start);
 
     auto pagePr = secPr.append_child("hp:pagePr");
     pagePr.append_attribute("landscape") = pd.landscape ? "NARROWLY" : "WIDELY";
@@ -781,6 +842,45 @@ void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Sectio
     margin.append_attribute("header") = pd.marginHeader;
     margin.append_attribute("footer") = pd.marginFooter;
     margin.append_attribute("gutter") = pd.marginGutter;
+
+    // 각주·미주 모양(한글 2024 secPr 차례: pagePr, footNotePr, endNotePr, pageBorderFill).
+    for (int fn = 0; fn < 2; ++fn) {
+        const model::NoteShape fallback;
+        const model::NoteShape& shape = secPtr ? (fn == 0 ? secPtr->footnote : secPtr->endnote)
+                                               : (secCtrl ? (fn == 0 ? secCtrl->footnoteShape : secCtrl->endnoteShape)
+                                                          : fallback);
+        auto pr = secPr.append_child(fn == 0 ? "hp:footNotePr" : "hp:endNotePr");
+        auto fmt = pr.append_child("hp:autoNumFormat");
+        // 한글 2024 는 기호 모양(목록 17 번부터)이면 type 을 쓰지 않는다.
+        std::string type = shape.numFormat.empty() ? "DIGIT" : shape.numFormat;
+        if (type == "DECAGON") type = "DECAGON_CIRCLE";
+        if (type == "DECAGON_HANJA") type = "DECAGON_CIRCLE_HANJA";
+        if (type != "SYMBOL" && type != "USER_CHAR") fmt.append_attribute("type") = type.c_str();
+        fmt.append_attribute("userChar") = shape.userChar.c_str();
+        fmt.append_attribute("prefixChar") = shape.prefix.c_str();
+        fmt.append_attribute("suffixChar") = shape.suffix.c_str();
+        fmt.append_attribute("supscript") = shape.contentSuperscript ? 1 : 0;
+        auto line = pr.append_child("hp:noteLine");
+        line.append_attribute("length") = shape.lineLength;
+        line.append_attribute("type") =
+            toHwpxLineType(shape.lineType.empty() ? std::string("NONE") : shape.lineType).c_str();
+        line.append_attribute("width") = toHwpxBorderWidth(shape.lineWidth).c_str();
+        line.append_attribute("color") = shape.lineColor.empty() ? "#000000" : shape.lineColor.c_str();
+        auto spacing = pr.append_child("hp:noteSpacing");
+        spacing.append_attribute("betweenNotes") = shape.between;
+        spacing.append_attribute("belowLine") = shape.below;
+        spacing.append_attribute("aboveLine") = shape.above;
+        auto numbering = pr.append_child("hp:numbering");
+        numbering.append_attribute("type") =
+            shape.numbering == 1 ? "ON_SECTION" : shape.numbering == 2 ? "ON_PAGE" : "CONTINUOUS";
+        numbering.append_attribute("newNum") = shape.startNumber;
+        auto placement = pr.append_child("hp:placement");
+        static const char* const kFootPlaces[] = {"EACH_COLUMN", "MERGED_COLUMN", "RIGHT_MOST_COLUMN"};
+        static const char* const kEndPlaces[] = {"END_OF_DOCUMENT", "END_OF_SECTION"};
+        placement.append_attribute("place") = fn == 0 ? kFootPlaces[std::clamp(shape.place, 0, 2)]
+                                                       : kEndPlaces[std::clamp(shape.place, 0, 1)];
+        placement.append_attribute("beneathText") = shape.beneathText ? 1 : 0;
+    }
 
     const std::array<model::PageBorderFill, 3>* borders = nullptr;
     if (secPtr) borders = &secPtr->pageBorders;
@@ -850,7 +950,7 @@ void writeTableNode(pugi::xml_node parent, const Control& ctrl, const BinRegistr
         auto tr = tblNode.append_child("hp:tr");
         for (const TableCell* c : rCells) {
             auto tc = tr.append_child("hp:tc");
-            tc.append_attribute("name") = "";
+            tc.append_attribute("name") = c->name.c_str();
             tc.append_attribute("header") = c->header ? 1 : 0;
             tc.append_attribute("hasMargin") = c->hasMargin ? 1 : 0;
             tc.append_attribute("protect") = 0;
@@ -1310,8 +1410,8 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
             node.append_attribute("hideHeader") = ctrl.hideHeader ? 1 : 0;
             node.append_attribute("hideFooter") = ctrl.hideFooter ? 1 : 0;
             node.append_attribute("hideMasterPage") = ctrl.hideMaster ? 1 : 0;
-            node.append_attribute("hideBorder") = 0;
-            node.append_attribute("hideFill") = 0;
+            node.append_attribute("hideBorder") = ctrl.hideBorder ? 1 : 0;
+            node.append_attribute("hideFill") = ctrl.hideFill ? 1 : 0;
             node.append_attribute("hidePageNum") = ctrl.hidePageNum ? 1 : 0;
             break;
         }
@@ -1335,13 +1435,70 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
         case ControlKind::Field: {
             auto ctrlNode = runNode.append_child("hp:ctrl");
             auto fb = ctrlNode.append_child("hp:fieldBegin");
-            fb.append_attribute("id") = 0;
+            const bool memo = isMemoField(ctrl);
+            const auto memoId = gFieldIds.memoId.find(&ctrl);
+            const std::uint32_t fieldId = memo && memoId != gFieldIds.memoId.end() ? memoId->second : gFieldIds.next++;
+            gFieldIds.open.push_back(fieldId);
+            fb.append_attribute("id") = fieldId;
             fb.append_attribute("type") = toHwpxFieldType(ctrl.ctrlId);
             fb.append_attribute("name") = ctrl.name.c_str();
+            if (ctrl.fieldProps & 1u) fb.append_attribute("editable") = "1";
+            if (ctrl.fieldProps & 0x8000u) fb.append_attribute("dirty") = "1";
+            if (memo) {
+                // 한글 2024 메모: zorder 는 문서 안 메모 차례, fieldid 는 %%me 의 정수, 매개변수 일곱, 메모 글 subList.
+                const std::uint32_t number = gFieldIds.memoNumber.count(&ctrl) ? gFieldIds.memoNumber[&ctrl] : 1u;
+                MemoCommand cmd = parseMemoCommand(ctrl.command);
+                cmd.number = number;
+                fb.append_attribute("zorder") = number;
+                fb.append_attribute("fieldid") = ctrlIdNumber(ctrl.ctrlId);  // %%me 623209829, 메모 고침표 %%mr
+                auto params = fb.append_child("hp:parameters");
+                params.append_attribute("cnt") = 7;
+                params.append_attribute("name") = "";
+                const auto put = [&](const char* type, const char* name, const std::string& value) {
+                    auto p = params.append_child(type);
+                    p.append_attribute("name") = name;
+                    p.text().set(value.c_str());
+                };
+                put("hp:integerParam", "Prop", std::to_string(static_cast<unsigned>(ctrl.fieldExtra)));
+                put("hp:stringParam", "Command", memoCommandText(cmd));
+                put("hp:stringParam", "ID", (cmd.kind == "MEMO$U" ? "memoc" : "memo") + std::to_string(number));
+                put("hp:integerParam", "Number", std::to_string(number));
+                put("hp:stringParam", "Author", cmd.author);
+                put("hp:stringParam", "MemoShapeIDRef", std::to_string(cmd.shapeRef));
+                put("hp:stringParam", "CreateDateTime", memoCreateDateTime(cmd.created));
+                SubList text = ctrl.subLists.empty() ? SubList{} : ctrl.subLists.front();
+                if (text.paragraphs.empty()) text.paragraphs.emplace_back();
+                writeSubListNode(fb, text, bins);
+                break;
+            }
+            const bool proof = proofKindOf(ctrl) != ProofKind::None;
+            if (proof) {
+                // 한글 2024 교정 부호: zorder 는 차례 번호(%sig 는 -1), fieldid 는 id 네 글자의 정수, Prop 은 늘 둔다.
+                fb.append_attribute("zorder") = ctrl.memoNumber > 0 ? static_cast<int>(ctrl.memoNumber) : -1;
+                fb.append_attribute("fieldid") = ctrlIdNumber(ctrl.ctrlId);
+            }
             auto params = fb.append_child("hp:parameters");
-            auto sp = params.append_child("hp:stringParam");
-            sp.append_attribute("name") = "Command";
-            sp.text().set(ctrl.command.c_str());
+            const auto stringParam = [&](const char* name, const std::string& value) {
+                auto sp = params.append_child("hp:stringParam");
+                sp.append_attribute("name") = name;
+                sp.text().set(value.c_str());
+            };
+            if (ctrl.fieldExtra != 0 || proof) {
+                auto ip = params.append_child("hp:integerParam");
+                ip.append_attribute("name") = "Prop";
+                ip.text().set(static_cast<unsigned>(ctrl.fieldExtra));
+            }
+            stringParam("Command", ctrl.command);
+            // 계산식은 한글처럼 명령을 나눈 식·결과 형식·마지막 결과도 둔다.
+            // 형식이 없는 명령("식;결과")이면 한글처럼 명령 전체를 Formula 로 둔다.
+            if (ctrl.ctrlId == "%fmu") {
+                const FormulaCommand f = parseFormulaCommand(ctrl.command);
+                stringParam("Formula", f.hasFormat ? f.formula : ctrl.command);
+                if (f.hasFormat) {
+                    stringParam("ResultFormat", f.format);
+                    stringParam("LastResult", f.result);
+                }
+            }
             break;
         }
         case ControlKind::HiddenComment: {
@@ -1353,16 +1510,36 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
         }
         case ControlKind::Dutmal: {
             auto dm = runNode.append_child("hp:dutmal");
-            dm.append_attribute("posType") = "TOP";
-            dm.append_attribute("szRatio") = 50;
-            dm.append_attribute("align") = "CENTER";
+            dm.append_attribute("posType") = ctrl.dutmalPos.c_str();
+            dm.append_attribute("szRatio") = ctrl.dutmalSizeRatio;
+            dm.append_attribute("option") = ctrl.dutmalOption;
+            dm.append_attribute("styleIDRef") = ctrl.dutmalStyle;
+            dm.append_attribute("align") = ctrl.dutmalAlign.c_str();
             dm.append_child("hp:mainText").text().set(ctrl.text.c_str());
             dm.append_child("hp:subText").text().set(ctrl.subText.c_str());
             break;
         }
         case ControlKind::Compose: {
             auto cmp = runNode.append_child("hp:compose");
+            std::vector<std::uint32_t> shapes = ctrl.composeCharShapes;
+            if (shapes.size() < 10) shapes.resize(10, 0xFFFFFFFFu);
+            cmp.append_attribute("circleType") = ctrl.composeCircle.c_str();
+            cmp.append_attribute("charSz") = static_cast<int>(ctrl.composeCharSize);
+            cmp.append_attribute("composeType") = ctrl.composeType.c_str();
+            cmp.append_attribute("charPrCnt") = static_cast<unsigned>(shapes.size());
             cmp.append_attribute("composeText") = ctrl.text.c_str();
+            for (const std::uint32_t id : shapes) cmp.append_child("hp:charPr").append_attribute("prIDRef") = id;
+            break;
+        }
+        case ControlKind::FieldEnd: {
+            auto ctrlNode = runNode.append_child("hp:ctrl");
+            auto fe = ctrlNode.append_child("hp:fieldEnd");
+            std::uint32_t begin = 0;
+            if (!gFieldIds.open.empty()) {
+                begin = gFieldIds.open.back();
+                gFieldIds.open.pop_back();
+            }
+            fe.append_attribute("beginIDRef") = begin;
             break;
         }
         case ControlKind::Unknown:
@@ -1536,8 +1713,8 @@ std::string writeMasterPageXml(const MasterPage& mp, std::size_t index, const Bi
     root.append_attribute("id") = ("masterpage" + std::to_string(index)).c_str();
     root.append_attribute("type") =
         mp.applyPageType.empty() ? "BOTH" : mp.applyPageType.c_str();
-    root.append_attribute("pageNumber") = 0;
-    root.append_attribute("pageDuplicate") = 0;
+    root.append_attribute("pageNumber") = mp.applyPageType == "OPTIONAL_PAGE" ? mp.pageNumber : 0u;
+    root.append_attribute("pageDuplicate") = mp.duplicate ? 1 : 0;
     root.append_attribute("pageFront") = mp.printOnTop ? 1 : 0;
 
     writeSubListNode(root, mp.content, bins);
@@ -1545,7 +1722,7 @@ std::string writeMasterPageXml(const MasterPage& mp, std::size_t index, const Bi
 }
 
 std::string writeContentHpfXml(const Document& doc, const BinRegistry& bins,
-                               std::size_t sectionCount, std::size_t masterPageCount) {
+                               std::size_t sectionCount, std::size_t masterPageCount, bool memoExtended) {
     pugi::xml_document xml;
     auto pkg = xml.append_child("opf:package");
     pkg.append_attribute("xmlns:ha") = "http://www.hancom.co.kr/hwpml/2011/app";
@@ -1604,6 +1781,7 @@ std::string writeContentHpfXml(const Document& doc, const BinRegistry& bins,
         addItem(secId, "Contents/" + secId + ".xml", "application/xml");
     }
     addItem("settings", "settings.xml", "application/xml");
+    if (memoExtended) addItem("memoextended", "Contents/memoExtended.xml", "application/xml");
 
     auto spine = pkg.append_child("opf:spine");
     {
@@ -1686,6 +1864,17 @@ std::string buildPreviewText(const Document& doc) {
 }  // namespace
 
 bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, std::string* error) {
+    gFieldIds = FieldIds{};
+    // 메모는 문서 차례로 1 부터 번호를 매기고, 필드 고유 id 는 있던 것을 쓰고 없으면 새로 매긴다(답글 관계가 쓴다).
+    const std::vector<const Control*> memos = collectMemos(doc);
+    std::uint32_t maxId = 0;
+    for (const Control* m : memos) maxId = std::max(maxId, m->fieldId);
+    std::uint32_t nextMemoId = std::max<std::uint32_t>(maxId + 1, 0x40000000u);
+    for (std::size_t i = 0; i < memos.size(); ++i) {
+        gFieldIds.memoNumber[memos[i]] = static_cast<std::uint32_t>(i + 1);
+        gFieldIds.memoId[memos[i]] = memos[i]->fieldId != 0 ? memos[i]->fieldId : nextMemoId++;
+    }
+    gFieldIds.next = std::max<std::uint32_t>(nextMemoId, 1);
     out.clear();
     zip::Writer zw;
 
@@ -1735,9 +1924,25 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
         }
     }
 
+    // 답글 관계(Contents/memoExtended.xml). 답글이 없으면 만들지 않는다.
+    bool replies = false;
+    {
+        pugi::xml_document extended;
+        auto root = extended.append_child("he:memosEx");
+        root.append_attribute("xmlns:he") = "http://www.hancom.co.kr/hwpml/2021/extended";
+        for (const Control* m : memos) {
+            if (m->memoParentId == 0) continue;
+            auto e = root.append_child("he:memo");
+            e.append_attribute("id") = gFieldIds.memoId[m];
+            e.append_attribute("parentId") = m->memoParentId;
+            replies = true;
+        }
+        if (replies && !zw.addText("Contents/memoExtended.xml", serializeXml(extended), true, error)) return false;
+    }
+
     // 6. Contents/content.hpf
     if (!zw.addText("Contents/content.hpf",
-                    writeContentHpfXml(doc, bins, sectionsPtr->size(), masterPageIdx), true,
+                    writeContentHpfXml(doc, bins, sectionsPtr->size(), masterPageIdx, replies), true,
                     error)) {
         return false;
     }

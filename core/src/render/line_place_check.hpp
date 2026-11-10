@@ -29,4 +29,10 @@ LinePlaceCheck checkCaretTops(const model::Document& doc, const std::vector<Node
 std::vector<std::int32_t> cachedCaretEdges(const model::Document& doc, const Node& line);
 std::vector<std::int32_t> freshCaretEdges(const model::Document& doc, const Node& line);
 
+// 보기 표시 검사. 줄의 조판 부호 이름표(놓는 차례)와, 표 테두리를 그릴 때 나온 투명 선(빨간 점선) 조각 수.
+std::vector<std::string> lineMarkLabels(const model::Document& doc, const Node& line);
+int transparentBorderPieces(const model::Document& doc, const Node& table);
+// 줄의 교정 부호 몫: "이름 x0 x1 머리 꼬리" 글(줄 x 기준 HU). 교정 부호 보기가 꺼져 있으면 비어 있다.
+std::vector<std::string> lineProofSpans(const model::Document& doc, const Node& line);
+
 }  // namespace chwp::render
