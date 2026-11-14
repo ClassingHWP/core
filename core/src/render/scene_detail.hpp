@@ -111,6 +111,8 @@ Node atomObject(const Atom& atom, std::int32_t x, const Document& doc, int depth
 Placement turnedPlacement(const Placement& p);
 // 문단 runs 의 항목을 차례로 센 번호. 없으면 -1 이다. 개체 노드가 문서의 그 컨트롤을 가리킬 때 쓴다.
 int itemOrdinal(const model::Paragraph& para, const model::Control* control);
+// 번호를 형식(DIGIT, CIRCLED_DIGIT, ROMAN_CAPITAL …)대로 쓴 글.
+std::string formatNumber(int value, const std::string& numFormat);
 Node uprightObject(Node object);
 // 세로쓰기 틀의 원자 폭. 세운 글자는 1em, 눕힌 글자는 가로 폭, 모두 4의 배수로 내리고 자간은 그 폭으로 잰다.
 // 글자처럼 넣은 개체는 세운 높이와 위·아래 여백이다. 원자마다 한 번만 넣는다.

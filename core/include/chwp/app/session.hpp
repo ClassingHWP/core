@@ -78,6 +78,8 @@ struct Host {
     std::function<void(std::function<void()>)> post;
     // 한 묶음(fontFetchPlan 의 batch)의 글꼴을 다 받아 풀고 문서에 적용했다. 셸 스레드에서 부른다.
     std::function<void(int batch)> fontsSettled;
+    // 웹 주소(하이퍼링크)를 그 플랫폼 브라우저로 연다. 무엇을 열지는 코어가 정한다.
+    std::function<void(const std::string& url)> openUrl;
 };
 
 void setHost(Host host);
@@ -140,11 +142,20 @@ std::string frameStats();
 struct OpenResult {
     bool ok = false;
     std::string error;
+    // 암호 걸린 문서: 암호가 필요하다(틀렸으면 wrongPassword 도). 셸은 암호를 물어 unlockDocument 로 넘긴다.
+    bool needPassword = false;
+    bool wrongPassword = false;
+    // 열고 나서 알릴 말(배포용 문서라 고칠 수 없다 등).
+    std::string notice;
+    // 문서가 고칠 수 없게 잠겨 있다(배포용 문서). 셸의 보기 전용과 따로다.
+    bool locked = false;
     std::vector<std::string> faces;
     std::string docState;  // DocSession::documentState
     std::string name;      // 새 문서의 이름(저장할 때 형식 끝이 붙는다). 연 문서는 비어 있다(파일 이름을 쓴다)
 };
 OpenResult openDocument(Bytes bytes);
+// 암호를 기다리는 문서를 이 암호로 연다. 틀리면 다시 needPassword·wrongPassword 다.
+OpenResult unlockDocument(const std::string& password);
 OpenResult newDocument();
 std::string planDocument(bool lineSeg);
 // 저장된 줄 높이를 쓸지는 core 기본값(DocSession::kUseStoredLineHeight)으로 정한다. 셸은 이것을 부른다.
@@ -170,6 +181,9 @@ StyleReport cursorStyleNow();
 StyleReport styleToSend(StyleReport report);
 // 문서 스타일 이름(스타일 표 차례). 리본 스타일 목록이 쓴다.
 std::vector<std::string> styleNames();
+// 스타일 대화 상자 보기. rows 는 "번호\t이름\t영문 이름\t종류\t다음 스타일\t단축키" 줄, caretStyleId 는 캐럿 스타일,
+// info.* 는 styleId 스타일의 정보(여백·첫 줄은 pt), draft.* 는 추가·편집 중인 초안이다.
+render::FormatFields styleViewNow(int styleId);
 // 글꼴 고르기 목록: 받을 수 있는 글꼴과 지금 문서에 쓰인 글꼴. 라이선스로 막힌 글꼴은 뺀다.
 std::vector<std::string> pickableFonts();
 render::FormatFields formatFieldsNow();
@@ -299,6 +313,9 @@ EditReport editTableText(const render::FormatFields& fields);
 // 조판 부호 지우기(fields.marks).
 EditReport editDeleteMarks(const render::FormatFields& fields);
 render::FormatFields bookmarkViewNow();
+// 누름틀 고치기(Ctrl+N,K 가 캐럿이 누름틀 안이면 연다). 값: found, direction, memo, name, editable.
+render::FormatFields clickHereViewNow();
+EditReport editClickHere(const render::FormatFields& fields);
 // 표/셀 속성(값 이름은 render::tablePropertiesView). 하지 못하면 error 에 이유가 있다.
 EditReport editTableProperties(const render::FormatFields& fields);
 render::FormatFields tablePropertiesViewNow();
@@ -329,6 +346,11 @@ render::FormatFields applyViewGuides(const render::FormatFields& patch);
 EditReport editInsertNote(bool endnote);
 // 하이퍼링크 넣기. text 가 비면 주소를 보인다. 고른 글은 바꾼다.
 EditReport editInsertHyperlink(const std::string& text, const std::string& url);
+// 수식 편집기(한글 입력 → 수식, Ctrl+N,M). equationViewNow 는 editing·script·baseUnit 이다. 고른 수식이 있으면
+// 그 수식을 고치고(editing 참), 없으면 캐럿 자리에 넣는다. 미리 보기는 SVG 글이고 글꼴을 받는 중이면 ready 가 거짓이다.
+render::FormatFields equationViewNow();
+EditReport editEquationSubmit(const std::string& script, std::int32_t baseUnit);
+std::string equationPreviewNow(const std::string& script, std::int32_t baseUnit, bool* ready);
 // 쪽 번호·새 번호·감추기 대화 상자를 열 때 채울 값.
 render::FormatFields pageControlFieldsNow(const std::string& kind);
 // 표 구조 편집. kind 는 insertRows, insertColumns, deleteRows, deleteColumns, mergeCells, splitCell 이다.
@@ -345,8 +367,19 @@ EditReport editStyle(const render::FormatPatch& patch);
 EditReport editPageSetup(const render::FormatFields& fields, bool wholeDocument);
 // 서식 대화 상자(0 글자 모양, 1 문단 모양, 2 편집 용지, 3 표 넣기). 셸은 칸 이름과 칸에 친 값을 그대로 넘긴다
 // (chwp/render/format_view.hpp). 보기는 패치를 적용했을 때의 값이고 문서는 바꾸지 않는다.
+// kind 5·6 은 스타일 대화 상자가 고치는 스타일(초안)의 글자·문단 모양이다. 적용해도 문서는 그대로다.
 render::FormatView formatDialogView(int kind, const render::FormatFields& patch);
 EditReport editFormatDialog(int kind, const render::FormatFields& patch, bool wholeDocument);
+// 스타일 명령. action: begin(editing: 번호, 새 스타일은 -1)·set(name·engName·type·nextStyleId)·commit·end·
+// delete(styleId·replacement)·move(styleId·delta)·fromCaret(styleId)·clearChar. 못 하면 error 에 까닭이다.
+EditReport editStyleCommand(const std::string& action, const render::FormatFields& fields);
+// 스타일을 가져올 문서(HWP·HWPX)를 연다. rows 는 그 문서 스타일(styleViewNow 와 같은 꼴), 못 읽으면 error 다.
+// 가져오기는 editStyleCommand("import", names: 줄마다 이름, 비면 모두)다.
+render::FormatFields openStyleSource(const Bytes& bytes);
+// 차례 만들기(action make, fields 는 render::tocOptionsOfFields 이름)·새로 고침(update: 캐럿 차례, updateAll: 모두).
+EditReport editToc(const std::string& action, const render::FormatFields& fields);
+// 이 문서 스타일만 담은 HWPX(스타일 내보내기).
+std::optional<Bytes> exportStyles();
 const render::PageBitmap* formatDialogPreview(int kind, const render::FormatFields& patch, int width, int height);
 EditReport editSwapFonts(const std::vector<std::pair<std::string, std::string>>& chosen);
 
@@ -403,6 +436,10 @@ void beginGrind();
 
 // 쪽 한 장을 그림으로. 실패하면 nullptr. 다음 호출까지 살아 있다.
 const std::vector<std::uint8_t>* renderPagePng(int page, int pixelHeight);
+// 문서를 PDF 로(인쇄·PDF 로 저장). 쪽마다 dpi 로 그린 그림을 종이 크기에 채운다. from·to 는 쪽 순번(0부터, -1 끝까지).
+Bytes exportPdfNow(int dpi, int from = 0, int to = -1);
+// PDF·인쇄를 막은 까닭(배포용 문서의 인쇄 막기). 막지 않았으면 비어 있다.
+std::string printBlockedReason();
 const render::PageBitmap* renderPagePixels(int page, int pixelHeight);
 
 // ---- GPU 화면
@@ -425,6 +462,7 @@ struct InputPointer {
     double y = 0;
     double t = 0;
     int button = 0;
+    bool shift = false;  // Shift 를 누른 채인지(여러 개체 고르기)
 };
 // type: pointer, pointers, wheel, wheelRaw, gesture, tick, scroll, viewport, revealPage, zoom, zoomStep, pageStep, pageUp, pageDown,
 // fit, grid, pins, readOnly, rulers, embed, embedOpen. 각 종류는 쓰는 칸만 읽는다.
@@ -474,6 +512,7 @@ struct SelectionReport {
     int selectPhase = 0;
     bool pinTap = false;
     std::string dialog;  // 두 번 누르기가 연 고치기 대화 상자(rubyEdit·composeEdit)
+    std::string notice;  // 알릴 글(하이퍼링크 대상이 없을 때 등)
     bool active = false;
     bool caret = false;
     bool styled = false;

@@ -10,7 +10,11 @@
 #include "chwp/common/bytes.hpp"
 #include "chwp/model/document.hpp"
 #include "chwp/render/edit_state.hpp"
+#include "chwp/render/guides.hpp"
+#include "chwp/render/format_view.hpp"
 #include "chwp/render/paint.hpp"
+#include "chwp/render/style_commands.hpp"
+#include "chwp/render/toc_commands.hpp"
 #include "chwp/render/scene.hpp"
 
 namespace chwp::app {
@@ -31,8 +35,12 @@ public:
     static constexpr int kFontGapRounds = 3;
 
     Bytes file;
+    // 암호를 기다리는 문서 바이트와 마지막 암호가 틀렸는지.
+    Bytes lockedFile_;
+    bool wrongPassword_ = false;
     model::Document doc;
     std::vector<render::Node> pages;
+    render::StyleDraft styleDraft;
     // 저장된 줄 높이(lineSeg)를 빌려 조판하는가. 열 때 정하고 편집도 같은 값으로 다시 놓는다.
     bool storedLineHeight = false;
     // 연 파일의 형식. 빈 문서는 hwpx 다.
@@ -40,7 +48,16 @@ public:
     render::EditState edit;
 
     // 원본을 읽는다. 쪽은 아직 놓지 않는다(글꼴을 받은 뒤 layout).
-    bool open(Bytes bytes, std::string* error = nullptr, std::vector<std::string>* warnings = nullptr);
+    // 암호 걸린 문서인데 암호가 없거나 틀리면 거짓이고 needsPassword() 가 참이다. 바이트는 들고 있다가 unlock 으로 다시 연다.
+    bool open(Bytes bytes, std::string* error = nullptr, std::vector<std::string>* warnings = nullptr,
+              const std::string& password = {});
+    bool unlock(const std::string& password, std::string* error = nullptr, std::vector<std::string>* warnings = nullptr);
+    [[nodiscard]] bool needsPassword() const { return !lockedFile_.empty(); }
+    [[nodiscard]] bool wrongPassword() const { return wrongPassword_; }
+    // 배포용 문서는 고칠 수 없다(복사·인쇄도 문서가 막을 수 있다). 셸의 보기 전용과 따로 늘 켜져 있다.
+    [[nodiscard]] bool locked() const { return doc.format.distribution; }
+    [[nodiscard]] bool copyBlocked() const { return doc.format.distribution && doc.format.noCopy; }
+    [[nodiscard]] bool printBlocked() const { return doc.format.distribution && doc.format.noPrint; }
     // 빈 문서로 시작한다.
     void openBlank();
     // 문서를 닫고 편집 상태를 비운다.
@@ -80,6 +97,22 @@ public:
     // U+2028 은 문단 안 줄바꿈이다. 되돌리기는 한 칸이다. 편집 하나하나의 결과를 차례로 돌려준다.
     std::vector<render::EditResult> insertPlainText(const std::string& text);
     render::EditResult keyDown(render::EditKey key, bool shift = false, bool ctrl = false, bool alt = false);
+    // 화면에 보이는 첫·마지막 줄로(Ctrl+Home·End). bands 는 카메라가 보이는 쪽 범위다.
+    render::EditResult moveToView(const std::vector<render::ViewBand>& bands, bool end, bool shift);
+    // 점(쪽 HU) 아래 하이퍼링크를 따라간다. 웹 주소면 url 에 준다. 이전·다음은 forward 로 고른다.
+    render::EditResult followLinkAt(int page, int x, int y, std::string* url = nullptr, std::string* why = nullptr);
+    render::EditResult linkHistory(bool forward);
+    // 변경 내용 추적: 기록 켜고 끄기, 적용·취소(scope caret·all), 이전·다음 바뀜.
+    render::EditResult toggleTrackChanges();
+    render::FormatFields clickHereView();
+    render::EditResult modifyClickHere(const render::FormatFields& fields, std::string* why = nullptr);
+    // 누름틀 안내문 숨기기(보기 상태, 한글 2024). 캐럿에 맞추기와 편집 앞에 되돌리기. 편집 기록은 남기지 않는다.
+    render::EditResult syncClickHereGuide();
+    render::EditResult revealClickHereGuide();
+    render::EditResult insertClickHere(const std::string& direction = {}, const std::string& memo = {},
+                                       const std::string& name = {}, std::string* why = nullptr);
+    render::EditResult resolveChanges(bool accept, const std::string& scope, std::string* why = nullptr);
+    render::EditResult moveToChange(bool forward);
     render::EditResult applyFormat(const render::FormatPatch& patch);
     render::EditResult insertTable(int rows, int cols);
     // 표 구조 편집(줄·칸 넣기·지우기, 합치기, 나누기). 고치지 못하면 error 에 이유를 적는다.
@@ -100,6 +133,25 @@ public:
     render::EditResult pageBorder(const render::FormatFields& fields, bool wholeDocument, std::string* error = nullptr);
     // 캡션: 고른 개체, 아니면 캐럿 표.
     render::EditResult caption(const std::string& caption, std::string* error = nullptr);
+    // 스타일 대화 상자(한글 스타일 F6). 초안은 이 문서에 하나다. 글자·문단 모양 대화 상자는 styleDraftFormatView 로 초안
+    // 모양을 보고 고친다. 맺기·지우기·차례 바꾸기·현재 모양으로 바꾸기·글자 스타일 해제는 되돌리기 한 칸이다.
+    render::FormatFields beginStyleDraft(int editing);
+    render::FormatFields styleDraftFields() const;
+    render::FormatFields setStyleDraftFields(const render::FormatFields& fields);
+    render::FormatView styleDraftFormatView(bool para, const render::FormatFields& patch);
+    void applyStyleDraftFormat(bool para, const render::FormatFields& patch);
+    render::PageBitmap styleDraftPreview(bool para, const render::FormatFields& patch, int width, int height);
+    render::EditResult commitStyleDraft(std::string* error = nullptr);
+    void endStyleDraft();
+    render::EditResult deleteStyle(std::uint32_t styleId, std::uint32_t replacement, std::string* error = nullptr);
+    render::EditResult moveStyle(std::uint32_t styleId, int delta, std::string* error = nullptr);
+    render::EditResult styleFromCaret(std::uint32_t styleId, std::string* error = nullptr);
+    render::EditResult clearCharStyle(std::string* error = nullptr);
+    // 차례 만들기·새로 고침(되돌리기 한 칸).
+    render::EditResult makeToc(const render::TocOptions& options, std::string* error = nullptr);
+    render::EditResult updateToc(bool all, std::string* error = nullptr);
+    render::EditResult importStyles(const model::Document& source, const std::vector<std::string>& names,
+                                    std::string* error = nullptr);
     // 책갈피(insert·delete·goto)와 찾아가기(쪽은 0 부터).
     render::EditResult bookmark(const std::string& action, const std::string& name, std::string* error = nullptr,
                                 const std::string& newName = {});
@@ -141,6 +193,12 @@ public:
     // 각주·미주 넣기. 하지 못하면 error 에 이유를 적는다.
     render::EditResult insertNote(bool endnote, std::string* error = nullptr);
     render::EditResult insertHyperlink(const std::string& text, const std::string& url, std::string* error = nullptr);
+    // 수식 넣기·고치기(render::editInsertEquation·editEquation). baseUnit 1000 = 10pt.
+    render::FormatFields equationView();
+    render::EditResult insertEquation(const std::string& script, std::int32_t baseUnit, std::string* error = nullptr);
+    render::EditResult editEquation(const std::string& script, std::int32_t baseUnit, std::string* error = nullptr);
+    render::EditResult editEquationAt(int story, int paragraph, int item, const std::string& script,
+                                      std::int32_t baseUnit, std::string* error = nullptr);
     // 찾기. 고른 글(없으면 캐럿) 뒤에서(backward 면 앞에서) 다음 text 를 골라 선택한다. 끝에 닿으면 돈다.
     render::EditResult findNext(const std::string& text, bool matchCase, bool backward, bool* wrapped = nullptr);
     // 바꾸기(한글 바꾸기 단추). 고른 글이 text 면 replacement 로 바꾸고, 다음 text 를 찾아 고른다.
@@ -161,6 +219,7 @@ public:
     render::EditResult commitComposition();
     // 쪽(0부터) 종이 좌표 (x0, y0)~(x1, y1)에 도형을 넣는다. tool: 1 직사각형, 2 타원, 3 직선, 4 글상자, 5 세로 글상자.
     render::EditResult insertShape(int tool, int page, std::int32_t x0, std::int32_t y0, std::int32_t x1, std::int32_t y1);
+    render::EditResult insertShapePoints(int tool, int page, const std::vector<model::ShapePoint>& points);
     // 이름으로 가리킨 개체(render::selectAnchoredObject 등). item 은 문단 안 항목 순번이다.
     bool selectObject(int story, int paragraph, int item);
     render::FormatFields objectPropertiesView(int story, int paragraph, int item);
@@ -197,6 +256,9 @@ public:
     // 쪽 하나를 PNG 로 그린다. 화면과 같이 GPU(Graphite)로 먼저 굽고, 못 쓰면 CPU 로 그린다.
     // 칸은 frames 에 굽는다(편집기는 화면의 칸 캐시, agent 는 제 캐시). 나중에 채울 쪽은 먼저 채운다.
     render::PageImage renderPage(int index, int pixelHeight, render::FrameCache& frames);
+    // 쪽들을 dpi 로 그려 PDF 로 묶는다(chwp::exporter::PdfWriter). from·to 는 쪽 순번(0부터, to 는 포함), -1 이면 끝까지.
+    // 쪽 그림은 renderPage 와 같다(GPU 먼저, 못 쓰면 CPU). 쪽이 없으면 빈 바이트다.
+    Bytes exportPdf(int dpi, render::FrameCache& frames, int from = 0, int to = -1);
 
     // 문서를 열 때 받을 글꼴: 문서가 쓰는 글꼴(documentFontFaces)에 첫 글자를 칠 자리(첫 문단 맨 앞)의 글자 모양 글꼴을
     // 더한다. 글이 없는 새 문서는 쓰는 글꼴이 없어, 더하지 않으면 첫 글자를 친 뒤에야 받기 시작해 받아 풀 때까지
@@ -213,6 +275,10 @@ public:
     // 편집기와 agent 가 같은 판단을 탄다. 받은 글꼴이 있으면 문서가 아직 쓰지 않아도 그리기 쪽 글꼴 캐시
     // (없어서 대체로 연 기억)를 비운다(render::clearGlyphWarm).
     bool fontsLanded(const std::vector<std::string>& faces);
+    // 보기 표시(render::viewMarks)를 바꾼 뒤. 조판 부호 이름표는 줄을 다시 나누지 않고 뒤 글자를 밀어 메모 자리(필드 시작
+    // 글자)가 옮겨 가고, 메모를 끄고 켜면 메모 영역이 생기고 없어진다. 그때 줄 자리 기록을 버리고 메모 상자·연결선을
+    // 다시 놓는다. before 는 바꾸기 전 값이다.
+    void viewMarksChanged(const render::ViewMarks& before);
     // 받지 못해 대체 글꼴로 재고 그리는 문서 글꼴 이름. 굵은 짝(" Bold", " 볼드")은 보통 글꼴까지 없을 때만 넣는다.
     std::vector<std::string> missingFonts() const;
 
@@ -228,6 +294,8 @@ private:
         return render::EditScope(edit);
     }
     void noteEdit(const render::EditResult& result, std::vector<std::string> faces = {});
+    // 되돌리기·다시 하기로 돌아온 수식 중 글꼴을 받는 중에 잰 것을 다시 잰다(remeasurePendingEquations).
+    render::EditResult remeasureRestored(render::EditResult result);
     void wantFont(const std::string& face);
 
     std::vector<std::string> fontWants_;

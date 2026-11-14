@@ -111,6 +111,10 @@ bool deflateRaw(ByteView input, Bytes& out) {
     return true;
 }
 
+std::uint32_t crc32(ByteView input) {
+    return static_cast<std::uint32_t>(mz_crc32(MZ_CRC32_INIT, input.data(), input.size()));
+}
+
 struct Writer::Impl {
     mz_zip_archive zip{};
     bool initialized = false;

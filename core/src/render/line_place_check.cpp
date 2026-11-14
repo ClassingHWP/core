@@ -191,4 +191,18 @@ std::vector<std::string> lineProofSpans(const model::Document& doc, const Node& 
     return out;
 }
 
+std::vector<std::string> lineMemoSpans(const model::Document& doc, const Node& line) {
+    Painter painter;
+    painter.doc = &doc;
+    const std::vector<Painter::Mark> marks = painter.collectMarks(line);
+    const Painter::LinePlacement place = painter.placeLine(line, marks);
+    std::vector<std::string> out;
+    for (const Painter::MemoRange& r : painter.lineMemoRanges(line, 0, 0, marks, place)) {
+        out.push_back(std::to_string(r.x0) + " " + std::to_string(r.x1) + " " + std::to_string(r.top) + " " +
+                      std::to_string(r.bottom) + " " + (r.head ? "1" : "0") + " " + (r.tail ? "1" : "0") + " " + r.fill +
+                      " " + r.line);
+    }
+    return out;
+}
+
 }  // namespace chwp::render

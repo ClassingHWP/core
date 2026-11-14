@@ -68,6 +68,7 @@ struct Atom {
     std::int32_t spacing = 0;
     std::int32_t charOffset = 0;
     std::string markpen;
+    std::uint8_t track = 0;  // 변경 추적(InlineItem::track)
     bool space = false;
     bool tab = false;
     std::string tabLeader;
@@ -160,6 +161,7 @@ private:
     std::int32_t offset_ = 0;
     std::int32_t spacing_ = 0;
     std::string markpen_;
+    std::uint8_t track_ = 0;
     bool synthetic_ = false;
 };
 

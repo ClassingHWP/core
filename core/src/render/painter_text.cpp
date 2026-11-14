@@ -710,6 +710,9 @@ std::vector<Painter::Mark> Painter::marksFromRuns(const Node& node, const LineGl
         mark.hatchColor = paint.hatchColor;
         mark.shade = paint.shade;
         mark.markpen = run.style->markpen ? *run.style->markpen : std::string{};
+        mark.track = run.style->track;
+        // 한글 변경 내용(최종본 및 변경 내용): 바뀐 글은 빨간 글자다.
+        if (mark.track != 0) mark.color = "#FF0000";
         mark.synthetic = run.synthetic;
     };
     for (std::size_t runIndex = 0; runIndex < glyphs.runs.size(); ++runIndex) {
@@ -1087,9 +1090,26 @@ void Painter::paintGlyphEffects(const model::CharShape& cs, const Mark& mark, st
     }
 }
 
-void Painter::paintBitmapDeco(const model::CharShape& cs, const Mark& mark, std::int32_t at, std::int32_t lineTop,
+void Painter::paintBitmapDeco(const model::CharShape& shape, const Mark& mark, std::int32_t at, std::int32_t lineTop,
                               int lineBox, std::int32_t glyphBaseline, int drawSize) {
     if (placesOnly) return;
+    // 변경 추적: 넣은 글은 빨간 실선 밑줄, 지운 글은 빨간 실선 취소선을 더한다(한글 화면).
+    model::CharShape tracked;
+    if (mark.track != 0) {
+        tracked = shape;
+        if (mark.track == model::kTrackInsert) {
+            tracked.underline = "BOTTOM";
+            tracked.underlineShape = "SOLID";
+            tracked.underlineShapeId = 0;
+            tracked.underlineColor = 0xFF0000u;
+        } else {
+            tracked.strikeout = true;
+            tracked.strikeShape = "SOLID";
+            tracked.strikeShapeId = 0;
+            tracked.strikeColor = 0xFF0000u;
+        }
+    }
+    const model::CharShape& cs = mark.track != 0 ? tracked : shape;
     const std::int32_t span = mark.width > 0 ? mark.width : mark.band;
     const std::string color = mark.color.empty() ? "#000000" : mark.color;
     int position = 0;
@@ -1201,6 +1221,7 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
 
     drawHeading(node, x, y, place.fit.shift, place.fit.slide);
     drawProofBackgrounds(node, x, y, place);
+    drawMemoRanges(node, x, y, place);
 
     // 글자 자리 번호는 커서 칸이다. 자동 번호 대신 넣은 글자는 칸을 세지 않고, 번호 없이(-1) 그린다.
     int caretIndex = 0;

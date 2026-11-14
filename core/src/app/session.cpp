@@ -38,6 +38,8 @@
 #include "chwp/writer.hpp"
 #include "chwp/render/cache_budget.hpp"
 #include "chwp/render/frame_cache.hpp"
+#include "chwp/render/link_commands.hpp"
+#include "chwp/render/track_commands.hpp"
 #include "chwp/render/paint.hpp"
 #include "chwp/render/scene.hpp"
 #include "chwp/render/view.hpp"
@@ -629,6 +631,8 @@ chwp::input::PointerInput gInput;
 chwp::input::WheelReader gWheel;
 // 사용자가 켠 눈금자. 셸이 저장해 둔 값을 넘기고, 없으면 켠다.
 bool gRulersWanted = true;
+// 셸이 켠 보기 전용. 배포용 문서는 이것과 상관없이 늘 읽기 전용이다.
+bool gShellReadOnly = false;
 // 보기 화면의 편집 단추. 넣은 페이지가 임베드 명령으로 켠다.
 bool gEditButton = false;
 // 쪽 그림(renderPagePng·renderPagePixels)을 그린 높이. 바뀌면 그린 그림을 버린다.
@@ -660,6 +664,9 @@ chwp::render::FrameCache gFrames;
 void stopCrew();
 void pauseCrewForEdit();
 void resumeCrewAfterEdit(const chwp::render::EditResult& res);
+chwp::render::EditResult syncClickHereGuidePaused();
+bool syncClickHereGuideNow();
+void revealClickHereGuideNow();
 void drainDone();
 void publishPlan();
 void noteCamera(int scrollX, int scrollY, int percent, bool coasting, bool pinching);
@@ -676,6 +683,7 @@ bool screenFrame(double time, void*);
 int gHeldFrames = 0;
 void frameAfterEdit();
 int gMasterViewSeen = 0;
+int gScreenGlyphSeen = 0;
 int currentCameraPage(int scrollX, int scrollY, int percent);
 
 using LocalPageSprite = chwp::render::PageSprite;
@@ -765,9 +773,24 @@ std::vector<std::string> documentFaceList() {
     return seen;
 }
 
+// 고른 글을 복사할 글로 돌려준다. 복사를 막은 배포용 문서면 비운다(셸은 빈 글을 복사하지 않는다).
+std::string copyableSelectionText() {
+    if (gDoc.copyBlocked()) return {};
+    return chwp::render::selectionText(gDoc.doc, gDoc.pages);
+}
+
 OpenResult openedDocumentInfo() {
     OpenResult out;
     out.ok = true;
+    // 배포용 문서는 고칠 수 없다(한글도 배포용 문서는 편집을 막는다). 복사·인쇄 막기는 문서가 정한다.
+    chwp::render::setReadOnly(gShellReadOnly || gDoc.locked());
+    out.locked = gDoc.locked();
+    if (gDoc.locked()) {
+        out.notice = "배포용 문서라 고칠 수 없습니다.";
+        if (gDoc.copyBlocked() && gDoc.printBlocked()) out.notice += " 복사와 인쇄도 막혀 있습니다.";
+        else if (gDoc.copyBlocked()) out.notice += " 복사도 막혀 있습니다.";
+        else if (gDoc.printBlocked()) out.notice += " 인쇄도 막혀 있습니다.";
+    }
     out.faces = documentFaceList();
     out.docState = gDoc.documentState();
     chwp::layout::requestFontFaces(gDoc.openFontFaces());
@@ -785,6 +808,22 @@ OpenResult openDocument(Bytes bytes) {
     if (!gDoc.open(std::move(bytes), &error)) {
         OpenResult out;
         out.error = error;
+        out.needPassword = gDoc.needsPassword();
+        out.wrongPassword = gDoc.wrongPassword();
+        return out;
+    }
+    return openedDocumentInfo();
+}
+
+OpenResult unlockDocument(const std::string& password) {
+    // 문서는 openDocument 가 이미 비웠다. 들고 있는 잠긴 바이트만 남아 있다.
+    gCaretAtStart = false;
+    std::string error;
+    if (!gDoc.unlock(password, &error)) {
+        OpenResult out;
+        out.error = error;
+        out.needPassword = gDoc.needsPassword();
+        out.wrongPassword = gDoc.wrongPassword();
         return out;
     }
     return openedDocumentInfo();
@@ -802,7 +841,18 @@ OpenResult newDocument() {
 std::optional<Bytes> exportDocument(const std::string& formatStr) {
     // 고친 문단과 lineSeg 없이 들어온 문단은 우리 조판 결과를 lineSeg 로 적어 저장한다(agent 저장과 같다).
     gDoc.ensureFullLayout();
-    return gDoc.save(parseFormatString(formatStr));
+    // 숨긴 누름틀 안내문은 보기 상태다. 안내문이 보이는 문서로 저장하고 다시 캐럿에 맞춘다.
+    std::optional<Bytes> bytes;
+    {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        revealClickHereGuideNow();
+        bytes = gDoc.save(parseFormatString(formatStr));
+        if (wasCrew) resumeCrewAfterEdit({});
+        else syncClickHereGuidePaused();
+    }
+    return bytes;
 }
 
 SavedDocument saveDocument(const std::string& name) {
@@ -817,7 +867,15 @@ SavedDocument saveDocument(const std::string& name) {
     for (char& c : lower) c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
     if (lower.size() < ext.size() || lower.compare(lower.size() - ext.size(), ext.size(), ext) != 0) out.name += ext;
     gDoc.ensureFullLayout();
-    out.bytes = gDoc.save(format, &out.error);
+    {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        revealClickHereGuideNow();
+        out.bytes = gDoc.save(format, &out.error);
+        if (wasCrew) resumeCrewAfterEdit({});
+        else syncClickHereGuidePaused();
+    }
     if (out.bytes) gDoc.markSaved();
     out.docState = gDoc.documentState();
     return out;
@@ -868,6 +926,8 @@ std::string planDocument(bool lineSeg) {
     gPagePixels.clear();
     gPixelHeight = 0;
     chwp::render::clearGlyphWarm();
+    // 칸은 위에서 모두 비웠다. 지운 글자 때문에 다시 구울 칸이 없다.
+    gScreenGlyphSeen = chwp::render::screenGlyphEpoch();
     chwp::JsonWriter writer(false);
     writer.beginObject();
     writer.key("pages");
@@ -1092,6 +1152,7 @@ PointerReport pointerEvent(int kind, int page, int x, int y, int percent) {
     out.view = chwp::render::applyPointer(gDoc.doc, gDoc.pages, kind, page, x, y, percent);
     out.event = chwp::render::pointerEventText();
     const bool dragUnchanged = (kind == 2 && out.event.empty());
+    if (kind != 2) syncClickHereGuideNow();
     if (!dragUnchanged && gScreenOn && chwp::render::screenReady()) {
         screenFrame(0, nullptr);
     }
@@ -1099,14 +1160,19 @@ PointerReport pointerEvent(int kind, int page, int x, int y, int percent) {
     if (kind != 2) {
         out.styled = true;
         out.style = cursorStyleNow();
-        out.text = chwp::render::selectionText(gDoc.doc, gDoc.pages);
+        out.text = copyableSelectionText();
     }
     gFallbackImages.clear();
     if (!gScreenOn && !dragUnchanged) gFallbackImages = chwp::render::pointerImages(gDoc.doc, gDoc.pages);
     return out;
 }
 
+// 다음 캐럿 보이기는 캐럿 줄을 화면 세로 가운데에 둔다(한글 하이퍼링크 이동). 한 번 쓰면 꺼진다.
+bool gCenterCaretOnce = false;
+
 bool ensureCaretVisibleInCamera(const chwp::render::EditResult& res, chwp::render::ViewPlan& plan) {
+    const bool center = gCenterCaretOnce;
+    gCenterCaretOnce = false;
     if (!res.caret.hit || res.cursor.page < 0 || res.cursor.page >= static_cast<int>(gDoc.pages.size())) return false;
     if (plan.viewW <= 0 || plan.viewH <= 0) return false;
     gInput.stop();
@@ -1154,7 +1220,9 @@ bool ensureCaretVisibleInCamera(const chwp::render::EditResult& res, chwp::rende
     } else if (caretRight + marginX > targetX + plan.viewW) {
         targetX = caretRight + marginX - plan.viewW;
     }
-    if (caretTop - marginY < targetY) {
+    if (center) {
+        targetY = (caretTop + caretBottom) / 2 - plan.viewH / 2;
+    } else if (caretTop - marginY < targetY) {
         targetY = caretTop - marginY;
     } else if (caretBottom + marginY > targetY + plan.viewH) {
         targetY = caretBottom + marginY - plan.viewH;
@@ -1172,6 +1240,22 @@ bool ensureCaretVisibleInCamera(const chwp::render::EditResult& res, chwp::rende
         noteCamera(plan.scrollX, plan.scrollY, plan.percent, false, false);
     }
     return true;
+}
+
+// 문서를 바꾸지 않은 캐럿 이동을 화면에 보인다.
+void revealCaretNow(const chwp::render::EditResult& res) {
+    if (!res.handled || !res.caret.hit) return;
+    chwp::render::ViewPlan plan = gCamera.plan(!gScreenOn);
+    if (!ensureCaretVisibleInCamera(res, plan)) return;
+    if (gScreenOn) {
+        gFrames.bakeVisibleNow(gDoc.doc, gDoc.pages, plan);
+        useFramePlan(plan);
+        gLastPlan = std::move(plan);
+        publishPlan();
+        ensureScreenFrames();
+    } else {
+        gLastPlan = std::move(plan);
+    }
 }
 
 void syncEditedDocument(const chwp::render::EditResult& res) {
@@ -1357,6 +1441,32 @@ void syncFullRelayout(bool bringSelection) {
     gViewportDirty = true;
 }
 
+// 누름틀 안내문(한글 2024): 블록 없는 캐럿이 손대지 않은 누름틀 안에 있는 동안 감추고 뒤 글을 당긴다. 보기 상태라
+// 되돌리기·고친 표시가 없고, 무엇을 감출지는 코어(click_here_commands)가 정한다. 문단을 다시 놓았으면 화면만 맞춘다.
+// 일꾼이 멈췄거나 없을 때 캐럿에 맞춘다. 일꾼이 있으면 편집 끝(resumeCrewAfterEdit)이 부른다.
+chwp::render::EditResult syncClickHereGuidePaused() {
+    if (gDoc.pages.empty()) return {};
+    chwp::render::PageFillGuard guard;
+    chwp::render::EditResult res = gDoc.syncClickHereGuide();
+    if (res.documentChanged) syncEditedDocument(res);
+    return res;
+}
+
+// 포인터 하나가 끝날 때(쪽 채우기 잠금을 잡지 않은 자리). 바꿨으면 참.
+bool syncClickHereGuideNow() {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    const chwp::render::EditResult res = syncClickHereGuidePaused();
+    if (wasCrew) resumeCrewAfterEdit(res);
+    return res.documentChanged;
+}
+
+// 편집·이동·저장 앞에 숨긴 안내문을 되돌린다(일꾼은 부르는 쪽이 멈춰 둔다).
+void revealClickHereGuideNow() {
+    const chwp::render::EditResult res = gDoc.revealClickHereGuide();
+    if (res.documentChanged) syncEditedDocument(res);
+}
+
 EditReport makeEditReport(const chwp::render::EditResult& res) {
     // 편집으로 새로 쓰게 된 글꼴(처음 고칠 때의 대체 글꼴, 고른 글꼴, 막힌 글꼴의 대역)은 core 가 정한다.
     // 셸이 받아 넣으면 문서를 다시 놓는다(fontJobLanded).
@@ -1370,7 +1480,7 @@ EditReport makeEditReport(const chwp::render::EditResult& res) {
     out.canRedo = chwp::render::canRedo();
     out.docState = gDoc.documentState();
     out.style = cursorStyleNow();
-    out.text = chwp::render::selectionText(gDoc.doc, gDoc.pages);
+    out.text = copyableSelectionText();
     if (res.documentChanged && res.fullInvalidation) {
         for (const chwp::render::Node& p : gDoc.pages) {
             out.pages.push_back(PageSize{p.width, p.height, p.marginLeft, p.marginRight, p.marginTop, p.marginBottom});
@@ -1385,6 +1495,7 @@ EditReport editText(const std::string& text, bool composing) {
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
     chwp::render::PageFillGuard guard;
+    revealClickHereGuideNow();
     // 조합 글이 아니면 줄 끝을 문단 나눔으로 넣는다(붙여 넣기). agent 글 넣기와 같은 DocSession 명령이다.
     std::vector<chwp::render::EditResult> steps;
     if (composing) steps.push_back(gDoc.insertText(text, true));
@@ -1408,6 +1519,7 @@ EditReport editHistory(bool backward) {
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
     chwp::render::PageFillGuard guard;
+    revealClickHereGuideNow();
     const chwp::render::EditResult res = backward
                                                ? gDoc.undo()
                                                : gDoc.redo();
@@ -1762,6 +1874,150 @@ EditReport editGoToPage(int page) {
 
 render::FormatFields bookmarkViewNow() { return gDoc.bookmarkView(); }
 
+render::FormatFields styleViewNow(int styleId) {
+    render::FormatFields out;
+    std::string rows;
+    for (const chwp::render::StyleRow& row : chwp::render::styleRows(gDoc.doc)) {
+        if (!rows.empty()) rows += '\n';
+        rows += std::to_string(row.id) + '\t' + row.name + '\t' + row.engName + '\t' + row.type + '\t' +
+                std::to_string(row.nextStyleId) + '\t' + std::to_string(row.shortcut);
+    }
+    out.emplace_back("rows", rows);
+    {
+        const chwp::render::EditScope scope = gDoc.bind();
+        out.emplace_back("caretStyleId", static_cast<double>(chwp::render::cursorStyle(gDoc.doc, gDoc.pages).styleId));
+    }
+    if (styleId >= 0) {
+        for (const auto& [key, value] : chwp::render::styleSummary(gDoc.doc, static_cast<std::uint32_t>(styleId))) {
+            // 길이는 pt 로 준다(HWPUNIT 100 = 1pt).
+            const double* n = std::get_if<double>(&value);
+            if (n && (key == "marginLeft" || key == "indent" || key == "marginRight" || key == "height")) {
+                out.emplace_back("info." + key, *n / 100.0);
+            } else {
+                out.emplace_back("info." + key, value);
+            }
+        }
+    }
+    for (const auto& [key, value] : gDoc.styleDraftFields()) out.emplace_back("draft." + key, value);
+    out.emplace_back("draft.active", gDoc.styleDraft.active);
+    return out;
+}
+
+namespace {
+
+// 스타일 가져오기 대화 상자가 연 문서. 그 문서의 머리말만 쓴다.
+std::optional<chwp::model::Document> gStyleSource;
+
+}  // namespace
+
+EditReport editToc(const std::string& action, const render::FormatFields& fields) {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    std::string why;
+    chwp::render::EditResult res;
+    if (action == "make") res = gDoc.makeToc(chwp::render::tocOptionsOfFields(fields), &why);
+    else if (action == "update") res = gDoc.updateToc(false, &why);
+    else if (action == "updateAll") res = gDoc.updateToc(true, &why);
+    else why = "모르는 차례 명령입니다.";
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged) report.error = why;
+    return report;
+}
+
+render::FormatFields openStyleSource(const Bytes& bytes) {
+    render::FormatFields out;
+    chwp::ParseResult parsed = chwp::parseDocument(bytes);
+    if (parsed.document.header.styles.empty()) {
+        gStyleSource.reset();
+        out.emplace_back("error", std::string("스타일을 읽을 수 없는 파일입니다."));
+        return out;
+    }
+    std::string rows;
+    for (const chwp::render::StyleRow& row : chwp::render::styleRows(parsed.document)) {
+        if (!rows.empty()) rows += '\n';
+        rows += std::to_string(row.id) + '\t' + row.name + '\t' + row.engName + '\t' + row.type + '\t' +
+                std::to_string(row.nextStyleId) + '\t' + std::to_string(row.shortcut);
+    }
+    out.emplace_back("rows", rows);
+    gStyleSource = std::move(parsed.document);
+    return out;
+}
+
+std::optional<Bytes> exportStyles() {
+    Bytes bytes;
+    std::string error;
+    if (!chwp::writeDocument(chwp::render::styleOnlyDocument(gDoc.doc), chwp::model::SourceFormat::Hwpx, bytes, {},
+                             &error)) {
+        return std::nullopt;
+    }
+    return bytes;
+}
+
+EditReport editStyleCommand(const std::string& action, const render::FormatFields& fields) {
+    const auto number = [&](const char* key, double fallback) {
+        for (const auto& [k, v] : fields) {
+            if (k != key) continue;
+            if (const double* n = std::get_if<double>(&v)) return *n;
+        }
+        return fallback;
+    };
+    if (action == "begin") {
+        gDoc.beginStyleDraft(static_cast<int>(number("editing", -1)));
+        return makeEditReport(chwp::render::EditResult{});
+    }
+    if (action == "set") {
+        gDoc.setStyleDraftFields(fields);
+        return makeEditReport(chwp::render::EditResult{});
+    }
+    if (action == "end") {
+        gDoc.endStyleDraft();
+        return makeEditReport(chwp::render::EditResult{});
+    }
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    std::string why;
+    chwp::render::EditResult res;
+    const auto id = static_cast<std::uint32_t>(std::max(0.0, number("styleId", 0)));
+    if (action == "commit") {
+        res = gDoc.commitStyleDraft(&why);
+    } else if (action == "delete") {
+        res = gDoc.deleteStyle(id, static_cast<std::uint32_t>(std::max(0.0, number("replacement", 0))), &why);
+    } else if (action == "move") {
+        res = gDoc.moveStyle(id, number("delta", 0) < 0 ? -1 : 1, &why);
+    } else if (action == "fromCaret") {
+        res = gDoc.styleFromCaret(id, &why);
+    } else if (action == "clearChar") {
+        res = gDoc.clearCharStyle(&why);
+    } else if (action == "import") {
+        std::vector<std::string> names;
+        for (const auto& [k, v] : fields) {
+            const std::string* text = std::get_if<std::string>(&v);
+            if (k != "names" || !text) continue;
+            std::size_t at = 0;
+            while (at <= text->size()) {
+                const std::size_t end = std::min(text->find('\n', at), text->size());
+                if (end > at) names.push_back(text->substr(at, end - at));
+                at = end + 1;
+            }
+        }
+        if (gStyleSource) res = gDoc.importStyles(*gStyleSource, names, &why);
+        else why = "스타일을 가져올 파일을 먼저 고르십시오.";
+    } else {
+        why = "모르는 스타일 명령입니다.";
+    }
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged && !res.handled) report.error = why;
+    return report;
+}
+
 EditReport editTableProperties(const render::FormatFields& fields) {
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
@@ -1882,7 +2138,7 @@ void redrawForViewMarks(const chwp::render::ViewMarks& before) {
     if (chwp::render::viewMarks().paragraphMarks()) chwp::layout::requestFontFaces({"함초롬바탕"});
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
-    if (before.memo != chwp::render::viewMarks().memo) chwp::render::placeMemos(gDoc.doc, gDoc.pages);
+    gDoc.viewMarksChanged(before);
     // 칸 그림은 노드 내용이 같으면 다시 쓴다(재활용). 노드는 그대로이고 그리는 것만 바뀌었으니 칸과 쪽 텍스처를 다 버린다.
     gFrames.clear();
     chwp::render::dropPageGpuCache(-1);
@@ -1961,6 +2217,39 @@ EditReport editInsertHyperlink(const std::string& text, const std::string& url) 
     EditReport report = makeEditReport(res);
     if (!res.documentChanged) report.error = why;
     return report;
+}
+
+render::FormatFields equationViewNow() {
+    // 미리 보기를 그릴 수식 글꼴을 편집기를 열 때 받는다(이미 있으면 받지 않는다).
+    std::vector<std::string> wants;
+    for (const std::string& face : chwp::layout::equationFontFaces("HancomEQN")) {
+        if (!chwp::layout::fontFaceAvailable(face)) wants.push_back(face);
+    }
+    if (!wants.empty()) chwp::layout::requestFontFaces(wants);
+    return gDoc.equationView();
+}
+
+EditReport editEquationSubmit(const std::string& script, std::int32_t baseUnit) {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    std::string why;
+    int story = -1;
+    int paragraph = -1;
+    int item = -1;
+    const bool editing = chwp::render::selectedEquationAt(gDoc.doc, story, paragraph, item);
+    const chwp::render::EditResult res =
+        editing ? gDoc.editEquation(script, baseUnit, &why) : gDoc.insertEquation(script, baseUnit, &why);
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged) report.error = why;
+    return report;
+}
+
+std::string equationPreviewNow(const std::string& script, std::int32_t baseUnit, bool* ready) {
+    return chwp::render::equationSvg(script, baseUnit, ready);
 }
 
 render::FormatFields pageControlFieldsNow(const std::string& kind) {
@@ -2073,13 +2362,109 @@ const std::vector<std::pair<std::string, render::FormatFields>>& formatShortcuts
 
 }  // namespace
 
+render::FormatFields clickHereViewNow() { return gDoc.clickHereView(); }
+
+EditReport editClickHere(const render::FormatFields& fields) {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    revealClickHereGuideNow();
+    std::string why;
+    const chwp::render::EditResult res = gDoc.modifyClickHere(fields, &why);
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.handled) report.error = why;
+    return report;
+}
+
 EditReport editShortcut(const std::string& command) {
+    // Hangul StyleShortcut1..10 (Ctrl+1..0, Ctrl+Alt+1..0): the Nth style in the document style list.
+    if (command.rfind("styleShortcut", 0) == 0) {
+        const int index = std::atoi(command.c_str() + 13) - 1;
+        const auto& styles = gDoc.doc.header.styles;
+        if (index < 0 || index >= static_cast<int>(styles.size())) return makeEditReport(chwp::render::EditResult{});
+        render::FormatPatch patch;
+        render::setFormatField(patch, "styleId", static_cast<double>(styles[static_cast<std::size_t>(index)].id));
+        return editStyle(patch);
+    }
     for (const auto& [name, fields] : formatShortcuts()) {
         if (name != command) continue;
         render::FormatPatch patch;
         for (const auto& [key, value] : fields) render::setFormatField(patch, key, value);
         return editStyle(patch);
     }
+    if (command == "clickHereEdit") {
+        EditReport report = makeEditReport(chwp::render::EditResult{});
+        report.dialog = "clickHere";
+        return report;
+    }
+    // 누름틀 넣기(한글 입력 탭 누름틀, InsertFieldCtrl). 한글 기본 안내문으로 바로 넣는다.
+    if (command == "insertClickHere") {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        std::string why;
+        const chwp::render::EditResult res = gDoc.insertClickHere({}, {}, {}, &why);
+        if (res.documentChanged) syncEditedDocument(res);
+        if (wasCrew) resumeCrewAfterEdit(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.handled) report.error = why;
+        return report;
+    }
+    // 변경 내용 추적(한글 검토 탭). 켜고 끄기는 알림 글로 지금 상태를 알린다.
+    if (command == "trackChanges") {
+        chwp::render::PageFillGuard guard;
+        const chwp::render::EditResult res = gDoc.toggleTrackChanges();
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        report.notice = chwp::render::trackRecording(gDoc.doc) ? "변경 내용 기록을 시작합니다." : "변경 내용 기록을 멈춥니다.";
+        return report;
+    }
+    if (command == "acceptChange" || command == "rejectChange" || command == "acceptAllChanges" ||
+        command == "rejectAllChanges" || command == "acceptAndMove" || command == "rejectAndMove") {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        std::string why;
+        const bool accept = command.rfind("accept", 0) == 0;
+        const char* scope = command.find("All") != std::string::npos ? "all"
+                            : command.find("AndMove") != std::string::npos ? "move"
+                                                                           : "caret";
+        const chwp::render::EditResult res = gDoc.resolveChanges(accept, scope, &why);
+        if (res.documentChanged) syncEditedDocument(res);
+        else revealCaretNow(res);
+        if (wasCrew) resumeCrewAfterEdit(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.handled) report.error = why;
+        return report;
+    }
+    if (command == "nextChange" || command == "prevChange") {
+        chwp::render::PageFillGuard guard;
+        const chwp::render::EditResult res = gDoc.moveToChange(command == "nextChange");
+        revealCaretNow(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.handled) report.error = command == "nextChange" ? "다음 바뀐 내용이 없습니다." : "이전 바뀐 내용이 없습니다.";
+        return report;
+    }
+    if (command == "linkBack" || command == "linkForward") {
+        // 한글 HyperlinkPrev·HyperlinkNext: 링크 이력의 앞·뒤. 대상 줄을 화면 가운데에 둔다.
+        chwp::render::PageFillGuard guard;
+        const chwp::render::EditResult res = gDoc.linkHistory(command == "linkForward");
+        gCenterCaretOnce = true;
+        revealCaretNow(res);
+        gCenterCaretOnce = false;
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.handled) report.error = command == "linkBack" ? "돌아갈 하이퍼링크 자리가 없습니다." : "다시 갈 하이퍼링크 자리가 없습니다.";
+        return report;
+    }
+    if (command == "updateToc") return editToc("update", {});
+    if (command == "updateAllToc") return editToc("updateAll", {});
     if (command == "breakPage") return editInsertBreak("page");
     if (command == "leaveNote") {
         // 주석 탭 닫기: 주 바로 뒤 본문으로 간다. 문서는 그대로다.
@@ -2099,8 +2484,22 @@ EditReport editShortcut(const std::string& command) {
         return report;
     }
     if (command == "modify") {
-        // 고치기(Ctrl+N,K): 캐럿 뒤(또는 고른 한 글자)의 덧말·글자 겹치기면 그 편집 대화 상자다.
+        // 고치기(Ctrl+N,K): 고른 수식이면 수식 편집기, 캐럿 뒤(또는 고른 한 글자)의 덧말·글자 겹치기면 그 편집 대화 상자다.
+        // 캐럿이 누름틀 안이면 누름틀 고치기다.
         EditReport report = makeEditReport(chwp::render::EditResult{});
+        int story = -1;
+        int paragraph = -1;
+        int item = -1;
+        if (chwp::render::selectedEquationAt(gDoc.doc, story, paragraph, item)) {
+            report.dialog = "equation";
+            return report;
+        }
+        for (const auto& [name, value] : gDoc.clickHereView()) {
+            if (name == "found" && std::get_if<bool>(&value) && *std::get_if<bool>(&value)) {
+                report.dialog = "clickHere";
+                return report;
+            }
+        }
         for (const auto& [name, value] : gDoc.glyphGroupView()) {
             if (name != "editKind") continue;
             if (const std::string* kind = std::get_if<std::string>(&value); kind && !kind->empty()) {
@@ -2264,6 +2663,24 @@ EditReport editCommit() {
     return makeEditReport(res);
 }
 
+// 지금 화면에 보이는 쪽마다의 세로 범위(쪽 HU).
+std::vector<chwp::render::ViewBand> visibleBands() {
+    std::vector<chwp::render::ViewBand> out;
+    const chwp::render::ViewPlan plan = gCamera.plan(false);
+    for (const chwp::render::ViewPage& vp : plan.pages) {
+        if (vp.index < 0 || vp.index >= static_cast<int>(gDoc.pages.size()) || vp.h <= 0) continue;
+        const chwp::render::Node& page = gDoc.pages[static_cast<std::size_t>(vp.index)];
+        if (page.height <= 0) continue;
+        const double perPixel = static_cast<double>(page.height) / static_cast<double>(vp.h);
+        const double top = (static_cast<double>(plan.scrollY) - vp.y) * perPixel;
+        const double bottom = (static_cast<double>(plan.scrollY + plan.viewH) - vp.y) * perPixel;
+        if (bottom <= 0 || top >= page.height) continue;
+        out.push_back(chwp::render::ViewBand{vp.index, static_cast<std::int32_t>(std::ceil(top)),
+                                            static_cast<std::int32_t>(std::floor(bottom))});
+    }
+    return out;
+}
+
 EditReport editKey(int key, bool shift, bool ctrl, bool alt) {
     // 낱자모를 묶는 중이면 지우기는 마지막 낱자모만 뺀다. 다른 키는 조합을 끝낸다(편집 명령이 확정한다).
     if (gHangul.active() && chwp::render::compositionActive() &&
@@ -2275,7 +2692,14 @@ EditReport editKey(int key, bool shift, bool ctrl, bool alt) {
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
     chwp::render::PageFillGuard guard;
-    const chwp::render::EditResult res = gDoc.keyDown(static_cast<chwp::render::EditKey>(key), shift, ctrl, alt);
+    revealClickHereGuideNow();
+    // Ctrl+Home·End 는 한글 MoveViewBegin·End: 화면에 온전히 보이는 첫·마지막 줄. 보이는 범위는 카메라에서 셈한다.
+    const bool viewMove = ctrl && !alt &&
+                          (key == static_cast<int>(chwp::render::EditKey::Home) ||
+                           key == static_cast<int>(chwp::render::EditKey::End));
+    const chwp::render::EditResult res =
+        viewMove ? gDoc.moveToView(visibleBands(), key == static_cast<int>(chwp::render::EditKey::End), shift)
+                 : gDoc.keyDown(static_cast<chwp::render::EditKey>(key), shift, ctrl, alt);
     if (res.documentChanged) {
         syncEditedDocument(res);
     } else if (res.handled && res.caret.hit) {
@@ -2357,10 +2781,16 @@ chwp::render::PageBitmap gDialogPreview;
 }  // namespace
 
 render::FormatView formatDialogView(int kind, const render::FormatFields& patch) {
+    if (kind == 5 || kind == 6) return gDoc.styleDraftFormatView(kind == 6, patch);
     return chwp::render::formatView(gDoc.doc, gDoc.pages, dialogKind(kind), patch);
 }
 
 EditReport editFormatDialog(int kind, const render::FormatFields& patch, bool wholeDocument) {
+    if (kind == 5 || kind == 6) {
+        // 스타일 초안 모양만 고친다. 문서는 스타일 대화 상자에서 맺을 때 바뀐다.
+        gDoc.applyStyleDraftFormat(kind == 6, patch);
+        return makeEditReport(chwp::render::EditResult{});
+    }
     const chwp::render::FormatViewKind which = dialogKind(kind);
     const chwp::render::FormatFields resolved = chwp::render::resolveFormatView(gDoc.doc, gDoc.pages, which, patch);
     if (which == chwp::render::FormatViewKind::Page) return editPageSetup(resolved, wholeDocument);
@@ -2383,6 +2813,10 @@ EditReport editFormatDialog(int kind, const render::FormatFields& patch, bool wh
 }
 
 const render::PageBitmap* formatDialogPreview(int kind, const render::FormatFields& patch, int width, int height) {
+    if (kind == 5 || kind == 6) {
+        gDialogPreview = gDoc.styleDraftPreview(kind == 6, patch, width, height);
+        return gDialogPreview.width > 0 ? &gDialogPreview : nullptr;
+    }
     gDialogPreview = chwp::render::renderFormatPreview(gDoc.doc, gDoc.pages, dialogKind(kind), patch, width, height);
     return gDialogPreview.width > 0 ? &gDialogPreview : nullptr;
 }
@@ -2630,10 +3064,29 @@ void noteCameraIf(bool force, int scrollX, int scrollY, int percent, bool coasti
 
 
 void frameAfterEdit() {
+    // 일꾼이 없으면 여기서 누름틀 안내문을 맞춘다(일꾼이 있으면 편집 끝에서 이미 맞췄다).
+    if (gHeldFrames == 0 && !crewRunning()) syncClickHereGuidePaused();
     if (gHeldFrames == 0 && gScreenOn && chwp::render::screenReady()) screenFrame(0, nullptr);
 }
 
+// 칸마다 모은 화면 글자를 지웠다(글꼴이 들어와 글자를 다시 고를 때. 문서를 다시 놓지 않아도 지운다).
+// 들고 있는 칸과 일꾼이 다 구운 칸은 글자 없는 그림만 남으니 모두 버리고 다시 굽는다. 화면이 아직 없어도
+// 일꾼이 미리 구운 칸이 있으니 같은 판단을 한다.
+void rebakeFramesWithoutGlyphs() {
+    const int epoch = chwp::render::screenGlyphEpoch();
+    if (epoch == gScreenGlyphSeen) return;
+    gScreenGlyphSeen = epoch;
+    if (gDoc.pages.empty()) return;
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::EditResult redraw;
+    redraw.fullInvalidation = true;
+    syncEditedDocument(redraw);
+    if (wasCrew) resumeCrewAfterEdit(redraw);
+}
+
 bool screenFrame(double time, void*) {
+    rebakeFramesWithoutGlyphs();
     if (!gScreenOn || !chwp::render::screenReady()) {
         // 화면이 없으면 매끄럽게 지킬 프레임이 없다. 입력이 켜 둔 '손이 움직이는 중'을 풀어 일꾼이 쉬지 않게 한다.
         setCrewInteracting(false);
@@ -3361,6 +3814,25 @@ const std::vector<std::uint8_t>* renderPagePng(int page, int pixelHeight) {
         gPagePng[static_cast<std::size_t>(page)] = gDoc.renderPage(page, pixelHeight, gFrames).png;
     }
     return &gPagePng[static_cast<std::size_t>(page)];
+}
+
+std::string printBlockedReason() {
+    return gDoc.printBlocked() ? "배포용 문서라 인쇄와 PDF 저장이 막혀 있습니다." : std::string();
+}
+
+Bytes exportPdfNow(int dpi, int from, int to) {
+    if (gDoc.printBlocked()) return {};
+    if (gDoc.pages.empty() && !gDoc.doc.sections.empty()) gDoc.layout();
+    // 쪽 글자를 채우는 일꾼과 같은 쪽을 만지지 않게 멈춘 뒤 그린다.
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    Bytes out;
+    {
+        chwp::render::PageFillGuard guard;
+        out = gDoc.exportPdf(dpi, gFrames, from, to);
+    }
+    if (wasCrew) resumeCrewAfterEdit(chwp::render::EditResult{});
+    return out;
 }
 
 const render::PageBitmap* renderPagePixels(int page, int pixelHeight) {
@@ -4498,8 +4970,14 @@ void pauseCrewForEdit() {
     });
 }
 
-void resumeCrewAfterEdit(const chwp::render::EditResult& res) {
+void resumeCrewAfterEdit(const chwp::render::EditResult& edited) {
     if (!crewRunning()) return;
+    // 편집 뒤 캐럿에 맞춰 누름틀 안내문을 숨기거나 보인다. 일꾼이 멈춘 지금 한다. 그랬으면 일감을 처음부터 다시 본다.
+    chwp::render::EditResult res = edited;
+    if (syncClickHereGuidePaused().documentChanged) {
+        res.documentChanged = true;
+        res.fullInvalidation = true;
+    }
     {
         std::lock_guard lock(gWorkMu);
         if (res.fullInvalidation) {
@@ -5042,6 +5520,9 @@ bool paperPoint(double vx, double vy, bool clampToNearest, int& page, int& x, in
                 nearest->w, nearest->h);
 }
 
+// 마지막으로 누른 포인터가 Shift 와 함께였는지(InputPointer::shift).
+bool gPointerShift = false;
+
 SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     SelectionReport out;
     if (!outcome.select) return out;
@@ -5069,6 +5550,7 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     chwp::render::PointerSample sample;
     sample.id = outcome.id;
     sample.device = outcome.device;
+    sample.shift = gPointerShift;
     sample.time = outcome.time;
     sample.dpr = gLastPlan.dpr > 0 ? gLastPlan.dpr : 1;
     sample.viewX = outcome.x;
@@ -5090,6 +5572,8 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     if (outcome.tap) {
         view = chwp::render::applyPointer(gDoc.doc, gDoc.pages, 3, page, x, y, gCamera.state().percent, sample);
     }
+    // 누름틀 안을 누르면 안내문을 숨기고, 밖을 누르면 다시 보인다(한글).
+    if (kind != 2 || outcome.tap) syncClickHereGuideNow();
     // 도형 그리기를 마쳤으면 그 도형을 문서에 넣는다. 무엇을 어떻게 넣을지는 코어가 정한다.
     if (kind == 3 || outcome.tap) {
         const bool wasCrew = crewRunning();
@@ -5132,6 +5616,32 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
             resumeCrewAfterEdit(resumed);
         }
     }
+    // 링크 글을 끌지 않고 한 번 누르면 따라간다(한글과 같다). Shift 누르기·블록 고르기는 따라가지 않는다.
+    if ((kind == 3 || outcome.tap) && !out.edited && !gPointerShift && page >= 0 &&
+        !chwp::render::pointerCursor().hasSelection && chwp::render::linkUnder(gDoc.doc, gDoc.pages, page, x, y)) {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrew();
+        std::string url;
+        std::string why;
+        const chwp::render::EditResult followed = gDoc.followLinkAt(page, x, y, &url, &why);
+        if (followed.handled) {
+            gCenterCaretOnce = true;
+            if (followed.documentChanged) {
+                syncEditedDocument(followed);
+                out.edited = true;
+            } else {
+                revealCaretNow(followed);
+            }
+            gCenterCaretOnce = false;
+            const chwp::render::PointerCursor cursor = chwp::render::pointerCursor();
+            view.active = cursor.active;
+            view.caret = cursor.caret;
+            if (!url.empty() && hostSlot().openUrl) hostSlot().openUrl(url);
+        } else if (!why.empty()) {
+            out.notice = why;
+        }
+        if (wasCrew) resumeCrewAfterEdit(followed);
+    }
     if (gScreenOn && chwp::render::screenReady()) {
         if (!gScreenLoop) {
             screenFrame(frameNow(), nullptr);
@@ -5147,7 +5657,7 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     if (kind != 2) {
         out.styled = true;
         out.style = cursorStyleNow();
-        out.text = chwp::render::selectionText(gDoc.doc, gDoc.pages);
+        out.text = copyableSelectionText();
     }
     out.event = event;
     gFallbackImages.clear();
@@ -5235,6 +5745,9 @@ const std::vector<KeyBinding>& keyBindings() {
         }
         out.push_back(KeyBinding{"Home", -1, false, true, "editKey", 8, false});
         out.push_back(KeyBinding{"End", -1, false, true, "editKey", 9, false});
+        // Ctrl+Home·End: 화면 처음·끝(한글 MoveViewBegin·MoveViewEnd).
+        out.push_back(KeyBinding{"Home", -1, true, false, "editKey", 8, false});
+        out.push_back(KeyBinding{"End", -1, true, false, "editKey", 9, false});
         out.push_back(KeyBinding{"PageUp", -1, true, false, "editKey", 14, false});
         out.push_back(KeyBinding{"PageDown", -1, true, false, "editKey", 15, false});
         // Esc 는 편집 입력칸에서만 코어로 보낸다(Shift+Esc 는 머리말·꼬리말 편집 끝내기).
@@ -5250,6 +5763,7 @@ const std::vector<KeyBinding>& keyBindings() {
         out.push_back(KeyBinding{"KeyV", -1, true, false, "paste", 0, false});
         out.push_back(KeyBinding{"KeyO", 0, true, false, "open", 0, false});
         out.push_back(KeyBinding{"KeyS", 0, true, false, "save", 0, false});
+        out.push_back(KeyBinding{"KeyP", 0, true, false, "print", 0, false});
         out.push_back(KeyBinding{"PageDown", 0, false, false, "pageDown", 0, false});
         out.push_back(KeyBinding{"PageUp", 0, false, false, "pageUp", 0, false});
         // 한글처럼 Alt+L 글자 모양, Alt+T 문단 모양, F7 편집 용지.
@@ -5269,7 +5783,7 @@ const std::vector<KeyBinding>& keyBindings() {
         out.push_back(KeyBinding{"KeyH", 0, true, false, "replaceDialog", 0, false});
         out.push_back(KeyBinding{"F2", 0, true, false, "replaceDialog", 0, false});
         out.push_back(KeyBinding{"KeyL", 0, true, false, "repeatFind", 0, false});
-        // 찾아가기(Alt+G).
+        // 찾아가기(한글 GotoDlg, Alt+G).
         out.push_back(KeyBinding{"KeyG", 0, false, true, "goToDialog", 0, false});
         // 칸 블록
         out.push_back(KeyBinding{"KeyM", 0, false, false, "mergeCells", 0, false, "cellBlock"});
@@ -5312,6 +5826,14 @@ const std::vector<KeyBinding>& keyBindings() {
         ctrlShift("KeyG", "marginLeftUp");
         ctrlShift("KeyD", "marginRightUp");
         ctrlShift("KeyF", "marginRightDown");
+        // Style shortcuts (Hangul 2024 StyleShortcut1..10 on Ctrl+1..0 and Ctrl+Alt+1..0) and the style dialog (F6).
+        for (int n = 1; n <= 10; ++n) {
+            const std::string key = "Digit" + std::to_string(n % 10);
+            const std::string command = "styleShortcut" + std::to_string(n);
+            out.push_back(KeyBinding{key, 0, true, false, command, 0, false});
+            out.push_back(KeyBinding{key, 0, true, true, command, 0, false});
+        }
+        out.push_back(KeyBinding{"F6", 0, false, false, "styleDialog", 0, false});
         out.push_back(KeyBinding{"F5", 0, true, true, "marginLeftDown", 0, false});
         out.push_back(KeyBinding{"F6", 0, true, true, "marginLeftUp", 0, false});
         out.push_back(KeyBinding{"F7", 0, true, true, "marginRightUp", 0, false});
@@ -5328,18 +5850,23 @@ const std::vector<KeyBinding>& keyBindings() {
         const auto chord = [&](const char* key, const char* next, const char* command) {
             out.push_back(KeyBinding{key, 0, true, false, command, 0, false, "", next});
         };
-        chord("KeyK", "KeyB", "bookmarkDialog");
-        chord("KeyK", "KeyH", "hyperlinkDialog");
+        chord("KeyK", "KeyB", "bookmarkDialog");   // BookmarkDlg
+        chord("KeyK", "KeyU", "updateToc");        // UpdateTOC
+        chord("KeyQ", "KeyB", "linkBack");         // HyperlinkPrev
+        chord("KeyQ", "KeyR", "linkForward");      // HyperlinkNext
+        chord("KeyK", "KeyA", "updateAllToc");     // UpdateAllTOC
+        chord("KeyK", "KeyH", "hyperlinkDialog");  // HyperlinkDlg
         chord("KeyN", "KeyN", "footnote");         // Footnotes
         chord("KeyN", "KeyE", "endnote");          // Endnotes
-        chord("KeyN", "KeyT", "tableDialog");
-        chord("KeyN", "KeyI", "pictureDialog");
-        chord("KeyN", "KeyG", "sectionDialog");
-        chord("KeyN", "KeyH", "headerFooterDialog");
+        chord("KeyN", "KeyT", "tableDialog");      // InsertTableDlg
+        chord("KeyN", "KeyI", "pictureDialog");    // InsertPictureDlg
+        chord("KeyN", "KeyG", "sectionDialog");    // SectionDlg
+        chord("KeyN", "KeyH", "headerFooterDialog");  // HeaderFooterDlg
         chord("KeyN", "KeyC", "captionToggle");    // InsertCaption(캡션 넣기·없애기)
-        chord("KeyN", "KeyK", "modify");
-        chord("KeyQ", "KeyF", "findDialog");
-        chord("KeyQ", "KeyA", "replaceDialog");
+        chord("KeyN", "KeyM", "equationDialog");
+        chord("KeyN", "KeyK", "modify");           // ModifyDlg(고치기)
+        chord("KeyQ", "KeyF", "findDialog");       // FindDlg
+        chord("KeyQ", "KeyA", "replaceDialog");    // FindReplaceDlg
         return out;
     }();
     return table;
@@ -5566,6 +6093,8 @@ InputReport input(const InputMessage& msg) {
     chwp::input::Camera camera;
     chwp::input::PointerOutcome outcome;
     if (type == "pointer") {
+        // 누를 때의 Shift 는 이 포인터의 고르기 판단(여러 개체 고르기)에 쓴다.
+        if (msg.pointer.phase.value_or(1) == 1) gPointerShift = msg.pointer.shift;
         chwp::input::PointerEvent event;
         event.device = static_cast<chwp::input::Device>(msg.pointer.device);
         event.phase = static_cast<chwp::input::Phase>(msg.pointer.phase.value_or(1));
@@ -5712,7 +6241,10 @@ InputReport input(const InputMessage& msg) {
         camera = gInput.tick(gCamera, 0);
     } else if (type == "readOnly" || type == "rulers" || type == "rulersToggle") {
         // 눈금자는 사용자가 켠 값(처음은 켬)이고, 보기 전용이면 숨긴다. 켠 값은 그대로 둔다.
-        if (type == "readOnly") chwp::render::setReadOnly(msg.on);
+        if (type == "readOnly") {
+            gShellReadOnly = msg.on;
+            chwp::render::setReadOnly(msg.on || gDoc.locked());
+        }
         else if (type == "rulers") gRulersWanted = msg.on;
         else gRulersWanted = !gRulersWanted;
         const chwp::render::ViewportState before = gCamera.state();

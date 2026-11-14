@@ -7,10 +7,13 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <optional>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include "chwp/common/crypto.hpp"
 #include "chwp/common/unicode.hpp"
 #include "chwp/unit.hpp"
 #include "chwp/container/zip.hpp"
@@ -90,6 +93,13 @@ std::int32_t i32(const pugi::xml_node& node, const char* attr, std::int32_t def 
 bool flag(const pugi::xml_node& node, const char* attr) {
     const std::string_view v = node.attribute(attr).as_string();
     return v == "1" || v == "true";
+}
+
+// 개체 원본 XML(우리가 풀지 않는 속성까지 저장할 때 그대로 쓴다).
+std::string rawXml(const pugi::xml_node& node) {
+    std::ostringstream out;
+    node.print(out, "", pugi::format_raw, pugi::encoding_utf8);
+    return out.str();
 }
 
 std::string str(const pugi::xml_node& node, const char* attr) {
@@ -358,7 +368,7 @@ bool isObjectElement(std::string_view name) {
 std::string fieldCtrlId(std::string_view type) {
     static const std::pair<std::string_view, const char*> map[] = {
         {"HYPERLINK", "%hlk"}, {"CLICK_HERE", "%clk"}, {"BOOKMARK", "%bmk"},
-        {"FORMULA", "%fmu"},   {"DATE", "%dte"},       {"DOC_DATE", "%ddt"},
+        {"FORMULA", "%fmu"},   {"DATE", "%dte"},       {"DOC_DATE", "%ddt"}, {"TABLEOFCONTENTS", "%toc"},
         {"PATH", "%pat"},      {"CROSSREF", "%xrf"},   {"MAILMERGE", "%mmg"},
         {"MEMO", "%%me"},      {"SUMMARY", "%smr"},    {"USER_INFO", "%usr"},
         // 한글 2024 는 문서 요약 필드를 SUMMERY 로 쓴다(InsertDocTitle 로 넣어 저장한 HWPX 로 확인).
@@ -398,10 +408,21 @@ private:
         return false;
     }
 
+    // 문서 암호로 잠근 항목(META-INF/manifest.xml 의 encryption-data).
+    struct LockInfo {
+        Bytes iv;
+        Bytes salt;
+        std::uint32_t iterations = 1024;
+        std::size_t keySize = 32;
+        Bytes checksum;  // 원문 앞 1 KiB 의 SHA-256
+    };
+
     bool loadXml(const std::string& path, pugi::xml_document& xml);
+    bool readEntry(const std::string& path, Bytes& out);
     void parseVersion();
     std::string findRootFile();
-    bool isEncrypted();
+    bool readLocks();
+    bool unlock();
     void parsePackage(const std::string& hpfPath, std::string& headerPath,
                       std::vector<std::string>& sectionPaths);
     void parseHeader(const pugi::xml_node& head);
@@ -417,6 +438,7 @@ private:
     Control parseSecPr(const pugi::xml_node& node);
     bool parseCtrl(const pugi::xml_node& node, Control& out);
     Control parseObject(const pugi::xml_node& node);
+    std::optional<Control> parseSwitchObject(const pugi::xml_node& node);
     static Placement readPlacement(const pugi::xml_node& node);
 
     void parsePreviewText();
@@ -426,7 +448,38 @@ private:
     ParseResult& result_;
     Document& doc_;
     zip::Archive zip_;
+    std::unordered_map<std::string, LockInfo> locks_;
+    std::unordered_map<std::string, Bytes> keys_;  // 소금·횟수마다 만든 열쇠
     std::unordered_map<std::string, std::string> hrefById_;
+    // 변경 추적 쌍(hp:insertBegin·deleteBegin ~ End). 문단마다 새로 시작한다(칸 안 문단은 따로 센다).
+    struct TrackState {
+        std::uint8_t track = 0;
+        std::uint32_t change = 0;
+        std::uint32_t mark = 0;
+        bool empty = false;  // 쌍을 연 뒤 아직 글·개체가 없다
+        ParaEndTrack end;    // 문단 끝의 빈 쌍
+    };
+    TrackState track_;
+    void markTrack(InlineItem& item) {
+        item.track = track_.track;
+        item.trackChange = track_.change;
+        item.trackMark = track_.mark;
+        track_.empty = false;
+    }
+    void trackMarkNode(const pugi::xml_node& n, std::string_view name) {
+        if (name == "insertBegin" || name == "deleteBegin") {
+            track_.track = name == "insertBegin" ? kTrackInsert : kTrackDelete;
+            track_.change = n.attribute("TcId").as_uint(0);
+            track_.mark = n.attribute("Id").as_uint(0);
+            track_.empty = true;
+        } else {
+            if (track_.empty && track_.track != 0) track_.end = ParaEndTrack{track_.track, track_.change, track_.mark};
+            track_ = TrackState{0, 0, 0, false, track_.end};
+        }
+    }
+    static bool isTrackMark(std::string_view name) {
+        return name == "insertBegin" || name == "insertEnd" || name == "deleteBegin" || name == "deleteEnd";
+    }
 };
 
 bool Parser::run() {
@@ -446,9 +499,9 @@ bool Parser::run() {
     }
 
     parseVersion();
-    if (isEncrypted()) {
+    if (readLocks()) {
         doc_.format.encrypted = true;
-        return fail("password-protected HWPX documents are not supported");
+        if (!unlock()) return false;
     }
 
     std::string headerPath = "Contents/header.xml";
@@ -497,9 +550,35 @@ bool Parser::run() {
     return true;
 }
 
+bool Parser::readEntry(const std::string& path, Bytes& out) {
+    if (!zip_.read(path, out)) return false;
+    const auto found = locks_.find(path);
+    if (found == locks_.end()) return true;
+    const LockInfo& lock = found->second;
+    const std::string cacheKey(lock.salt.begin(), lock.salt.end());
+    auto key = keys_.find(cacheKey + std::to_string(lock.iterations));
+    if (key == keys_.end()) {
+        const auto start = crypto::sha256(
+            ByteView(reinterpret_cast<const std::uint8_t*>(options_.password.data()), options_.password.size()));
+        key = keys_.emplace(cacheKey + std::to_string(lock.iterations),
+                            crypto::pbkdf2Sha1(start, lock.salt, lock.iterations, lock.keySize)).first;
+    }
+    const crypto::Aes aes(key->second);
+    if (!aes.ok()) return false;
+    const Bytes packed = crypto::aesCbcDecrypt(aes, lock.iv, out);
+    Bytes plain;
+    if (!zip::inflateRaw(packed, plain)) return false;
+    if (!lock.checksum.empty()) {
+        const auto sum = crypto::sha256(ByteView(plain).subspan(0, std::min<std::size_t>(plain.size(), 1024)));
+        if (!std::equal(sum.begin(), sum.end(), lock.checksum.begin(), lock.checksum.end())) return false;
+    }
+    out = std::move(plain);
+    return true;
+}
+
 bool Parser::loadXml(const std::string& path, pugi::xml_document& xml) {
     Bytes bytes;
-    if (!zip_.read(path, bytes)) return false;
+    if (!readEntry(path, bytes)) return false;
     // 공백만 있는 텍스트(<hp:t>  </hp:t>)도 본문이므로 보존한다.
     const auto res = xml.load_buffer(bytes.data(), bytes.size(),
                                      pugi::parse_default | pugi::parse_ws_pcdata,
@@ -536,11 +615,44 @@ std::string Parser::findRootFile() {
     return "Contents/content.hpf";
 }
 
-bool Parser::isEncrypted() {
+bool Parser::readLocks() {
     if (!zip_.contains("META-INF/manifest.xml")) return false;
     pugi::xml_document xml;
     if (!loadXml("META-INF/manifest.xml", xml)) return false;
-    return static_cast<bool>(descendant(xml, "encryption-data"));
+    for (auto entry : xml.document_element().children()) {
+        if (!is(entry, "file-entry")) continue;
+        const auto data = child(entry, "encryption-data");
+        if (!data) continue;
+        LockInfo lock;
+        lock.checksum = crypto::base64Decode(str(data, "checksum"));
+        if (auto alg = child(data, "algorithm")) lock.iv = crypto::base64Decode(str(alg, "initialisation-vector"));
+        if (auto kd = child(data, "key-derivation")) {
+            lock.salt = crypto::base64Decode(str(kd, "salt"));
+            if (const std::uint32_t n = u32(kd, "iteration-count")) lock.iterations = n;
+            if (const std::uint32_t n = u32(kd, "key-size")) lock.keySize = n;
+        }
+        locks_[str(entry, "full-path")] = std::move(lock);
+    }
+    return !locks_.empty();
+}
+
+// 암호로 잠근 문서: 암호가 없으면 물어야 하고, 머리(header.xml)가 검사합대로 풀리지 않으면 틀린 암호다.
+bool Parser::unlock() {
+    if (options_.password.empty()) {
+        result_.needPassword = true;
+        return fail("password required");
+    }
+    for (const auto& [path, lock] : locks_) {
+        Bytes probe;
+        if (!readEntry(path, probe)) {
+            result_.needPassword = true;
+            result_.wrongPassword = true;
+            return fail("wrong password");
+        }
+        break;
+    }
+    doc_.format.password = options_.password;
+    return true;
 }
 
 void Parser::parsePackage(const std::string& hpfPath, std::string& headerPath,
@@ -602,12 +714,14 @@ void Parser::parsePackage(const std::string& hpfPath, std::string& headerPath,
             bin.path = resolve(mi.href);
             bin.extension = extensionOf(mi.href);
             bin.mediaType = mi.mediaType;
-            bin.storage = mi.embedded ? "EMBEDDING" : "LINK";
+            // 한글은 OLE 를 isEmbeded="0" 으로 적지만 데이터는 묶음 안에 있다. 묶음에 있으면 STORAGE 다.
+            bin.storage = mi.embedded ? "EMBEDDING" : zip_.contains(bin.path) ? "STORAGE" : "LINK";
             for (const auto& e : zip_.entries()) {
                 if (e.name == bin.path) bin.size = e.size;
             }
-            if (options_.loadBinData && mi.embedded) {
-                if (!zip_.read(bin.path, bin.data)) warn("failed to read bin data: " + bin.path);
+            // 잠근 문서의 그림은 여기서 풀어 둔다(나중에 원본 묶음에서 읽으면 잠긴 바이트다).
+            if ((options_.loadBinData || locks_.count(bin.path)) && bin.storage != "LINK") {
+                if (!readEntry(bin.path, bin.data)) warn("failed to read bin data: " + bin.path);
             }
             doc_.header.binItems.push_back(std::move(bin));
         }
@@ -796,6 +910,32 @@ void Parser::parseHeader(const pugi::xml_node& head) {
             h.bullets.push_back(std::move(bullet));
         }
     }
+    // 변경 추적 기록과 작성자(refList 안), 기록 중 여부(head 의 trackchageConfig).
+    if (auto list = child(refList, "trackChanges")) {
+        for (auto n : list.children()) {
+            if (!is(n, "trackChange")) continue;
+            TrackChange tc;
+            tc.id = u32(n, "id");
+            tc.type = str(n, "type");
+            tc.date = str(n, "date");
+            tc.authorId = u32(n, "authorID");
+            tc.hide = flag(n, "hide");
+            if (n.attribute("charshapeID")) tc.charShapeId = u32(n, "charshapeID");
+            if (n.attribute("parashapeID")) tc.paraShapeId = u32(n, "parashapeID");
+            h.trackChanges.push_back(std::move(tc));
+        }
+    }
+    if (auto list = child(refList, "trackChangeAuthors")) {
+        for (auto n : list.children()) {
+            if (!is(n, "trackChangeAuthor")) continue;
+            TrackAuthor author;
+            author.id = u32(n, "id");
+            author.name = str(n, "name");
+            author.mark = !n.attribute("mark") || flag(n, "mark");
+            h.trackAuthors.push_back(std::move(author));
+        }
+    }
+    if (auto config = child(head, "trackchageConfig")) h.trackConfigFlags = u32(config, "flags");
     auto takeForbidden = [&](const pugi::xml_node& list) {
         for (auto word : list.children()) {
             if (!is(word, "forbidden") && !is(word, "forbiddenWord")) continue;
@@ -977,7 +1117,11 @@ void Parser::parseSection(const pugi::xml_node& sec, Section& section) {
 }
 
 Paragraph Parser::parseParagraph(const pugi::xml_node& p) {
+    const TrackState outer = track_;
+    track_ = TrackState{};
     Paragraph para;
+    para.fileId = u32(p, "id");
+    if (para.fileId == 2147483648u) para.fileId = 0;
     para.paraShapeId = u32(p, "paraPrIDRef");
     para.styleId = u32(p, "styleIDRef");
     para.pageBreak = flag(p, "pageBreak");
@@ -986,6 +1130,7 @@ Paragraph Parser::parseParagraph(const pugi::xml_node& p) {
         if (is(c, "run")) {
             Run run;
             run.charShapeId = u32(c, "charPrIDRef");
+            run.charTrackChange = u32(c, "charTcId");
             parseRun(c, run);
             para.runs.push_back(std::move(run));
         } else if (is(c, "linesegarray") && options_.keepLineSegs) {
@@ -1013,16 +1158,21 @@ Paragraph Parser::parseParagraph(const pugi::xml_node& p) {
             }
         }
     }
+    para.endTrack = track_.end;
+    track_ = outer;
     return para;
 }
 
 void Parser::parseRun(const pugi::xml_node& run, Run& out) {
     std::string pending;
     std::string markpen;
+    std::uint32_t charStyle = kNoCharStyle;  // hp:t charStyleIDRef
     auto flush = [&] {
         if (!pending.empty()) {
             InlineItem item = InlineItem::makeText(std::move(pending));
             item.markpen = markpen;
+            item.charStyleId = charStyle;
+            markTrack(item);
             out.items.push_back(std::move(item));
             pending.clear();
         }
@@ -1032,6 +1182,12 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
         if (c.type() != pugi::node_element) continue;
         const std::string_view name = localName(c.name());
         if (name == "t") {
+            const pugi::xml_attribute styleRef = c.attribute("charStyleIDRef");
+            const std::uint32_t thisStyle = styleRef ? styleRef.as_uint() : kNoCharStyle;
+            if (thisStyle != charStyle) {
+                flush();
+                charStyle = thisStyle;
+            }
             for (auto n : c.children()) {
                 if (n.type() == pugi::node_pcdata || n.type() == pugi::node_cdata) {
                     pending += n.value();
@@ -1050,6 +1206,9 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
                 } else if (inner == "markpenEnd") {
                     flush();
                     markpen.clear();
+                } else if (isTrackMark(inner)) {
+                    flush();
+                    trackMarkNode(n, inner);
                 }
             }
         } else if (name == "markpenBegin") {
@@ -1059,6 +1218,9 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
         } else if (name == "markpenEnd") {
             flush();
             markpen.clear();
+        } else if (isTrackMark(name)) {
+            flush();
+            trackMarkNode(c, name);
         } else if (name == "secPr") {
             flush();
             out.items.push_back(InlineItem::makeControl(parseSecPr(c)));
@@ -1070,12 +1232,23 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
                 if (parseCtrl(cc, control)) {
                     InlineItem item = InlineItem::makeControl(std::move(control));
                     item.markpen = markpen;
+                    markTrack(item);
                     out.items.push_back(std::move(item));
                 }
             }
         } else if (isObjectElement(name)) {
             flush();
-            out.items.push_back(InlineItem::makeControl(parseObject(c)));
+            InlineItem item = InlineItem::makeControl(parseObject(c));
+            markTrack(item);
+            out.items.push_back(std::move(item));
+        } else if (name == "switch") {
+            // 차트는 hp:switch 의 hp:case(hp:chart) 와 hp:default(hp:ole, 한글이 그려 둔 미리 보기)로 온다.
+            flush();
+            if (auto control = parseSwitchObject(c)) {
+                InlineItem item = InlineItem::makeControl(std::move(*control));
+                markTrack(item);
+                out.items.push_back(std::move(item));
+            }
         } else if (name == "dutmal") {
             flush();
             Control control;
@@ -1414,6 +1587,7 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
     } else if (name == "fieldBegin") {
         c.kind = ControlKind::Field;
         c.ctrlId = fieldCtrlId(str(node, "type"));
+        c.fieldType = str(node, "type");
         c.name = str(node, "name");
         c.fieldId = u32(node, "id");
         if (str(node, "editable") == "1") c.fieldProps |= 1u;
@@ -1421,6 +1595,9 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
         for (auto param : child(node, "parameters").children()) {
             if (is(param, "stringParam") && str(param, "name") == "Command") {
                 c.command = collectText(param);
+            } else if (is(param, "stringParam") && c.ctrlId != "%fmu" && c.ctrlId != "%%me" &&
+                       proofCtrlIdOfType(c.fieldType).empty()) {
+                c.fieldStrings.emplace_back(str(param, "name"), collectText(param));
             } else if (is(param, "integerParam") && str(param, "name") == "Prop") {
                 c.fieldExtra = static_cast<std::uint8_t>(std::stoul("0" + collectText(param)));
             } else if (is(param, "integerParam") && str(param, "name") == "Number") {
@@ -1463,6 +1640,7 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
 Placement Parser::readPlacement(const pugi::xml_node& node) {
     Placement p;
     p.zOrder = i32(node, "zOrder");
+    p.instanceId = u32(node, "id");
     p.textWrap = str(node, "textWrap");
     if (const std::string flow = str(node, "textFlow"); !flow.empty()) p.textFlow = flow;
     p.numberingType = str(node, "numberingType");
@@ -1829,11 +2007,57 @@ Control Parser::parseObject(const pugi::xml_node& node) {
         }
     } else if (name == "ole") {
         c.kind = ControlKind::Ole;
+        c.binItemId = str(node, "binaryItemIDRef");
+        c.hwpxXml = rawXml(node);
+        OleInfo ole;
+        if (node.attribute("objectType")) ole.objectType = str(node, "objectType");
+        if (node.attribute("drawAspect")) ole.drawAspect = str(node, "drawAspect");
+        ole.hasMoniker = flag(node, "hasMoniker");
+        ole.eqBaseLine = i32(node, "eqBaseLine");
+        if (auto extent = child(node, "extent")) {
+            ole.extentX = i32(extent, "x");
+            ole.extentY = i32(extent, "y");
+        }
+        c.ole = ole;
     } else if (name == "textart" || name == "chart" || name == "video") {
         c.kind = ControlKind::Shape;
-        if (name == "textart" && c.text.empty()) c.text = str(node, "text");
-        if (auto pr = child(node, "textartPr")) {
-            if (c.equationFont.empty()) c.equationFont = str(pr, "fontName");
+        c.hwpxXml = rawXml(node);
+        if (name == "textart") {
+            if (c.text.empty()) c.text = str(node, "text");
+            TextArt art;
+            if (auto pr = child(node, "textartPr")) {
+                art.fontName = str(pr, "fontName");
+                art.fontStyle = str(pr, "fontStyle");
+                if (pr.attribute("fontType")) art.fontType = str(pr, "fontType");
+                art.shape = str(pr, "textShape");
+                art.shapeNumber = textArtShapeCode(art.shape);
+                if (pr.attribute("lineSpacing")) art.lineSpacing = i32(pr, "lineSpacing");
+                if (pr.attribute("charSpacing")) art.charSpacing = i32(pr, "charSpacing");
+                if (pr.attribute("align")) art.align = str(pr, "align");
+                if (auto shadow = child(pr, "shadow")) {
+                    // 한글처럼 번호로 읽어 한글이 쓰는 이름으로 둔다(DROP 은 PARELLEL_LEFTTOP).
+                    art.shadowType = textArtShadowName(textArtShadowCode(str(shadow, "type")));
+                    art.shadowColor = str(shadow, "color");
+                    art.shadowX = i32(shadow, "offsetX");
+                    art.shadowY = i32(shadow, "offsetY");
+                    art.shadowAlpha = u32(shadow, "alpha");
+                }
+            }
+            for (int k = 0; k < 4; ++k) {
+                const std::string ptName = "pt" + std::to_string(k);
+                if (auto pt = child(node, ptName.c_str())) {
+                    art.corners[static_cast<std::size_t>(k)] = ShapePoint{i32(pt, "x"), i32(pt, "y")};
+                }
+            }
+            c.textArt = std::move(art);
+        } else if (name == "video") {
+            // 그리기는 첫 장면 그림(imageIDRef)이다.
+            c.binItemId = str(node, "imageIDRef");
+            VideoInfo video;
+            if (node.attribute("videotype")) video.type = str(node, "videotype");
+            video.fileBinId = str(node, "fileIDRef");
+            video.tag = str(node, "tag");
+            c.video = std::move(video);
         }
     } else {
         c.kind = ControlKind::Shape;
@@ -1856,9 +2080,32 @@ Control Parser::parseObject(const pugi::xml_node& node) {
     return c;
 }
 
+std::optional<Control> Parser::parseSwitchObject(const pugi::xml_node& node) {
+    pugi::xml_node chart;
+    pugi::xml_node fallback;
+    for (auto branch : node.children()) {
+        if (branch.type() != pugi::node_element) continue;
+        for (auto item : branch.children()) {
+            if (item.type() != pugi::node_element || !isObjectElement(localName(item.name()))) continue;
+            if (is(branch, "case") && is(item, "chart") && !chart) chart = item;
+            if (is(branch, "default") && !fallback) fallback = item;
+        }
+    }
+    if (!chart && !fallback) return std::nullopt;
+    Control c = parseObject(fallback ? fallback : chart);
+    if (!chart) return c;
+    // 차트: 그림은 대신 그림(OLE 미리 보기)으로 하고, 저장은 hp:switch 째로 한다. 차트 XML 도 같이 둔다.
+    c.hwpxXml = rawXml(node);
+    const std::string part = str(chart, "chartIDRef");
+    Bytes bytes;
+    if (!part.empty() && readEntry(part, bytes)) c.hwpxParts.emplace_back(part, std::move(bytes));
+    if (!fallback) c.kind = ControlKind::Shape;
+    return c;
+}
+
 void Parser::parsePreviewText() {
     Bytes bytes;
-    if (!zip_.read("Preview/PrvText.txt", bytes)) return;
+    if (!readEntry("Preview/PrvText.txt", bytes)) return;
     std::string text(bytes.begin(), bytes.end());
     if (text.rfind("\xEF\xBB\xBF", 0) == 0) text.erase(0, 3);
     doc_.previewText = std::move(text);

@@ -38,6 +38,12 @@ struct FormatInfo {
     bool compressed = false;
     bool encrypted = false;
     bool distribution = false;  // 배포용 문서
+    // 배포용 문서: 복사·인쇄를 막는지, 그리고 다시 저장할 때 쓰는 256 바이트 배포용 문서 데이터(열쇠가 든다).
+    bool noCopy = false;
+    bool noPrint = false;
+    std::vector<std::uint8_t> distributeData;
+    // 문서 암호. 열 때 받은 암호로, 저장할 때 같은 암호로 다시 잠근다. 밖으로 내보내지 않는다(JSON 에도 없다).
+    std::string password;
 };
 
 struct Metadata {
@@ -258,7 +264,7 @@ struct TabDef {
     std::vector<TabStop> stops;
 };
 
-// 메모 모양(HWP DocInfo MEMO_SHAPE, HWPX hh:memoPr). 기본값은 한글 새 메모 모양이다.
+// 메모 모양(HWP DocInfo MEMO_SHAPE, HWPX hh:memoPr). 기본값은 한글 새 메모 모양이다(docs/memo-structure.md 2.1절).
 struct MemoShape {
     std::uint32_t width = 15591;      // HWPUNIT. 메모 상자 너비(55mm)
     std::uint8_t lineType = 1;        // 선 종류 번호(0 없음, 1 실선, 2 점선, 3 파선 …)
@@ -269,6 +275,33 @@ struct MemoShape {
     std::uint32_t memoType = 0;       // 0 NOMAL, 1 USER_INSERT … 높은 비트는 파일 그대로
     bool operator==(const MemoShape&) const = default;
 };
+
+// 변경 내용 추적(한글 2024 검토 > 변경 내용 추적). 한글이 저장한 HWPX 로 잰 꼴:
+//   머리 hh:trackChanges 의 기록 하나는 종류·작성자·시각이고, 같은 사람의 같은 종류 바꿈은 한 기록(TcId)을 함께 쓴다.
+//   본문의 바뀐 글은 hp:insertBegin/End·hp:deleteBegin/End 쌍(Id 는 쌍마다, TcId 는 기록)으로 감싼다. HWP 는 ViewText 의
+//   문단 범위 태그(0x10 넣기, 0x11 지우기, 0x12 글자 모양)로 같은 것을 적는다.
+struct TrackChange {
+    std::uint32_t id = 0;
+    std::string type = "Insert";  // Insert, Delete, CharShape, ParaShape
+    std::string date;             // 2026-11-12T00:42:00Z (UTC)
+    std::uint32_t authorId = 0;
+    bool hide = false;
+    std::optional<std::uint32_t> charShapeId;  // CharShape: 바뀌기 전 글자 모양
+    std::optional<std::uint32_t> paraShapeId;  // ParaShape: 바뀌기 전 문단 모양
+    std::vector<std::uint8_t> hwpRaw;           // HWP 에서 읽은 레코드(TRACK_CHANGE_CONTENT) 그대로. 다시 쓸 때 쓴다
+};
+// HWP 변경 추적 시각(지역 시각 년·월·일·시·분) ↔ HWPX 시각 글(UTC "YYYY-MM-DDTHH:MM:00Z").
+std::string trackDateFromLocal(int year, int month, int day, int hour, int minute);
+void trackDateToLocal(const std::string& iso, int& year, int& month, int& day, int& hour, int& minute);
+struct TrackAuthor {
+    std::uint32_t id = 0;
+    std::string name;
+    bool mark = true;
+};
+// 글·문단 끝의 바뀜 종류. 0 이면 없다.
+inline constexpr std::uint8_t kTrackNone = 0;
+inline constexpr std::uint8_t kTrackInsert = 1;
+inline constexpr std::uint8_t kTrackDelete = 2;
 
 struct DocHeader {
     std::uint32_t sectionCount = 0;
@@ -285,7 +318,11 @@ struct DocHeader {
     std::vector<TabDef> tabDefs;
     std::vector<BinItem> binItems;
     std::vector<std::string> forbiddenWords;
-    std::vector<KeptRecord> kept;  // 메모 모양, 변경 추적, 금칙, 호환 문서 등 아직 필드가 없는 레코드
+    std::vector<TrackChange> trackChanges;
+    std::vector<TrackAuthor> trackAuthors;
+    // HWPX hh:trackchageConfig flags. 1 번 비트가 기록 중이다(한글 새 문서 56, 켜면 57).
+    std::uint32_t trackConfigFlags = 56;
+    std::vector<KeptRecord> kept;  // 메모 모양, 금칙, 호환 문서 등 아직 필드가 없는 레코드
 };
 
 // ---------------------------------------------------------------------------
@@ -422,6 +459,8 @@ struct Placement {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::int32_t zOrder = 0;
+    // 개체 고유 번호(HWPX 개체 id, HWP 개체 공통 속성의 instance id). 0 이면 없다. 차례 하이퍼링크가 이 번호로 개체를 가리킨다.
+    std::uint32_t instanceId = 0;
     std::int32_t marginLeft = 0;    // 바깥 여백. 본문이 개체를 피하는 영역이 이만큼 더 커진다.
     std::int32_t marginRight = 0;
     std::int32_t marginTop = 0;
@@ -533,6 +572,23 @@ enum class ControlKind {
     FieldEnd      // 필드 끝. 앞의 Field(하이퍼링크 등)의 범위가 여기서 끝난다. 글자 칸은 없다
 };
 const char* controlKindName(ControlKind kind);
+// 글맵시 값의 HWP 번호 ↔ HWPX 이름(한글 2024 로 HWPX 를 열어 HWP 로 저장해 쟀다).
+// 정렬 LEFT 0, RIGHT 1, CENTER 2, FULL 3, TABLE 4. 모양은 textArtShapeName.
+// 그림자 NONE 0, PARELLEL_LEFTTOP 1, PARELLEL_RIGHTTOP 2, PARELLEL_LEFTBOTTOM 3, PARELLEL_RIGHTBOTTOM 4,
+// SHEAR_LEFTTOP 5, SHEAR_RIGHTTOP 6, SHEAR_LEFTBOTTOM 7, SHEAR_RIGHTBOTTOM 8(한글 2024 가 HWP 를 HWPX 로 저장할 때 쓰는
+// 이름). DROP 은 1, CONTINUOUS 는 2 로 읽는다. 모르는 이름은 0 이다. 한글은 1~8 을 모두 같게 그린다(자리만 다르다).
+const char* textArtAlignName(int code);
+int textArtAlignCode(const std::string& name);
+const char* textArtShadowName(int code);
+int textArtShadowCode(const std::string& name);
+// 글맵시 모양 번호 ↔ textShape 이름. 모르는 번호면 빈 글, 모르는 이름이면 -1.
+const char* textArtShapeName(int code);
+int textArtShapeCode(const std::string& name);
+// OLE 개체 속성 비트(HWP) ↔ HWPX 값.
+const char* oleObjectTypeName(int code);
+int oleObjectTypeCode(const std::string& name);
+const char* oleAspectName(int code);
+int oleAspectCode(const std::string& name);
 // 덧말·글자 겹치기 값의 HWP 번호 ↔ HWPX 이름. 번호 차례는 HWP 5.0 문서 형식(덧말 자리 0 위·1 아래·2 가운데,
 // 정렬은 문단 정렬 차례)과 OWPML 열거 차례다. 글자 겹치기 CHAR 0·SHAPE_CIRCLE 1 은 한글 2024 파일로 확인했다.
 const char* dutmalPosName(std::uint32_t code);
@@ -626,6 +682,45 @@ inline std::array<PageBorderFill, 3> defaultPageBorders() {
     return out;
 }
 
+// 글맵시 글꼴과 모양. HWP 레코드: 네 꼭짓점, 글, 글꼴 이름, 글꼴 스타일, 글꼴 종류 i32(1 TTF), 모양 i32, 줄 간격 i32,
+// 자간 i32, 정렬 i32, 그림자... HWPX: hp:textartPr fontName·fontStyle·fontType·textShape·lineSpacing·charSpacing·align.
+struct TextArt {
+    std::string fontName;
+    std::string fontStyle;
+    std::string fontType = "TTF";  // TTF(HWP 1), HFT
+    std::string shape;      // HWPX textShape 이름(예: WAVE2). HWP 에서 읽으면 번호에서 바꾼다(모르면 비어 있다)
+    int shapeNumber = -1;   // HWP 모양 번호(예: 17 = WAVE2). HWPX 에서 읽으면 이름에서 바꾼다(모르면 -1)
+    int lineSpacing = 120;
+    int charSpacing = 100;
+    std::string align = "LEFT";
+    std::string shadowType = "NONE";
+    std::string shadowColor = "#000000";
+    std::int32_t shadowX = 0;
+    std::int32_t shadowY = 0;
+    std::uint32_t shadowAlpha = 0;
+    // 네 꼭짓점(처음 크기 안의 좌표). HWP 레코드 앞 32 바이트, HWPX hc:pt0~pt3.
+    std::array<ShapePoint, 4> corners{};
+};
+
+// OLE 개체(HWP 개체 속성 u32: 0~7 비트 보이는 면, 8 비트 모니커, 9~15 비트 기준선, 16~21 비트 종류; HWPX hp:ole).
+// 데이터는 binItemId 묶음이다(앞 4 바이트 길이 + 복합 파일).
+struct OleInfo {
+    std::string objectType = "EMBEDDED";  // UNKNOWN(차트), EMBEDDED, LINK, STATIC, EQUATION
+    std::string drawAspect = "CONTENT";   // CONTENT, THUMB_NAIL, ICON, DOC_PRINT
+    bool hasMoniker = false;
+    int eqBaseLine = 0;
+    std::int32_t extentX = 0;  // 개체 자체 크기(HWPX hc:extent)
+    std::int32_t extentY = 0;
+};
+
+// 동영상(HWP 동영상 레코드: 종류 i32, 로컬이면 동영상 BinData u16, 웹이면 태그 글, 그다음 첫 장면 그림 BinData u16;
+// HWPX hp:video videotype·fileIDRef·imageIDRef·tag). 첫 장면 그림은 Control::binItemId 다.
+struct VideoInfo {
+    std::string type = "Local";  // Local, Web
+    std::string fileBinId;
+    std::string tag;
+};
+
 struct Control {
     ControlKind kind = ControlKind::Unknown;
     std::string ctrlId;     // HWP 4글자 컨트롤 ID (HWPX 는 대응되는 ID 로 변환)
@@ -658,6 +753,8 @@ struct Control {
     std::int32_t baseUnit = 1000; // 수식 글자 크기. 1000 = 10pt. 측정에만 쓴다
     std::string equationFont;     // 수식 글꼴. 비어 있으면 HYhwpEQ. 재기와 그리기에 쓴다
     int fileBaseLine = -1;        // 파일 기준선. 조판 baseLine과 따로 요소 비교에만 쓴다
+    // 수식 글꼴이 아직 오지 않은 채 잰 수식(웹에서 받는 중에 넣거나 고침). 저장하지 않는다. 글꼴이 오면 다시 잰다.
+    bool measurePending = false;
     std::string applyPageType;    // Header/Footer: BOTH, EVEN, ODD
     std::string numType;          // AutoNumber/NewNumber: PAGE, FOOTNOTE ...
     std::string numFormat;        // DIGIT, ROMAN_CAPITAL ... 비어 있으면 아라비아 숫자
@@ -688,6 +785,10 @@ struct Control {
     std::uint32_t number = 0;
     std::string name;             // Bookmark/Field 이름
     std::string command;          // Field 명령 (하이퍼링크 URL 등)
+    // HWPX fieldBegin@type(우리가 모르는 필드도 저장할 때 같은 이름으로 쓴다)과 Command 밖의 글 매개변수
+    // (하이퍼링크 Category·TargetType·DocOpenType 등). 계산식·메모·교정 부호가 따로 쓰는 매개변수는 담지 않는다.
+    std::string fieldType;
+    std::vector<std::pair<std::string, std::string>> fieldStrings;
     // Field 속성(HWP CTRL_HEADER 의 속성 u32: bit0 고칠 수 있음, bit15 내용이 고쳐짐)과 기타 속성 u8(HWPX
     // parameters 의 Prop). 한글 계산식은 기타 속성이 8 이다.
     std::uint32_t fieldProps = 0;
@@ -730,6 +831,14 @@ struct Control {
     int cornerRatio = 0;  // 사각형 모서리 곡률 %. 0 은 직각, 20 은 둥근 모서리, 50 은 반원
     std::vector<ShapePoint> points;  // 다각형·곡선·선·타원. 현재 크기 안의 좌표
     std::vector<KeptRecord> kept;    // 글맵시·양식·차트·비디오 등 원본 레코드
+    // 글맵시(HWP 글맵시 레코드, HWPX hp:textart). 글은 text 다. 모양은 HWPX 이름(textShape) 또는 HWP 번호다.
+    std::optional<TextArt> textArt;
+    std::optional<OleInfo> ole;
+    std::optional<VideoInfo> video;
+    // HWPX 에서 우리가 풀지 않는 개체(차트 hp:switch, hp:video, hp:ole, hp:textart)의 원본 XML 과 딸린 묶음 항목
+    // (Chart/chart1.xml 등). 저장할 때 위치·크기·묶음 id 만 고쳐 그대로 쓴다. 그리기는 binItemId(미리 보기)로 한다.
+    std::string hwpxXml;
+    std::vector<std::pair<std::string, Bytes>> hwpxParts;
 
     NoteShape footnoteShape;  // 구역 정의의 각주 모양
     NoteShape endnoteShape;   // 구역 정의의 미주 모양
@@ -741,12 +850,20 @@ struct Control {
 };
 
 // 인라인 항목: 텍스트 또는 컨트롤(텍스트 흐름 안의 위치 = 앵커)
+inline constexpr std::uint32_t kNoCharStyle = 0xFFFFFFFFu;
+
 struct InlineItem {
     enum class Type { Text, Control };
     Type type = Type::Text;
     std::string text;  // UTF-8. 탭 '\t', 줄바꿈 '\n', 묶음 빈칸 U+00A0, 고정폭 빈칸 U+2007
     std::string markpen;  // 형광펜 #RRGGBB. 비어 있으면 없다. 글자 배경과 따로 둔다
+    // 글자 스타일 번호(HWPX hp:t charStyleIDRef). kNoCharStyle 이면 없다. 글자 모양은 run 이 따로 들고 있다.
+    std::uint32_t charStyleId = 0xFFFFFFFFu;
     bool ignoreSpacing = false;  // 쪽 번호. 장평은 적용하고 자간은 더하지 않는다
+    // 변경 추적: kTrackInsert(넣은 글)·kTrackDelete(지운 글). trackChange 는 머리 기록 id(TcId), trackMark 는 쌍 id 다.
+    std::uint8_t track = 0;
+    std::uint32_t trackChange = 0;
+    std::uint32_t trackMark = 0;
     // 조판 때 자동 번호 대신 넣은 글자. 원래 문서에는 없어서 커서가 서는 칸이 아니다.
     // 줄 위치로는 바꾼 컨트롤의 칸(replacedUnits)만 차지한다.
     bool synthetic = false;
@@ -761,6 +878,15 @@ struct InlineItem {
 struct Run {
     std::uint32_t charShapeId = 0;
     std::vector<InlineItem> items;
+    // 글자 모양 바꿈을 추적한 기록 id(HWPX hp:run charTcId). 0 이면 없다.
+    std::uint32_t charTrackChange = 0;
+};
+
+// 문단 끝(문단 나누기)의 바뀜. HWPX 는 문단 끝의 빈 쌍, HWP 는 문단 끝 글자까지 덮은 범위다.
+struct ParaEndTrack {
+    std::uint8_t track = 0;
+    std::uint32_t change = 0;
+    std::uint32_t mark = 0;
 };
 
 struct Paragraph {
@@ -773,6 +899,10 @@ struct Paragraph {
     std::vector<LineSeg> lineSegs;
     std::vector<TextRange> ranges;
     std::vector<KeptRecord> kept;  // 문단 자식 중 아직 필드가 없는 레코드
+    ParaEndTrack endTrack;
+    // 파일의 문단 id(HWPX hp:p@id, HWP PARA_HEADER instance id). 한글 차례 하이퍼링크("?#id;...")가 이 값으로
+    // 개요 문단을 가리킨다. 0 이면 없다(HWPX 는 한글처럼 2147483648 을 쓴다). 나눈 뒤 문단은 받지 않는다.
+    std::uint32_t fileId = 0;
     // 문단 고유 번호. 앞뒤에 문단이 생기거나 빠져도 그대로다. 파일에는 쓰지 않는다.
     // 0 이면 아직 없다. ensureParagraphIds 가 매긴다.
     std::uint32_t id = 0;
@@ -885,9 +1015,15 @@ DocumentStats computeStats(const Document& doc);
 int ensureParagraphIds(Document& doc);
 // 문서의 모든 문단(본문, 바탕쪽, 머리말·각주·글상자, 표 칸, 캡션)을 문서 차례로 돈다.
 void forEachParagraph(Document& doc, const std::function<void(Paragraph&)>& fn);
+// 표·그림·수식 번호. target 이 개체면 그 개체의 번호, 표·그림·수식 자동 번호면 그 값이다.
+// 한글처럼 번호 범주(objectNumberingType)가 같은 개체를 캡션이 없어도 문서 차례로 센다. 개체 캡션 안 자동 번호는
+// 그 개체 번호이고, 캡션 밖 자동 번호는 따로 하나를 센다. 새 번호로 시작과 구역 시작 번호에서 다시 센다.
+int objectNumber(const Document& doc, const Control* target);
 
 // samples/빈 문서.hwpx 와 같은 빈 문서. 용지 세로는 84186 이다.
 Document blankDocument();
+// Puts a new Hangul document's styles and the shapes, numbering and tabs they use into doc.header (default_header.cpp).
+void addDefaultStyleHeader(Document& doc);
 
 // 글자 모양이 가리키는 글꼴 표의 이름을 바꾼다. 스타일의 글꼴 번호는 그대로다.
 int replaceFontFace(Document& doc, const std::string& from, const std::string& to);

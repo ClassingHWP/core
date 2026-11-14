@@ -36,6 +36,8 @@ std::int32_t fontWinCell(const std::string& face);
 
 // OS/2 usWinAscent·usWinDescent. 표가 없으면 hhea 위·아래. 글꼴이 없으면 거짓.
 bool fontWinMetrics(const std::string& face, std::int32_t& ascent, std::int32_t& descent);
+// hhea ascender·descender(디자인 단위, descender 는 음수). 글꼴이 없으면 거짓.
+bool fontHheaMetrics(const std::string& face, std::int32_t& ascender, std::int32_t& descender);
 
 // 글꼴 파일의 디자인 진행폭을 코드 포인트마다 sink 로 넘긴다. 파일이 없으면 거짓.
 // unitsPerEm, xAvgCharWidth, winCell 도 채운다. sink 의 advance 는 hmtx 값이고 0 이상이다.

@@ -1,4 +1,4 @@
-// 메모 필드 명령과 모양.
+// 메모 필드 명령과 모양(docs/memo-structure.md).
 #include "chwp/model/memo.hpp"
 
 #include <chrono>
@@ -11,7 +11,7 @@ namespace chwp::model {
 
 namespace {
 
-// 명령 칸은 '/' 로 나뉘고, 작성자 안의 '/' 등은 '\' 로 막아 둔다(한글 2024 와 같다).
+// 명령 칸은 '/' 로 나뉘고, 작성자 안의 '/' 등은 '\' 로 막아 둔다.
 std::vector<std::string> splitCommand(const std::string& command, std::size_t limit, std::string& rest) {
     std::vector<std::string> parts;
     std::string field;

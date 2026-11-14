@@ -15,6 +15,7 @@
 #include "chwp/render/format_view.hpp"
 #include "chwp/render/paragraph_layout.hpp"
 #include "chwp/render/scene.hpp"
+#include "chwp/model/memo.hpp"
 #include "chwp/model/table_edit.hpp"
 #include "chwp/unit.hpp"
 #include "render/paint_detail.hpp"
@@ -64,7 +65,7 @@ bool isInlineObjectControl(const model::Control& ctrl) {
     return ctrl.placement && ctrl.placement->treatAsChar &&
            (ctrl.kind == ControlKind::Shape || ctrl.kind == ControlKind::Picture ||
             ctrl.kind == ControlKind::Table || ctrl.kind == ControlKind::Container ||
-            ctrl.kind == ControlKind::Equation);
+            ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole);
 }
 
 // 각주·미주 번호와 덧말·글자 겹치기는 글자 한 칸이다. 앞뒤에 커서가 서고, 지우면 그 컨트롤이 빠진다.
@@ -72,6 +73,108 @@ bool isCaretCharControl(const model::Control& ctrl) {
     return isInlineObjectControl(ctrl) || ctrl.kind == model::ControlKind::Footnote ||
            ctrl.kind == model::ControlKind::Endnote || ctrl.kind == model::ControlKind::Dutmal ||
            ctrl.kind == model::ControlKind::Compose;
+}
+
+std::vector<MemoMarker> memoMarkersAt(const model::Paragraph& para, int charIndex) {
+    std::vector<MemoMarker> out;
+    std::vector<const model::Control*> open;  // 열린 필드. 메모가 아니면 nullptr
+    int chars = 0;
+    for (const model::Run& run : para.runs) {
+        for (const model::InlineItem& item : run.items) {
+            if (item.type == model::InlineItem::Type::Text) {
+                chars += utf8CodePointCount(item.text);
+                continue;
+            }
+            if (item.type != model::InlineItem::Type::Control) continue;
+            const model::Control& c = item.control;
+            if (c.kind == model::ControlKind::Field) {
+                const bool memo = model::isMemoField(c);
+                open.push_back(memo ? &c : nullptr);
+                if (memo && chars == charIndex) out.push_back(MemoMarker{&c, &c, true});
+            } else if (c.kind == model::ControlKind::FieldEnd) {
+                const model::Control* memo = open.empty() ? nullptr : open.back();
+                if (!open.empty()) open.pop_back();
+                if (memo && chars == charIndex) out.push_back(MemoMarker{&c, memo, false});
+            }
+            if (isCaretCharControl(c)) ++chars;
+            if (chars > charIndex) return out;
+        }
+    }
+    return out;
+}
+
+int memoMarkerSlot(const PointerHold& hold, int story, int paragraph, int charIndex, const std::vector<MemoMarker>& markers) {
+    const int n = static_cast<int>(markers.size());
+    if (n == 0) return 0;
+    if (hold.markerStory == story && hold.markerPara == paragraph && hold.markerChar == charIndex && hold.markerSlot >= 0 &&
+        hold.markerSlot <= n) {
+        return hold.markerSlot;
+    }
+    int slot = 0;
+    while (slot < n && !markers[static_cast<std::size_t>(slot)].begin) ++slot;
+    return slot;
+}
+
+void setMemoMarkerSlot(PointerHold& hold, int story, int paragraph, int charIndex, int slot) {
+    hold.markerStory = story;
+    hold.markerPara = paragraph;
+    hold.markerChar = charIndex;
+    hold.markerSlot = slot;
+}
+
+int insertTextAtMemoMarker(model::Paragraph& para, const model::Control* marker, bool after, const std::string& text) {
+    const int count = utf8CodePointCount(text);
+    if (text.empty() || !marker) return 0;
+    for (model::Run& run : para.runs) {
+        for (std::size_t i = 0; i < run.items.size(); ++i) {
+            if (run.items[i].type != model::InlineItem::Type::Control || &run.items[i].control != marker) continue;
+            // 바로 옆 글 조각에 붙인다. 없으면 새 글 조각을 둔다.
+            if (after) {
+                if (i + 1 < run.items.size() && run.items[i + 1].type == model::InlineItem::Type::Text) {
+                    run.items[i + 1].text = text + run.items[i + 1].text;
+                } else {
+                    run.items.insert(run.items.begin() + static_cast<std::ptrdiff_t>(i + 1), model::InlineItem::makeText(text));
+                }
+            } else {
+                if (i > 0 && run.items[i - 1].type == model::InlineItem::Type::Text) {
+                    run.items[i - 1].text += text;
+                } else {
+                    run.items.insert(run.items.begin() + static_cast<std::ptrdiff_t>(i), model::InlineItem::makeText(text));
+                }
+            }
+            para.lineSegs.clear();
+            return count;
+        }
+    }
+    return 0;
+}
+
+model::Control* hyperlinkAround(model::Paragraph& para, int charIndex, int& begin, int& end) {
+    model::Control* open = nullptr;
+    int openAt = 0;
+    int chars = 0;
+    for (model::Run& run : para.runs) {
+        for (model::InlineItem& item : run.items) {
+            if (item.type == model::InlineItem::Type::Text) {
+                chars += utf8CodePointCount(item.text);
+                continue;
+            }
+            model::Control& c = item.control;
+            if (c.kind == model::ControlKind::Field && c.ctrlId == "%hlk") {
+                open = &c;
+                openAt = chars;
+            } else if (c.kind == model::ControlKind::FieldEnd && open) {
+                if (charIndex >= openAt && charIndex < chars) {
+                    begin = openAt;
+                    end = chars;
+                    return open;
+                }
+                open = nullptr;
+            }
+            if (isCaretCharControl(c)) ++chars;
+        }
+    }
+    return nullptr;
 }
 
 int paragraphCharCount(const model::Paragraph& para) {
@@ -251,8 +354,23 @@ int insertTextInParagraph(model::Paragraph& para, int charIndex, const std::stri
         return 0;
     }
 
+    // 그 항목이 누름틀 안인가(앞으로 거슬러 처음 만나는 필드가 누름틀 시작이다).
+    const auto insideClickHere = [&](std::size_t runIndex, std::size_t itemIndex) {
+        for (std::size_t r = runIndex + 1; r-- > 0;) {
+            const std::vector<model::InlineItem>& items = para.runs[r].items;
+            for (std::size_t k = r == runIndex ? itemIndex : items.size(); k-- > 0;) {
+                const model::InlineItem& prev = items[k];
+                if (prev.type != model::InlineItem::Type::Control) continue;
+                if (prev.control.kind == model::ControlKind::FieldEnd) return false;
+                if (prev.control.kind == model::ControlKind::Field) return prev.control.ctrlId == "%clk";
+            }
+        }
+        return false;
+    };
     // 글 조각 바로 뒤가 필드 끝이면 그 조각 끝에 붙이지 않는다. 하이퍼링크 끝에서 친 글은 필드 밖(필드 끝 뒤)이다.
+    // 누름틀은 안에서 이어 친다(한글).
     const auto fieldEndFollows = [&](std::size_t runIndex, std::size_t itemIndex) {
+        if (insideClickHere(runIndex, itemIndex)) return false;
         for (std::size_t r = runIndex; r < para.runs.size(); ++r) {
             const std::vector<model::InlineItem>& items = para.runs[r].items;
             for (std::size_t k = r == runIndex ? itemIndex + 1 : 0; k < items.size(); ++k) {
@@ -265,6 +383,20 @@ int insertTextInParagraph(model::Paragraph& para, int charIndex, const std::stri
         }
         return false;
     };
+    // 글 조각 바로 뒤가 누름틀 시작이고 그 안에 빈 글 조각(안내문을 지운 자리)이 있으면 그 빈 조각에 넣는다.
+    const auto clickHereSlotFollows = [&](std::size_t runIndex, std::size_t itemIndex) {
+        const model::InlineItem* seen[2] = {nullptr, nullptr};
+        int found = 0;
+        for (std::size_t r = runIndex; r < para.runs.size() && found < 2; ++r) {
+            const std::vector<model::InlineItem>& items = para.runs[r].items;
+            for (std::size_t k = r == runIndex ? itemIndex + 1 : 0; k < items.size() && found < 2; ++k) {
+                seen[found++] = &items[k];
+            }
+        }
+        return found == 2 && seen[0]->type == model::InlineItem::Type::Control &&
+               seen[0]->control.kind == model::ControlKind::Field && seen[0]->control.ctrlId == "%clk" &&
+               seen[1]->type == model::InlineItem::Type::Text && seen[1]->text.empty();
+    };
     int pos = 0;
     for (std::size_t runIndex = 0; runIndex < para.runs.size(); ++runIndex) {
         model::Run& run = para.runs[runIndex];
@@ -276,7 +408,8 @@ int insertTextInParagraph(model::Paragraph& para, int charIndex, const std::stri
                 const int itemEnd = pos + len;
                 pos = itemEnd;
                 if (charIndex >= itemStart && charIndex <= itemEnd &&
-                    !(charIndex == itemEnd && len > 0 && fieldEndFollows(runIndex, i))) {
+                    !(charIndex == itemEnd && len > 0 && fieldEndFollows(runIndex, i)) &&
+                    !(charIndex == itemEnd && clickHereSlotFollows(runIndex, i))) {
                     // 계산식 결과 맨 앞에서 친 글은 결과를 고친 것이 아니라 필드 앞에 쓴 글이다.
                     if (charIndex == itemStart && i > 0 && run.items[i - 1].type == model::InlineItem::Type::Control &&
                         run.items[i - 1].control.kind == model::ControlKind::Field && run.items[i - 1].control.ctrlId == "%fmu") {
@@ -398,6 +531,29 @@ int replaceCharsInParagraph(model::Paragraph& para, int from, int to, const std:
     return from + newCount;
 }
 
+std::uint32_t charStyleAtParagraphChar(const model::Paragraph& para, int charIndex, bool preferRight) {
+    int pos = 0;
+    const model::InlineItem* first = nullptr;
+    for (const model::Run& run : para.runs) {
+        for (const model::InlineItem& item : run.items) {
+            if (item.type != model::InlineItem::Type::Text) {
+                if (isCaretCharControl(item.control)) ++pos;
+                continue;
+            }
+            const int len = utf8CodePointCount(item.text);
+            if (len <= 0) continue;
+            if (!first) first = &item;
+            const int itemStart = pos;
+            const int itemEnd = pos + len;
+            pos = itemEnd;
+            if (preferRight ? (charIndex >= itemStart && charIndex < itemEnd) : (charIndex > itemStart && charIndex <= itemEnd)) {
+                return item.charStyleId;
+            }
+        }
+    }
+    return first && preferRight ? first->charStyleId : model::kNoCharStyle;
+}
+
 std::uint32_t charShapeAtParagraphChar(const model::Paragraph& para, int charIndex, bool preferRight) {
     int pos = 0;
     for (const model::Run& run : para.runs) {
@@ -427,9 +583,10 @@ std::uint32_t charShapeAtParagraphChar(const model::Paragraph& para, int charInd
 
 // 구간 글자의 글자 모양을 mapShapeId 로 바꾼다. markpen 을 주면 그 구간의 형광펜도 그 색으로 바꾼다(빈 색은 지움).
 // 글자 조각을 나눠도 조각마다 형광펜은 그대로 간다.
+// charStyle 을 주면 그 구간 글의 글자 스타일도 그 번호로 바꾼다(kNoCharStyle 이면 푼다).
 template <typename Fn>
 void transformParagraphRangeCharShape(model::Paragraph& para, int startChar, int endChar, Fn&& mapShapeId,
-                                      const std::string* markpen = nullptr) {
+                                      const std::string* markpen = nullptr, const std::uint32_t* charStyle = nullptr) {
     const int totalChars = paragraphCharCount(para);
     if (totalChars <= 0) {
         ensureParagraphHasTextRun(para, 0);
@@ -446,7 +603,9 @@ void transformParagraphRangeCharShape(model::Paragraph& para, int startChar, int
         if (!out.empty() && out.back().charShapeId == shapeId) {
             if (item.type == model::InlineItem::Type::Text && !out.back().items.empty() &&
                 out.back().items.back().type == model::InlineItem::Type::Text &&
-                out.back().items.back().markpen == item.markpen) {
+                out.back().items.back().markpen == item.markpen &&
+                out.back().items.back().charStyleId == item.charStyleId &&
+                out.back().items.back().ignoreSpacing == item.ignoreSpacing) {
                 out.back().items.back().text += item.text;
             } else {
                 out.back().items.push_back(std::move(item));
@@ -472,14 +631,17 @@ void transformParagraphRangeCharShape(model::Paragraph& para, int startChar, int
                 if (len <= 0) continue;
                 // 나눈 조각도 원래 형광펜을 지닌다. 구간 안 조각만 새 형광펜이다.
                 const auto slice = [&](int from, int count, bool inside) {
-                    model::InlineItem piece = model::InlineItem::makeText(utf8SliceCodePoints(item.text, from, count));
-                    piece.markpen = inside && markpen ? *markpen : item.markpen;
+                    model::InlineItem piece = item;
+                    piece.text = utf8SliceCodePoints(item.text, from, count);
+                    if (inside && markpen) piece.markpen = *markpen;
+                    if (inside && charStyle) piece.charStyleId = *charStyle;
                     return piece;
                 };
                 if (itemEnd <= startChar || itemStart >= endChar) {
                     appendItemToRuns(newRuns, origShapeId, std::move(item));
                 } else if (itemStart >= startChar && itemEnd <= endChar) {
                     if (markpen) item.markpen = *markpen;
+                    if (charStyle) item.charStyleId = *charStyle;
                     appendItemToRuns(newRuns, mapShapeId(origShapeId), std::move(item));
                 } else {
                     const int leftLen = std::max(0, startChar - itemStart);
@@ -615,19 +777,7 @@ std::uint32_t deriveParaShapeId(model::Document& doc, std::uint32_t baseId, cons
     applyParaFillFields(doc, next, patch.fields);
     applyParaHeadingFields(doc, next, patch.fields);
     applyParaTabFields(doc, next, patch.fields);
-    auto& shapes = doc.header.paraShapes;
-    for (std::size_t idx = 0; idx < shapes.size(); ++idx) {
-        if (shapes[idx].id == idx && sameParaShapeAttrs(shapes[idx], next)) {
-            return static_cast<std::uint32_t>(idx);
-        }
-    }
-    std::uint32_t newId = static_cast<std::uint32_t>(shapes.size());
-    for (const auto& ps : shapes) {
-        if (ps.id >= newId) newId = ps.id + 1;
-    }
-    next.id = newId;
-    shapes.push_back(std::move(next));
-    return newId;
+    return internParaShape(doc, std::move(next));
 }
 
 bool sameCharShapeAttrs(const model::CharShape& a, const model::CharShape& b) {
@@ -642,6 +792,35 @@ bool sameCharShapeAttrs(const model::CharShape& a, const model::CharShape& b) {
            a.shadowColor == b.shadowColor && a.emboss == b.emboss && a.engrave == b.engrave &&
            a.emphasis == b.emphasis && a.superscript == b.superscript && a.subscript == b.subscript &&
            a.useFontSpace == b.useFontSpace && a.useKerning == b.useKerning && a.borderFillId == b.borderFillId;
+}
+
+// 같은 모양이 있으면 그 번호, 없으면 새로 붙인 번호다.
+std::uint32_t internParaShape(model::Document& doc, model::ParaShape next) {
+    auto& shapes = doc.header.paraShapes;
+    for (std::size_t idx = 0; idx < shapes.size(); ++idx) {
+        if (shapes[idx].id == idx && sameParaShapeAttrs(shapes[idx], next)) return static_cast<std::uint32_t>(idx);
+    }
+    std::uint32_t newId = static_cast<std::uint32_t>(shapes.size());
+    for (const auto& ps : shapes) {
+        if (ps.id >= newId) newId = ps.id + 1;
+    }
+    next.id = newId;
+    shapes.push_back(std::move(next));
+    return newId;
+}
+
+std::uint32_t internCharShape(model::Document& doc, model::CharShape next) {
+    auto& shapes = doc.header.charShapes;
+    for (std::size_t idx = 0; idx < shapes.size(); ++idx) {
+        if (shapes[idx].id == idx && sameCharShapeAttrs(shapes[idx], next)) return static_cast<std::uint32_t>(idx);
+    }
+    std::uint32_t newId = static_cast<std::uint32_t>(shapes.size());
+    for (const auto& cs : shapes) {
+        if (cs.id >= newId) newId = cs.id + 1;
+    }
+    next.id = newId;
+    shapes.push_back(std::move(next));
+    return newId;
 }
 
 void ensureFontInAllSlots(model::Document& doc, const std::string& faceName, model::PerLang<std::uint32_t>& outRefs) {
@@ -682,7 +861,7 @@ std::uint32_t deriveCharShapeId(model::Document& doc, std::uint32_t baseId, cons
         if (rel == 0) rel = 100;
     }
     if (patch.normalShape) {
-        // 한글 2024 CharShapeNormal 이 지우는 항목: 진하게·기울임·양각·음각·위/아래 첨자·
+        // 한글 2024 CharShapeNormal이 지우는 항목: 진하게·기울임·양각·음각·위/아래 첨자·
         // 밑줄·외곽선·그림자·취소선·강조점을 끄고, 글자 색 검정, 음영 없음, 밑줄·취소선 실선 검정,
         // 그림자 10%·10%·#B2B2B2 로 둔다. 글꼴·크기·장평·자간·위치·커닝·빈칸·테두리는 둔다.
         next.bold = false;
@@ -753,24 +932,13 @@ std::uint32_t deriveCharShapeId(model::Document& doc, std::uint32_t baseId, cons
     }
     applyCharFields(next, patch.fields);
     applyCharFillFields(doc, next, patch.fields);
-    auto& shapes = doc.header.charShapes;
-    for (std::size_t idx = 0; idx < shapes.size(); ++idx) {
-        if (shapes[idx].id == idx && sameCharShapeAttrs(shapes[idx], next)) {
-            return static_cast<std::uint32_t>(idx);
-        }
-    }
-    std::uint32_t newId = static_cast<std::uint32_t>(shapes.size());
-    for (const auto& cs : shapes) {
-        if (cs.id >= newId) newId = cs.id + 1;
-    }
-    next.id = newId;
-    shapes.push_back(std::move(next));
-    return newId;
+    return internCharShape(doc, std::move(next));
 }
 
 model::Paragraph splitParagraphAt(model::Paragraph& cur, int splitCharIndex) {
     model::Paragraph leftPara;
     leftPara.id = cur.id;  // 앞 문단이 번호를 지킨다. 뒤 문단은 재조판 앞에서 새 번호를 받는다
+    leftPara.fileId = cur.fileId;
     leftPara.paraShapeId = cur.paraShapeId;
     leftPara.styleId = cur.styleId;
     leftPara.pageBreak = cur.pageBreak;
@@ -1372,6 +1540,32 @@ void setOverwrite(bool on) { gOverwrite.store(on, std::memory_order_relaxed); }
 
 bool overwrite() { return gOverwrite.load(std::memory_order_relaxed); }
 
+// 지우기가 메모 시작·끝 표시에 닿았다. 글은 두고 그 메모(시작·끝·메모 글)를 지운다. 숨긴 한글은 "메모를 지울까요?"를
+// 묻지만 묻지 않고 지운다(되돌리기 한 번이면 돌아온다). 범위 글은 남는다.
+EditResult eraseMemoAtMarker(model::Document& doc, std::vector<Node>& pages, PointerHold& hold, const PointerCursor& cur,
+                             const MemoMarker& marker, bool useStoredLineHeight) {
+    hold.pendingMemo = marker.memo;
+    hold.pendingMemoStory = cur.story;
+    hold.pendingMemoPara = cur.paragraph;
+    hold.pendingMemoOffset = cur.offset;
+    return deleteMemoNow(doc, pages, useStoredLineHeight);
+}
+
+const model::Control* paint_detail::memoMarkerToErase(const model::Document& doc, const std::vector<Node>& pages, EditKey key) {
+    if (key != EditKey::Delete && key != EditKey::Backspace) return nullptr;
+    const PointerHold& hold = pointerHold();
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0 || cur.hasSelection || hold.composing) return nullptr;
+    const model::Paragraph* para = storyParagraph(doc, cur.story, cur.paragraph);
+    if (!para) return nullptr;
+    const int charIndex = offsetToCharIndex(doc, pages, cur.story, cur.paragraph, cur.offset);
+    const std::vector<MemoMarker> markers = memoMarkersAt(*para, charIndex);
+    const int slot = memoMarkerSlot(hold, cur.story, cur.paragraph, charIndex, markers);
+    if (key == EditKey::Delete && slot < static_cast<int>(markers.size())) return markers[static_cast<std::size_t>(slot)].memo;
+    if (key == EditKey::Backspace && slot > 0) return markers[static_cast<std::size_t>(slot - 1)].memo;
+    return nullptr;
+}
+
 EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const std::string& text, bool composing,
                          bool useStoredLineHeight) {
     if (readOnly()) return {};
@@ -1388,18 +1582,23 @@ EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const s
     int paraDelta = 0;
     int editOldEndOff = 0;
     std::optional<std::uint32_t> overrideShapeId;
+    std::uint32_t overrideCharStyle = model::kNoCharStyle;
     if (hold.hasPendingCharShape && hold.pendingCharStory == story && hold.pendingCharPara == paraIdx &&
         (hold.pendingCharOffset == cur.offset ||
          (hold.composing && hold.compStory == story && hold.compPara == paraIdx))) {
         overrideShapeId = hold.pendingCharShapeId;
+        overrideCharStyle = hold.pendingCharStyleId;
     }
 
+    // 메모 시작·끝 표시가 놓인 자리에서 친 글은 캐럿이 선 표시 자리(안·밖)에 들어간다.
+    int markerSlot = -1;
     if (hold.composing && hold.compStory == story && hold.compPara == paraIdx &&
         hold.compPara < static_cast<int>(paras->size())) {
         model::Paragraph& para = (*paras)[static_cast<std::size_t>(paraIdx)];
         editOldEndOff = hold.compEnd;
         eraseCharsInParagraph(para, hold.compStart, hold.compEnd);
         charIndex = hold.compStart;
+        markerSlot = hold.compMarkerSlot;
     } else {
         clearComposition(hold);
         if (cur.hasSelection) {
@@ -1412,6 +1611,8 @@ EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const s
         } else {
             charIndex = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
             editOldEndOff = charIndex;
+            const std::vector<MemoMarker> markers = memoMarkersAt((*paras)[static_cast<std::size_t>(paraIdx)], charIndex);
+            if (!markers.empty()) markerSlot = memoMarkerSlot(hold, story, paraIdx, charIndex, markers);
             // 수정 모드는 친 글자 수만큼 뒤 글자를 바꾼다. 문단을 나누는 글은 바꾸지 않고 넣는다.
             if (overwrite() && text.find_first_of("\r\n") == std::string::npos) {
                 model::Paragraph& para = (*paras)[static_cast<std::size_t>(paraIdx)];
@@ -1425,12 +1626,25 @@ EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const s
     }
 
     model::Paragraph& targetPara = (*paras)[static_cast<std::size_t>(paraIdx)];
-    const int inserted = insertTextInParagraph(targetPara, charIndex, text);
+    int inserted = 0;
+    bool keepSlot = false;
+    if (markerSlot >= 0 && text.find_first_of("\r\n") == std::string::npos) {
+        const std::vector<MemoMarker> markers = memoMarkersAt(targetPara, charIndex);
+        const int n = static_cast<int>(markers.size());
+        if (n > 0) {
+            const int slot = std::clamp(markerSlot, 0, n);
+            inserted = slot < n ? insertTextAtMemoMarker(targetPara, markers[static_cast<std::size_t>(slot)].control, false, text)
+                                : insertTextAtMemoMarker(targetPara, markers[static_cast<std::size_t>(n - 1)].control, true, text);
+            keepSlot = inserted > 0 && slot < n;
+        }
+    }
+    if (inserted == 0) inserted = insertTextInParagraph(targetPara, charIndex, text);
     const int newCharIndex = charIndex + inserted;
     if (overrideShapeId.has_value() && inserted > 0) {
         const std::uint32_t forcedShape = *overrideShapeId;
-        transformParagraphRangeCharShape(targetPara, charIndex, newCharIndex,
-                                         [forcedShape](std::uint32_t) { return forcedShape; });
+        transformParagraphRangeCharShape(
+            targetPara, charIndex, newCharIndex, [forcedShape](std::uint32_t) { return forcedShape; }, nullptr,
+            &overrideCharStyle);
     }
 
     if (composing && inserted > 0) {
@@ -1439,8 +1653,10 @@ EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const s
         hold.compPara = paraIdx;
         hold.compStart = charIndex;
         hold.compEnd = newCharIndex;
+        hold.compMarkerSlot = markerSlot;
     } else {
         clearComposition(hold);
+        hold.compMarkerSlot = -1;
     }
     hold.preferredX = -1;
 
@@ -1450,11 +1666,14 @@ EditResult insertTextNow(model::Document& doc, std::vector<Node>& pages, const s
     if (overrideShapeId.has_value()) {
         hold.hasPendingCharShape = true;
         hold.pendingCharShapeId = *overrideShapeId;
+        hold.pendingCharStyleId = overrideCharStyle;
         hold.pendingCharStory = story;
         hold.pendingCharPara = paraIdx;
         hold.pendingCharOffset = newOff;
     }
     setPointerCursor(doc, pages, model::CursorPos{story, paraIdx, newOff});
+    // 표시 앞에 넣었으면 넣은 글 뒤 캐럿은 그 표시들 앞이다(메모 안 끝에서 이어 치면 계속 메모 안이다).
+    if (keepSlot) setMemoMarkerSlot(hold, story, paraIdx, newCharIndex, 0);
     rememberCompositionUnderlines(doc, pages);
     return makeEditResult(doc, true, true, story, paraIdx, &relayout);
 }
@@ -1949,7 +2168,20 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         }
         const bool insertMidLine = splitsBeforeWrappedInlineObject(
             doc, pages, story, paraIdx, charIndex, (*paras)[static_cast<std::size_t>(paraIdx)]);
+        const bool atParaEnd = charIndex >= paragraphCharCount((*paras)[static_cast<std::size_t>(paraIdx)]);
         model::Paragraph nextPara = splitParagraphAt((*paras)[static_cast<std::size_t>(paraIdx)], charIndex);
+        // Enter at the paragraph end starts the style's next style (Hangul: the new paragraph is that style as is).
+        // Elsewhere both halves keep the style.
+        if (atParaEnd && !insertMidLine) {
+            const model::Style* now = Painter::findStyle(doc, nextPara.styleId);
+            const model::Style* next = now ? Painter::findStyle(doc, now->nextStyleId) : nullptr;
+            if (now && next && next->id != now->id && next->type != "CHAR") {
+                nextPara.styleId = next->id;
+                nextPara.paraShapeId = next->paraShapeId;
+                for (model::Run& run : nextPara.runs) run.charShapeId = next->charShapeId;
+                clearPendingCharShape(hold);
+            }
+        }
         int insertedParas = 1;
         if (insertMidLine) {
             const model::Paragraph& leftRef = (*paras)[static_cast<std::size_t>(paraIdx)];
@@ -2009,8 +2241,22 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
             return makeEditResult(doc, true, true, story, paraIdx, &relayout);
         }
         charIndex = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
+        int markerSlot = 0;
+        {
+            const std::vector<MemoMarker> markers = memoMarkersAt((*paras)[static_cast<std::size_t>(paraIdx)], charIndex);
+            markerSlot = memoMarkerSlot(hold, story, paraIdx, charIndex, markers);
+            if (markerSlot > 0) {
+                return eraseMemoAtMarker(doc, pages, hold, cur, markers[static_cast<std::size_t>(markerSlot - 1)],
+                                         useStoredLineHeight);
+            }
+        }
         if (charIndex > 0) {
+            // 지운 글자 앞에 있던 메모 표시는 캐럿 왼쪽에 남는다. 메모 안에서 지우면 캐럿이 안에 머문다(숨긴 한글:
+            // "abc [memo|]" 에서 BackSpace 두 번 → 32·31·30, "abc [m|emo]" BackSpace → 28 = 시작 뒤).
+            const int leftMarkers = static_cast<int>(
+                memoMarkersAt((*paras)[static_cast<std::size_t>(paraIdx)], charIndex - 1).size());
             eraseCharsInParagraph((*paras)[static_cast<std::size_t>(paraIdx)], charIndex - 1, charIndex);
+            setMemoMarkerSlot(hold, story, paraIdx, charIndex - 1, leftMarkers + markerSlot);
             const EditRelayoutResult relayout = relayoutAfterEdit(
                 doc, pages, EditRelayoutSpec{story, paraIdx, 0, charIndex - 1, charIndex, charIndex - 1, useStoredLineHeight});
             const int newOff = charIndexToOffset(doc, pages, story, paraIdx, charIndex - 1);
@@ -2052,9 +2298,21 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         }
         model::Paragraph& para = (*paras)[static_cast<std::size_t>(paraIdx)];
         charIndex = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
+        int markerSlot = 0;
+        {
+            const std::vector<MemoMarker> markers = memoMarkersAt(para, charIndex);
+            markerSlot = memoMarkerSlot(hold, story, paraIdx, charIndex, markers);
+            if (markerSlot < static_cast<int>(markers.size())) {
+                return eraseMemoAtMarker(doc, pages, hold, cur, markers[static_cast<std::size_t>(markerSlot)],
+                                         useStoredLineHeight);
+            }
+        }
         const int paraLen = paragraphCharCount(para);
         if (charIndex < paraLen) {
+            // 지운 글자 뒤 메모 표시는 캐럿 오른쪽으로 온다. 캐럿은 같은 칸에 머문다(숨긴 한글: "abc [|memo]"
+            // Delete → 28 그대로, "abc [mem|o]" Delete → 31 = 끝 앞).
             eraseCharsInParagraph(para, charIndex, charIndex + 1);
+            setMemoMarkerSlot(hold, story, paraIdx, charIndex, markerSlot);
             const EditRelayoutResult relayout = relayoutAfterEdit(
                 doc, pages, EditRelayoutSpec{story, paraIdx, 0, charIndex, charIndex + 1, charIndex, useStoredLineHeight});
             const int newOff = charIndexToOffset(doc, pages, story, paraIdx, charIndex);
@@ -2133,6 +2391,17 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         }
         int nextPara = paraIdx;
         int nextChar = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
+        // 메모 시작·끝 표시가 캐럿 앞에 있으면 글자는 그대로 두고 표시 하나를 넘는다(한글 MoveLeft).
+        if (!shift) {
+            const std::vector<MemoMarker> here = memoMarkersAt((*paras)[static_cast<std::size_t>(paraIdx)], nextChar);
+            const int slot = memoMarkerSlot(hold, story, paraIdx, nextChar, here);
+            if (slot > 0) {
+                const model::CursorPos same{story, paraIdx, cur.offset};
+                setPointerCursor(doc, pages, same, same);
+                setMemoMarkerSlot(hold, story, paraIdx, nextChar, slot - 1);
+                return makeEditResult(doc, true, false, story, paraIdx);
+            }
+        }
         if (nextChar > 0) {
             --nextChar;
         } else if (nextPara > 0) {
@@ -2150,6 +2419,11 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         const model::CursorPos anchorPos =
             shift ? model::CursorPos{story, cur.anchorParagraph, cur.anchorOffset} : focusPos;
         setPointerCursor(doc, pages, anchorPos, focusPos);
+        // 오른쪽에서 왔으니 그 자리 표시를 모두 지난 쪽(메모 끝이면 밖, 시작이면 안)이다.
+        if (!shift) {
+            const std::vector<MemoMarker> there = memoMarkersAt((*paras)[static_cast<std::size_t>(nextPara)], nextChar);
+            if (!there.empty()) setMemoMarkerSlot(hold, story, nextPara, nextChar, static_cast<int>(there.size()));
+        }
         return makeEditResult(doc, true, false, story, nextPara);
     }
 
@@ -2163,6 +2437,17 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         int nextPara = paraIdx;
         int nextChar = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
         const int paraLen = paragraphCharCount((*paras)[static_cast<std::size_t>(paraIdx)]);
+        // 메모 시작·끝 표시가 캐럿 뒤에 있으면 글자는 그대로 두고 표시 하나를 넘는다(한글 MoveRight).
+        if (!shift) {
+            const std::vector<MemoMarker> here = memoMarkersAt((*paras)[static_cast<std::size_t>(paraIdx)], nextChar);
+            const int slot = memoMarkerSlot(hold, story, paraIdx, nextChar, here);
+            if (slot < static_cast<int>(here.size())) {
+                const model::CursorPos same{story, paraIdx, cur.offset};
+                setPointerCursor(doc, pages, same, same);
+                setMemoMarkerSlot(hold, story, paraIdx, nextChar, slot + 1);
+                return makeEditResult(doc, true, false, story, paraIdx);
+            }
+        }
         if (nextChar < paraLen) {
             ++nextChar;
         } else if (nextPara + 1 < static_cast<int>(paras->size())) {
@@ -2180,6 +2465,11 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
         const model::CursorPos anchorPos =
             shift ? model::CursorPos{story, cur.anchorParagraph, cur.anchorOffset} : focusPos;
         setPointerCursor(doc, pages, anchorPos, focusPos);
+        // 왼쪽에서 왔으니 그 자리 표시 앞(메모 시작이면 밖, 끝이면 안)이다.
+        if (!shift) {
+            const std::vector<MemoMarker> there = memoMarkersAt((*paras)[static_cast<std::size_t>(nextPara)], nextChar);
+            if (!there.empty()) setMemoMarkerSlot(hold, story, nextPara, nextChar, 0);
+        }
         return makeEditResult(doc, true, false, story, nextPara);
     }
 
@@ -2276,6 +2566,63 @@ EditResult keyDownNow(model::Document& doc, std::vector<Node>& pages, EditKey ke
     return makeEditResult(doc, false, false, story, paraIdx);
 }
 
+EditResult editMoveToView(model::Document& doc, std::vector<Node>& pages, const std::vector<ViewBand>& bands, bool end,
+                          bool shift) {
+    PointerHold& hold = pointerHold();
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0) return {};
+    const int story = cur.story;
+    if (hold.composing) clearComposition(hold);
+    clearPendingCharShape(hold);
+    const std::vector<StoryLineOnPage> all = gatherAllStoryLines(doc, pages, story);
+    const StoryLineOnPage* pick = nullptr;
+    for (const StoryLineOnPage& line : all) {
+        if (!line.line.node || line.line.turn.on()) continue;
+        const std::int32_t top = line.line.y;
+        const std::int32_t bottom = line.line.y + line.line.node->height;
+        bool shown = false;
+        for (const ViewBand& band : bands) {
+            shown = shown || (band.page == line.page && top >= band.top && bottom <= band.bottom);
+        }
+        if (!shown) continue;
+        pick = &line;
+        if (!end) break;
+    }
+    if (!pick) return makeEditResult(doc, false, false, story, cur.paragraph);
+    // 가로 자리는 위아래 이동과 같은 기억한 자리다(한글은 칸 자리를 지킨다).
+    if (hold.preferredX < 0) hold.preferredX = hold.caret.x;
+    Painter painter;
+    painter.doc = &doc;
+    CaretPlace place = painter.placeOnLine(pick->line, hold.preferredX, false, -1, -1);
+    if (!place.hit) return makeEditResult(doc, false, false, story, cur.paragraph);
+    place.page = pick->page;
+    hold.focusPara = place.paragraph;
+    hold.focusOff = place.offset;
+    if (!shift) {
+        hold.anchorPara = place.paragraph;
+        hold.anchorOff = place.offset;
+    }
+    placeCaret(hold, place, pick->page, pages, &doc);
+    rememberSelection(doc, pages);
+    return makeEditResult(doc, true, false, story, place.paragraph);
+}
+
+// 한글은 따라간 링크 글을 글자·밑줄 #800080 으로 바꿔 저장한다(되돌리기 한 칸, 한글 화면에서 확인).
+bool paint_detail::markLinkVisited(model::Document& doc, model::Paragraph& para, int startChar, int endChar) {
+    FormatPatch visited;
+    visited.hasColor = true;
+    visited.color = "#800080";
+    visited.fields.emplace_back("underlineColor", std::string("#800080"));
+    bool changed = false;
+    transformParagraphRangeCharShape(para, startChar, endChar, [&](std::uint32_t id) {
+        const std::uint32_t now = deriveCharShapeId(doc, id, visited);
+        changed = changed || now != id;
+        return now;
+    });
+    if (changed) para.lineSegs.clear();
+    return changed;
+}
+
 namespace {
 
 // 그 수준의 개요 스타일. 문단 모양이 그 수준 개요인 문단 스타일이다(한글 기본 스타일 개요 1~7).
@@ -2288,11 +2635,160 @@ const model::Style* outlineStyleOf(const model::Document& doc, int level) {
     return nullptr;
 }
 
-void applyParaStyle(model::Paragraph& para, const model::Style& st) {
-    para.styleId = st.id;
-    para.paraShapeId = st.paraShapeId;
-    for (model::Run& run : para.runs) run.charShapeId = st.charShapeId;
+namespace {
+
+// 옛 스타일 값과 다르면(직접 준 값) 그대로, 같으면 새 스타일 값이다.
+template <typename T>
+void keepDirect(T& out, const T& cur, const T& was, const T& now) {
+    out = cur != was ? cur : now;
 }
+
+template <typename T>
+void keepDirectEach(model::PerLang<T>& out, const model::PerLang<T>& cur, const model::PerLang<T>& was,
+                    const model::PerLang<T>& now) {
+    for (std::size_t i = 0; i < out.size(); ++i) keepDirect(out[i], cur[i], was[i], now[i]);
+}
+
+model::CharShape restyledCharShape(const model::CharShape& cur, const model::CharShape& was,
+                                   const model::CharShape& now) {
+    model::CharShape out = now;
+    keepDirect(out.height, cur.height, was.height, now.height);
+    keepDirectEach(out.fontRef, cur.fontRef, was.fontRef, now.fontRef);
+    keepDirectEach(out.ratio, cur.ratio, was.ratio, now.ratio);
+    keepDirectEach(out.spacing, cur.spacing, was.spacing, now.spacing);
+    keepDirectEach(out.relSize, cur.relSize, was.relSize, now.relSize);
+    keepDirectEach(out.offset, cur.offset, was.offset, now.offset);
+    keepDirect(out.textColor, cur.textColor, was.textColor, now.textColor);
+    keepDirect(out.shadeColor, cur.shadeColor, was.shadeColor, now.shadeColor);
+    keepDirect(out.bold, cur.bold, was.bold, now.bold);
+    keepDirect(out.italic, cur.italic, was.italic, now.italic);
+    keepDirect(out.underline, cur.underline, was.underline, now.underline);
+    keepDirect(out.underlineShape, cur.underlineShape, was.underlineShape, now.underlineShape);
+    keepDirect(out.underlineShapeId, cur.underlineShapeId, was.underlineShapeId, now.underlineShapeId);
+    keepDirect(out.underlineColor, cur.underlineColor, was.underlineColor, now.underlineColor);
+    keepDirect(out.strikeout, cur.strikeout, was.strikeout, now.strikeout);
+    keepDirect(out.strikeShape, cur.strikeShape, was.strikeShape, now.strikeShape);
+    keepDirect(out.strikeShapeId, cur.strikeShapeId, was.strikeShapeId, now.strikeShapeId);
+    keepDirect(out.strikeColor, cur.strikeColor, was.strikeColor, now.strikeColor);
+    keepDirect(out.outline, cur.outline, was.outline, now.outline);
+    keepDirect(out.shadow, cur.shadow, was.shadow, now.shadow);
+    keepDirect(out.shadowOffsetX, cur.shadowOffsetX, was.shadowOffsetX, now.shadowOffsetX);
+    keepDirect(out.shadowOffsetY, cur.shadowOffsetY, was.shadowOffsetY, now.shadowOffsetY);
+    keepDirect(out.shadowColor, cur.shadowColor, was.shadowColor, now.shadowColor);
+    keepDirect(out.emboss, cur.emboss, was.emboss, now.emboss);
+    keepDirect(out.engrave, cur.engrave, was.engrave, now.engrave);
+    keepDirect(out.emphasis, cur.emphasis, was.emphasis, now.emphasis);
+    keepDirect(out.superscript, cur.superscript, was.superscript, now.superscript);
+    keepDirect(out.subscript, cur.subscript, was.subscript, now.subscript);
+    keepDirect(out.useFontSpace, cur.useFontSpace, was.useFontSpace, now.useFontSpace);
+    keepDirect(out.useKerning, cur.useKerning, was.useKerning, now.useKerning);
+    keepDirect(out.borderFillId, cur.borderFillId, was.borderFillId, now.borderFillId);
+    return out;
+}
+
+model::ParaShape restyledParaShape(const model::ParaShape& cur, const model::ParaShape& was,
+                                   const model::ParaShape& now) {
+    model::ParaShape out = now;
+    keepDirect(out.align, cur.align, was.align, now.align);
+    keepDirect(out.vertAlign, cur.vertAlign, was.vertAlign, now.vertAlign);
+    keepDirect(out.indent, cur.indent, was.indent, now.indent);
+    keepDirect(out.marginLeft, cur.marginLeft, was.marginLeft, now.marginLeft);
+    keepDirect(out.marginRight, cur.marginRight, was.marginRight, now.marginRight);
+    keepDirect(out.spacingPrev, cur.spacingPrev, was.spacingPrev, now.spacingPrev);
+    keepDirect(out.spacingNext, cur.spacingNext, was.spacingNext, now.spacingNext);
+    // 줄 간격은 종류와 값이 한 묶음이다.
+    if (cur.lineSpacingType != was.lineSpacingType || cur.lineSpacing != was.lineSpacing) {
+        out.lineSpacingType = cur.lineSpacingType;
+        out.lineSpacing = cur.lineSpacing;
+    }
+    keepDirect(out.breakLatinWord, cur.breakLatinWord, was.breakLatinWord, now.breakLatinWord);
+    keepDirect(out.breakNonLatinWord, cur.breakNonLatinWord, was.breakNonLatinWord, now.breakNonLatinWord);
+    keepDirect(out.condense, cur.condense, was.condense, now.condense);
+    keepDirect(out.widowOrphan, cur.widowOrphan, was.widowOrphan, now.widowOrphan);
+    keepDirect(out.keepWithNext, cur.keepWithNext, was.keepWithNext, now.keepWithNext);
+    keepDirect(out.keepLines, cur.keepLines, was.keepLines, now.keepLines);
+    keepDirect(out.pageBreakBefore, cur.pageBreakBefore, was.pageBreakBefore, now.pageBreakBefore);
+    // 문단 번호(종류·번호 모양·수준)도 한 묶음이다.
+    if (cur.headingType != was.headingType || cur.headingIdRef != was.headingIdRef ||
+        cur.headingLevel != was.headingLevel || cur.checked != was.checked) {
+        out.headingType = cur.headingType;
+        out.headingIdRef = cur.headingIdRef;
+        out.headingLevel = cur.headingLevel;
+        out.checked = cur.checked;
+    }
+    keepDirect(out.tabDefId, cur.tabDefId, was.tabDefId, now.tabDefId);
+    keepDirect(out.borderFillId, cur.borderFillId, was.borderFillId, now.borderFillId);
+    keepDirect(out.snapToGrid, cur.snapToGrid, was.snapToGrid, now.snapToGrid);
+    keepDirect(out.fontLineHeight, cur.fontLineHeight, was.fontLineHeight, now.fontLineHeight);
+    keepDirect(out.autoSpacingEng, cur.autoSpacingEng, was.autoSpacingEng, now.autoSpacingEng);
+    keepDirect(out.autoSpacingNum, cur.autoSpacingNum, was.autoSpacingNum, now.autoSpacingNum);
+    keepDirect(out.suppressLineNumbers, cur.suppressLineNumbers, was.suppressLineNumbers, now.suppressLineNumbers);
+    keepDirect(out.lineWrap, cur.lineWrap, was.lineWrap, now.lineWrap);
+    keepDirect(out.borderOffsetLeft, cur.borderOffsetLeft, was.borderOffsetLeft, now.borderOffsetLeft);
+    keepDirect(out.borderOffsetRight, cur.borderOffsetRight, was.borderOffsetRight, now.borderOffsetRight);
+    keepDirect(out.borderOffsetTop, cur.borderOffsetTop, was.borderOffsetTop, now.borderOffsetTop);
+    keepDirect(out.borderOffsetBottom, cur.borderOffsetBottom, was.borderOffsetBottom, now.borderOffsetBottom);
+    keepDirect(out.borderConnect, cur.borderConnect, was.borderConnect, now.borderConnect);
+    keepDirect(out.borderIgnoreMargin, cur.borderIgnoreMargin, was.borderIgnoreMargin, now.borderIgnoreMargin);
+    return out;
+}
+
+}  // namespace
+}  // namespace
+
+std::uint32_t paint_detail::restyleCharShapeId(model::Document& doc, std::uint32_t curId, const model::Style* was,
+                                 const model::Style& now) {
+    const model::CharShape* nowShape = Painter::findCharShape(doc, now.charShapeId);
+    const model::CharShape* curShape = Painter::findCharShape(doc, curId);
+    const model::CharShape* wasShape = was ? Painter::findCharShape(doc, was->charShapeId) : nullptr;
+    if (!nowShape) return curId;
+    if (!curShape || !wasShape) return now.charShapeId;
+    // 벡터가 늘면 앞의 포인터가 무효가 되므로 값으로 베껴 넘긴다.
+    const model::CharShape merged = restyledCharShape(*curShape, *wasShape, *nowShape);
+    return internCharShape(doc, merged);
+}
+
+std::uint32_t paint_detail::restyleParaShapeId(model::Document& doc, std::uint32_t curId, const model::Style* was,
+                                 const model::Style& now) {
+    const model::ParaShape* nowShape = Painter::findParaShape(doc, now.paraShapeId);
+    const model::ParaShape* curShape = Painter::findParaShape(doc, curId);
+    const model::ParaShape* wasShape = was ? Painter::findParaShape(doc, was->paraShapeId) : nullptr;
+    if (!nowShape) return curId;
+    if (!curShape || !wasShape) return now.paraShapeId;
+    const model::ParaShape merged = restyledParaShape(*curShape, *wasShape, *nowShape);
+    return internParaShape(doc, merged);
+}
+
+void paint_detail::restyleParagraph(model::Document& doc, model::Paragraph& para, const model::Style* was,
+                                    const model::Style& now) {
+    para.paraShapeId = restyleParaShapeId(doc, para.paraShapeId, was, now);
+    for (model::Run& run : para.runs) run.charShapeId = restyleCharShapeId(doc, run.charShapeId, was, now);
+    para.styleId = now.id;
+    para.lineSegs.clear();
+}
+
+// 한글 스타일 적용(숨긴 한글에서 잼). 옛 스타일 모양과 다르게 직접 준 문단·글자 속성은 남기고 나머지는 새 스타일
+// 값을 쓴다("abc def" 의 def 만 진하게 하고 메모 스타일 → 모두 9pt, def 는 9pt 진하게. 가운데 정렬도 남는다).
+// 같은 스타일을 다시 입히면 직접 준 모양을 모두 지우고 스타일 모양으로 돌아간다.
+const model::Style* paint_detail::restyleFrom(const model::Document& doc, std::uint32_t styleId,
+                                              const model::Style& now) {
+    const model::Style* was = Painter::findStyle(doc, styleId);
+    return was && was->type != "CHAR" && was->id != now.id ? was : nullptr;
+}
+
+void paint_detail::applyParaStyle(model::Document& doc, model::Paragraph& para, const model::Style& st) {
+    // 스타일 벡터를 늘리지 않으므로 was 는 그대로 쓸 수 있다.
+    const model::Style* was = restyleFrom(doc, para.styleId, st);
+    const model::Style now = st;
+    if (was) {
+        const model::Style before = *was;
+        restyleParagraph(doc, para, &before, now);
+    } else {
+        restyleParagraph(doc, para, nullptr, now);
+    }
+}
+
+namespace {
 
 std::string headingTypeOf(const model::Document& doc, const model::Paragraph& para) {
     const model::ParaShape* ps = Painter::findParaShape(doc, para.paraShapeId);
@@ -2316,7 +2812,7 @@ bool applyHeadingCommand(model::Document& doc, model::Paragraph& para, const std
         para.paraShapeId = deriveParaShapeId(doc, para.paraShapeId, p);
     };
     const auto outline = [&](int lvl) {
-        if (const model::Style* st = outlineStyleOf(doc, lvl)) applyParaStyle(para, *st);
+        if (const model::Style* st = outlineStyleOf(doc, lvl)) applyParaStyle(doc, para, *st);
         else setHeading("OUTLINE", lvl);
     };
     if (toggle == "NUMBER" || toggle == "BULLET") {
@@ -2328,7 +2824,7 @@ bool applyHeadingCommand(model::Document& doc, model::Paragraph& para, const std
             outline(0);
         } else if (type == "OUTLINE") {
             // 끄면 바탕 스타일(첫 문단 스타일)로 돌아간다.
-            if (!doc.header.styles.empty()) applyParaStyle(para, doc.header.styles.front());
+            if (!doc.header.styles.empty()) applyParaStyle(doc, para, doc.header.styles.front());
             else setHeading("NONE", 0);
         }
     }
@@ -2353,7 +2849,7 @@ std::int32_t columnWidthAt(const model::Document& doc, const std::vector<Node>& 
 
 }  // namespace
 
-// 모양 복사(한글 2024 ShapeCopyPaste, 한글 2024 에서 확인).
+// 모양 복사(한글 2024 ShapeCopyPaste, 숨긴 한글 COM 으로 확인).
 //   복사: 캐럿 왼쪽 글자의 글자 모양(경계 AAA|aaa 면 AAA 쪽), 캐럿 문단의 문단 모양·문단 스타일을 기억한다.
 //   붙이기: 블록 글자에 글자 모양을, 블록이 걸친 문단에 문단 모양을 준다. 문단 스타일은 스타일 적용과 같다.
 //   블록 없이 붙이면 아무것도 바꾸지 않는다. 글자 스타일·셀 모양 복사는 아직 없다.
@@ -2492,6 +2988,7 @@ EditResult applyFormatNow(model::Document& doc, std::vector<Node>& pages, const 
     bool documentChanged = false;
     bool setPendingShape = false;
     std::uint32_t nextPendingShapeId = 0;
+    std::uint32_t nextPendingCharStyle = model::kNoCharStyle;
     // 문단 종류·수준이 바뀌면 뒤 문단 번호까지 바뀐다. 그때는 문서 전체를 다시 놓는다.
     // 구역 기본 탭 간격도 그 구역 모든 문단에 걸린다.
     bool headingChanged = false;
@@ -2520,30 +3017,50 @@ EditResult applyFormatNow(model::Document& doc, std::vector<Node>& pages, const 
                 headingChanged = true;
             }
             if (patch.hasStyleId) {
-                para.styleId = patch.styleId;
                 if (const model::Style* st = Painter::findStyle(doc, patch.styleId)) {
                     if (st->type.empty() || st->type == "PARA") {
-                        para.paraShapeId = st->paraShapeId;
-                        for (model::Run& run : para.runs) {
-                            run.charShapeId = st->charShapeId;
+                        // 캐럿에 걸어 둔 글자 모양도 같은 규칙으로 바꾼다.
+                        std::uint32_t caretShape = st->charShapeId;
+                        if (!cur.hasSelection && p == focusPara) {
+                            const std::uint32_t base =
+                                hold.hasPendingCharShape && hold.pendingCharStory == story &&
+                                        hold.pendingCharPara == focusPara && hold.pendingCharOffset == cur.offset
+                                    ? hold.pendingCharShapeId
+                                    : cursorStyle(doc, pages).charShapeId;
+                            caretShape = restyleCharShapeId(doc, base, restyleFrom(doc, para.styleId, *st), *st);
                         }
+                        const auto headingKey = [&](std::uint32_t id) {
+                            const model::ParaShape* ps = Painter::findParaShape(doc, id);
+                            return ps ? ps->headingType + "/" + std::to_string(ps->headingIdRef) + "/" +
+                                            std::to_string(ps->headingLevel)
+                                      : std::string();
+                        };
+                        const std::string headingBefore = headingKey(para.paraShapeId);
+                        applyParaStyle(doc, para, *st);
+                        // 문단 번호·개요가 바뀌면 뒤 문단 번호도 바뀐다(문서 전체를 다시 놓는다).
+                        if (headingKey(para.paraShapeId) != headingBefore) headingChanged = true;
                         if (!cur.hasSelection && p == focusPara) {
                             setPendingShape = true;
-                            nextPendingShapeId = st->charShapeId;
+                            nextPendingShapeId = caretShape;
                         }
                     } else if (st->type == "CHAR") {
+                        // 글자 스타일은 문단 스타일을 그대로 두고 고른 글에 스타일 글자 모양과 번호를 건다(숨긴 한글:
+                        // 문단 스타일은 바탕글 그대로, def 만 스타일 모양, 블록 없이 입히면 이어 친 글이 그 스타일).
                         const std::uint32_t targetShape = st->charShapeId;
+                        const std::uint32_t charStyle = st->id;
                         if (cur.hasSelection) {
                             const int paraLen = paragraphCharCount(para);
                             const int pStart = (p == startPara) ? std::clamp(startChar, 0, paraLen) : 0;
                             const int pEnd = (p == endPara) ? std::clamp(endChar, 0, paraLen) : paraLen;
                             if (pEnd > pStart || paraLen == 0) {
-                                transformParagraphRangeCharShape(para, pStart, pEnd,
-                                                                 [targetShape](std::uint32_t) { return targetShape; });
+                                transformParagraphRangeCharShape(
+                                    para, pStart, pEnd, [targetShape](std::uint32_t) { return targetShape; }, nullptr,
+                                    &charStyle);
                             }
                         } else if (p == focusPara) {
                             setPendingShape = true;
                             nextPendingShapeId = targetShape;
+                            nextPendingCharStyle = charStyle;
                         }
                     }
                 }
@@ -2651,6 +3168,7 @@ EditResult applyFormatNow(model::Document& doc, std::vector<Node>& pages, const 
     if (setPendingShape && !cur.hasSelection) {
         hold.hasPendingCharShape = true;
         hold.pendingCharShapeId = nextPendingShapeId;
+        hold.pendingCharStyleId = nextPendingCharStyle;
         hold.pendingCharStory = story;
         hold.pendingCharPara = focusPara;
         hold.pendingCharOffset = newFocusOff;
@@ -3431,17 +3949,31 @@ bool shapeAnchor(const model::Document& doc, const std::vector<Node>& pages, int
 // 직사각형·타원·글상자는 흰색 채움이고 직선은 채움이 없다. 글상자는 가운데 정렬, 안 여백 283, 빈 문단 하나이고
 // 세로 글상자의 글 폭은 도형 높이다. 직선은 끈 방향 그대로 시작·끝 점을 둔다. 도형은 누른 자리 문단의 앞에 붙는다.
 EditResult insertShapeNow(model::Document& doc, std::vector<Node>& pages, int tool, int page, std::int32_t x0,
-                          std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight) {
-    if (readOnly() || tool < 1 || tool > 5) return {};
+                          std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight,
+                          const std::vector<model::ShapePoint>* points) {
+    if (readOnly() || tool < 1 || tool > kLastDrawTool) return {};
     if (EditResult blocked; blockedByLicenseFonts(doc, blocked)) return blocked;
+    // 다각형·곡선·자유선은 점들을 감싼 상자가 도형 상자다.
+    const bool pointShape = tool == 7 || tool == 8 || tool == 9;
+    if (pointShape) {
+        if (!points || points->size() < (tool == 7 ? 3u : 2u)) return {};
+        x0 = x1 = points->front().x;
+        y0 = y1 = points->front().y;
+        for (const model::ShapePoint& pt : *points) {
+            x0 = std::min(x0, pt.x);
+            y0 = std::min(y0, pt.y);
+            x1 = std::max(x1, pt.x);
+            y1 = std::max(y1, pt.y);
+        }
+    }
     const std::int32_t left = std::min(x0, x1);
     const std::int32_t top = std::min(y0, y1);
     const std::int32_t width = std::abs(x1 - x0);
     const std::int32_t height = std::abs(y1 - y0);
     const bool line = tool == 3;
-    // 2mm 보다 작게 끌면 그리지 않는다.
+    // 2mm 보다 작게 끌면 그리지 않는다. 선과 점으로 그린 도형은 긴 쪽만 본다.
     constexpr std::int32_t kMinDraw = 567;
-    if (line ? std::max(width, height) < kMinDraw : (width < kMinDraw || height < kMinDraw)) return {};
+    if (line || pointShape ? std::max(width, height) < kMinDraw : (width < kMinDraw || height < kMinDraw)) return {};
     int story = -1;
     int paraIdx = -1;
     if (!shapeAnchorAt(doc, pages, page, top, story, paraIdx)) return {};
@@ -3464,7 +3996,13 @@ EditResult insertShapeNow(model::Document& doc, std::vector<Node>& pages, int to
     model::Control control;
     control.kind = model::ControlKind::Shape;
     control.ctrlId = "gso ";
-    control.shapeType = tool == 2 ? "ellipse" : line ? "line" : "rect";
+    // 한글 2024 도형 갤러리: 호는 arc, 다각형·자유선은 polygon, 곡선은 curve 다.
+    control.shapeType = tool == 2   ? "ellipse"
+                        : line      ? "line"
+                        : tool == 6 ? "arc"
+                        : tool == 8 ? "curve"
+                        : tool == 7 || tool == 9 ? "polygon"
+                                                 : "rect";
     model::Placement placement;
     placement.treatAsChar = false;
     placement.flowWithText = false;
@@ -3485,8 +4023,18 @@ EditResult insertShapeNow(model::Document& doc, std::vector<Node>& pages, int to
     if (line) {
         control.points.push_back({x0 <= x1 ? 0 : width, y0 <= y1 ? 0 : height});
         control.points.push_back({x0 <= x1 ? width : 0, y0 <= y1 ? height : 0});
+    } else if (pointShape) {
+        // 점은 도형 상자 안 좌표다. 다각형·곡선은 흰 채움, 자유선은 채움이 없다(한글 2024 에서 그린 값).
+        for (const model::ShapePoint& pt : *points) control.points.push_back({pt.x - left, pt.y - top});
+        if (tool != 9) control.fillColor = "#FFFFFF";
     } else {
         control.fillColor = "#FFFFFF";
+        // 호: 중심이 상자 왼쪽 위, 축 끝이 왼쪽 아래와 오른쪽 위다(한글 2024 에서 왼쪽 위 → 오른쪽 아래로 끈 호).
+        if (tool == 6) {
+            control.points.push_back({0, 0});
+            control.points.push_back({0, height});
+            control.points.push_back({width, 0});
+        }
     }
     if (tool == 4 || tool == 5) {
         model::SubList box;
@@ -3563,6 +4111,20 @@ EditResult moveObjectNow(model::Document& doc, std::vector<Node>& pages, bool us
     if (target->textWrap == "SQUARE" || target->textWrap == "TOP_AND_BOTTOM") {
         for (model::Paragraph& para : *paras) para.lineSegs.clear();
     }
+    // 여러 개체를 골랐으면 띄운 개체는 모두 같은 만큼 옮긴다(글자처럼 넣은 개체는 그대로).
+    const std::vector<PointerHold::PickedObject> picked = hold.multiPicked;
+    for (const PointerHold::PickedObject& other : picked) {
+        model::Control* more = anchoredControl(doc, other.story, other.paragraph, other.item);
+        if (!more || !more->placement || more->placement->treatAsChar || more == control) continue;
+        model::Placement& place = *more->placement;
+        place.horzOffset += step(place.horzAlign, hold.moveDX);
+        place.vertOffset += step(place.vertAlign, hold.moveDY);
+        if (place.textWrap == "SQUARE" || place.textWrap == "TOP_AND_BOTTOM") {
+            if (std::vector<model::Paragraph>* host = storyParagraphs(doc, other.story)) {
+                for (model::Paragraph& para : *host) para.lineSegs.clear();
+            }
+        }
+    }
     const int story = hold.moveStory;
     const int paragraph = hold.moveParagraph;
     const int item = hold.moveItem;
@@ -3574,6 +4136,14 @@ EditResult moveObjectNow(model::Document& doc, std::vector<Node>& pages, bool us
     model::ensureParagraphIds(doc);
     pages = layoutPages(doc, -1, useStoredLineHeight, useStoredLineHeight);
     reselectAnchoredObject(doc, pages, page, story, paragraph, item);
+    // 함께 고른 개체도 옮긴 자리에서 다시 고른다.
+    for (const PointerHold::PickedObject& other : picked) {
+        if (!pickAnchoredObject(doc, pages, other.page, other.story, other.paragraph, other.item)) {
+            for (int p = 0; p < static_cast<int>(pages.size()); ++p) {
+                if (pickAnchoredObject(doc, pages, p, other.story, other.paragraph, other.item)) break;
+            }
+        }
+    }
     EditRelayoutResult relayout;
     relayout.fullInvalidation = true;
     relayout.pageListChanged = true;
@@ -3653,7 +4223,10 @@ EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool 
         placement.width = newW;
         placement.height = newH;
     } else {
-        resizeControl(*control, oldW, oldH, newW, newH);
+        // 그린 상자는 저장 크기와 다를 수 있다(글이 넘친 글상자는 글만큼 그린다). 손잡이가 바꾸지 않은 쪽은 저장 크기를 둔다.
+        const std::uint32_t fileW = placement.width;
+        const std::uint32_t fileH = placement.height;
+        resizeControl(*control, fileW, fileH, newW == oldW ? fileW : newW, newH == oldH ? fileH : newH);
         for (model::SubList& list : control->subLists) {
             for (model::Paragraph& para : list.paragraphs) para.lineSegs.clear();
         }
@@ -3780,8 +4353,10 @@ EditResult insertDrawnShapeNow(model::Document& doc, std::vector<Node>& pages, b
     if (EditResult blocked; !readOnly() && blockedByLicenseFonts(doc, blocked)) return blocked;
     hold.drawPending = false;
     bumpPointerPicture();
+    const std::vector<model::ShapePoint> points = std::move(hold.drawPoints);
+    hold.drawPoints.clear();
     return insertShapeNow(doc, pages, hold.drawPendingTool, hold.drawPage, hold.drawX0, hold.drawY0, hold.drawX1,
-                          hold.drawY1, useStoredLineHeight);
+                          hold.drawY1, useStoredLineHeight, &points);
 }
 
 void paint_detail::dropPendingDrawnShape() {

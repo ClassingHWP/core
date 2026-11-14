@@ -163,7 +163,7 @@ TableEdit sortTableRows(Table& table, int row0, int col0, int row1, int col1, co
 // 본문 정렬(한글 Sort, 글 블록). 블록이 걸친 문단(블록 끝이 문단 맨 앞이면 그 문단은 뺀다)을 통째로 옮긴다.
 // 키는 블록 안 글(첫 문단은 블록 시작부터, 끝 문단은 블록 끝까지)이다. TableSortKey::column 은 위치다:
 // 0 문단 전체, n 필드 n(구분 기호로 나눈 n 번째), kSortWordPosition 단어(문단 대신 단어를 정렬한다).
-// 필드는 한글 2024 정렬의 필드 나누기와 같게 나눈다(연속 구분 기호 무시를 끄면 구분 기호 사이 빈 필드도 센다).
+// 필드는 한글의 필드 나누기와 같게 나눈다(연속 구분 기호 무시를 끄면 구분 기호 사이 빈 필드도 센다).
 // 빈 키(빈 문단, 없는 필드)는 오름차순에서 맨 앞, 내림차순에서 맨 뒤다.
 inline constexpr int kSortWordPosition = 0x7fffffff;
 struct ParagraphSortOptions : TableSortOptions {

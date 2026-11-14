@@ -14,6 +14,11 @@
 #include "chwp/render/paint.hpp"
 #include "chwp/render/scene.hpp"
 
+namespace chwp::render {
+struct StyleDraft;
+struct TocOptions;
+}
+
 namespace chwp::render::paint_detail {
 
 // 화면이 글자·그림·테두리를 칸 비트맵 대신 직접 그리는가. 셸 Host 값으로 켜고, GPU 를 못 쓰게 되면 꺼진다.
@@ -83,6 +88,38 @@ struct DragHost {
     DragBox objectBox;
 };
 
+// 하이퍼링크로 옮긴 한 번(이전·다음 이력). 자리는 글 묶음·문단·글자 번호다.
+struct LinkJump {
+    int fromStory = 0;
+    int fromPara = 0;
+    int fromChar = 0;
+    int toStory = 0;
+    int toPara = 0;
+    int toChar = 0;
+};
+
+// 점 아래 하이퍼링크 글자(pointer_hold.cpp). 링크 안 글자 번호다.
+struct LinkSpot {
+    bool found = false;
+    int story = -1;
+    int paragraph = -1;
+    int charIndex = -1;
+};
+
+// 숨긴 누름틀 안내문(한글 2024: 블록 없는 캐럿이 손대지 않은 누름틀 안에 있는 동안 안내문을 감추고 뒤 글을 당긴다).
+// 문단에서 안내문을 빼 두고, 캐럿이 나가면 숨기기 전 문단(줄 정보까지)으로 되돌린다. story 가 -1 이면 없다.
+struct HiddenClickGuide {
+    int story = -1;
+    int para = -1;
+    int openPos = 0;     // 누름틀 시작 글자 번호
+    int chars = 0;       // 뺀 안내문 글자 수
+    std::string text;    // 뺀 안내문
+    std::uint32_t shape = 0;  // 안내문 글자 모양
+    bool useStoredLineHeight = false;
+    std::optional<model::Paragraph> before;  // 숨기기 전 문단
+    std::optional<model::Paragraph> hidden;  // 숨긴 뒤 문단(그 사이 다른 편집이 고쳤는지 견준다)
+};
+
 struct PointerHold {
     bool tracking = false;
     int story = 0;
@@ -109,6 +146,16 @@ struct PointerHold {
     int compEndOff = 0;
     bool hasPendingCharShape = false;
     std::uint32_t pendingCharShapeId = 0;
+    // 캐럿이 누름틀 "안" 자리다(누름틀 앞과 글자 번호가 같아 따로 든다). clickHereStory 가 -1 이면 없다.
+    int clickHereStory = -1;
+    int clickHerePara = -1;
+    int clickHereChar = -1;
+    HiddenClickGuide hiddenGuide;
+    // 걸어 둔 글자 모양과 함께 친 글에 걸 글자 스타일. 없으면 kNoCharStyle 이다.
+    std::uint32_t pendingCharStyleId = 0xFFFFFFFFu;
+    // 하이퍼링크 이력. linkJumpAt 앞은 이전으로 돌아갈 수 있고, 뒤는 다음으로 다시 갈 수 있다.
+    std::vector<LinkJump> linkJumps;
+    std::size_t linkJumpAt = 0;
     int pendingCharStory = 0;
     int pendingCharPara = -1;
     int pendingCharOffset = -1;
@@ -149,6 +196,18 @@ struct PointerHold {
     bool pinTapped = false;
     // 두 번 눌러 고를 덧말·글자 겹치기의 고치기 대화 상자(rubyEdit·composeEdit). 셸이 한 번 가져간다.
     std::string openDialog;
+    // 메모 필드 시작·끝 문자 자리(한글은 캐럿이 한 칸씩 멈춘다). 같은 글자 번호에 놓인 메모 시작·끝 사이 어디에 캐럿이
+    // 있는지(앞에서 지난 표시 수). 그 글자 자리(story·문단·글자 번호)에서만 쓴다. 다른 자리면 기본값(memoMarkerSlot)이다.
+    int markerSlot = 0;
+    int markerStory = -1;
+    int markerPara = -1;
+    int markerChar = -1;
+    int compMarkerSlot = -1;  // 조합 중인 글을 넣은 표시 자리. 조합 글을 다시 넣을 때 같은 자리에 넣는다
+    // 지우기가 메모 시작·끝 표시에 닿아 지울 메모. 그 캐럿 자리에서만 메모 지우기가 이 메모를 고른다.
+    const model::Control* pendingMemo = nullptr;
+    int pendingMemoStory = -1;
+    int pendingMemoPara = -1;
+    int pendingMemoOffset = -1;
     // 모양 복사(한글 ShapeCopyPaste, Alt+C)로 기억한 모양. type 0 글자 모양, 1 문단 모양, 2 둘 다, 4 문단 스타일.
     struct CopiedShape {
         bool valid = false;
@@ -177,7 +236,8 @@ struct PointerHold {
     std::vector<BandArea> bandAreas;
     int resizeHandle = -1;
     // 도형 그리기. drawTool 이 0 이 아니면 다음 끌기 한 번으로 그 도형을 그린다(1 직사각형, 2 타원, 3 직선,
-    // 4 글상자, 5 세로 글상자). 다 끌면 drawPending 이 켜지고 editInsertDrawnShape 가 문서에 넣는다.
+    // 4 글상자, 5 세로 글상자, 6 호, 9 자유선). 7 다각형·8 곡선은 누를 때마다 점을 더하고 두 번 누르면 끝난다
+    // (한글 2024 도형 갤러리와 같다). 다 그리면 drawPending 이 켜지고 editInsertDrawnShape 가 문서에 넣는다.
     int drawTool = 0;
     int drawPendingTool = 0;
     // 고른 띄운 개체를 끌어 옮기는 중. 뗄 때 movePending 이 켜지고 editMoveObject 가 위치를 옮긴다.
@@ -225,8 +285,24 @@ struct PointerHold {
     // 개체를 끌어 옮기거나 크기를 바꾸는 동안 보일 그 개체 모습. 누를 때 그 자리를 그려 둔다.
     std::shared_ptr<const CachedPicture> dragSnapshot;
     std::string dragSnapshotId;
+    // 여러 개체 고르기(한글 2024: Shift 를 누른 채 개체를 누르면 더하거나 뺀다). selectedObject 가 첫 개체이고, 여기는
+    // 함께 고른 다른 개체의 자리(글 묶음·문단·항목 순번)와 쪽 상자다. 끌면 같이 옮기고 Delete 로 같이 지운다.
+    struct PickedObject {
+        int page = -1;
+        int story = -1;
+        int paragraph = -1;
+        int item = -1;
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::int32_t width = 0;
+        std::int32_t height = 0;
+    };
+    std::vector<PickedObject> multiPicked;
+    bool shiftDown = false;  // 지금 누른 포인터가 Shift 와 함께인지(셸이 준 값)
     bool drawing = false;
     bool drawPending = false;
+    std::vector<model::ShapePoint> drawPoints;  // 다각형·곡선·자유선의 점(쪽 좌표)
+    double drawLastDown = 0;                    // 다각형·곡선: 마지막으로 누른 때(두 번 누르기를 가린다)
     int drawPage = -1;
     std::int32_t drawX0 = 0;
     std::int32_t drawY0 = 0;
@@ -287,8 +363,27 @@ void rememberSelection(const model::Document& doc, const std::vector<Node>& page
 
 int offsetToCharIndex(const model::Document& doc, const std::vector<Node>& pages, int story, int paraIdx, int offset);
 std::uint32_t charShapeAtParagraphChar(const model::Paragraph& para, int charIndex, bool preferRight);
+// 그 자리 글의 글자 스타일 번호. 없으면 model::kNoCharStyle 이다.
+std::uint32_t charStyleAtParagraphChar(const model::Paragraph& para, int charIndex, bool preferRight);
 // 글자 한 칸을 차지하는 컨트롤. 글자처럼 취급한 개체와 각주·미주 번호다. 문단 글자 번호는 이 칸을 하나로 센다.
 bool isCaretCharControl(const model::Control& ctrl);
+// 문단 글자 번호 charIndex 에 놓인 메모 필드 시작·끝 표시(글 차례). 메모 시작은 begin, 짝인 끝은 !begin 이고
+// memo 는 그 메모 시작 컨트롤이다. 한글은 이 표시마다 캐럿이 한 칸 멈춘다(숨긴 한글 GetPos 로 확인).
+struct MemoMarker {
+    const model::Control* control = nullptr;
+    const model::Control* memo = nullptr;
+    bool begin = false;
+};
+std::vector<MemoMarker> memoMarkersAt(const model::Paragraph& para, int charIndex);
+// 캐럿이 그 자리 표시 몇 개 뒤에 있는가. 정한 적 없는 자리면 앞쪽 끝 표시를 다 지난 자리(모든 메모 밖)다.
+int memoMarkerSlot(const PointerHold& hold, int story, int paragraph, int charIndex, const std::vector<MemoMarker>& markers);
+void setMemoMarkerSlot(PointerHold& hold, int story, int paragraph, int charIndex, int slot);
+// 표시 앞(after 거짓)이나 뒤에 글을 넣는다. 넣은 글자 수를 돌려준다.
+int insertTextAtMemoMarker(model::Paragraph& para, const model::Control* marker, bool after, const std::string& text);
+// 지우기(Delete·Backspace)가 캐럿 자리 메모 표시에 닿으면 그 메모. 닿지 않으면 nullptr 이다.
+const model::Control* memoMarkerToErase(const model::Document& doc, const std::vector<Node>& pages, EditKey key);
+// 캐럿 자리 메모(pendingMemo 가 있으면 그것)를 지운다. 본문 글은 남는다(page_commands.cpp).
+EditResult deleteMemoNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 // 막힌 글꼴이 남은 문서면 고치지 않고 out 에 글꼴 바꾸기를 묻는 결과를 둔다(edit_commands.cpp).
 bool editBlockedByLicenseFonts(const model::Document& doc, EditResult& out);
 // 개체 안 글을 고쳤을 때 그 개체를 품은 바깥 문단들의 lineSeg 를 버린다.
@@ -312,6 +407,8 @@ bool searchTextEqual(const std::string& a, const std::string& b, bool matchCase)
 int paragraphCharCount(const model::Paragraph& para);
 // 이 줄 문단에 그릴 교정 부호가 있는가(교정 부호 보기가 켜져 있을 때). 있으면 줄 칸 비트맵을 그린다.
 bool lineHasProofInk(const Node& line, const model::Document* doc);
+// 이 줄 문단에 메모 범위(%%me)가 있는가(메모 보이기가 켜져 있을 때). 있으면 줄 칸 비트맵에 범위 상자를 그린다.
+bool lineHasMemoRange(const Node& line, const model::Document* doc);
 bool parseHexColorRgb(const std::string& text, std::uint32_t& outRgb);
 // 줄에서 글자가 실제로 놓인 가로 범위 안(slack 만큼 넓혀)인가. 줄 상자가 넓어도 빈 곳은 글이 아니다.
 // lineX·lineY 는 줄 노드의 자리다. 글자 자리는 그리기·캐럿과 같은 placeLine 으로 잰다.
@@ -364,6 +461,52 @@ std::uint32_t deriveCharShapeId(model::Document& doc, std::uint32_t baseId, cons
 // boxWidth 는 여백 한 단계(marginLeftStep·marginRightStep)의 끝값을 정하는 문단 폭이다. 그 밖에는 쓰지 않는다.
 std::uint32_t deriveParaShapeId(model::Document& doc, std::uint32_t baseId, const FormatPatch& patch,
                                 std::int32_t boxWidth = 0);
+// 같은 모양이 있으면 그 번호, 없으면 새로 넣은 번호다.
+std::uint32_t internParaShape(model::Document& doc, model::ParaShape next);
+std::uint32_t internCharShape(model::Document& doc, model::CharShape next);
+// 문단 스타일 was → now 로 바꿀 때 글자·문단 모양. 옛 스타일과 다르게 직접 준 속성만 남긴다. was 가 없으면 스타일
+// 모양 그대로다(같은 스타일을 다시 입힐 때).
+std::uint32_t restyleCharShapeId(model::Document& doc, std::uint32_t curId, const model::Style* was,
+                                 const model::Style& now);
+std::uint32_t restyleParaShapeId(model::Document& doc, std::uint32_t curId, const model::Style* was,
+                                 const model::Style& now);
+// 문단을 was 에서 now 로 바꾼다(문단 모양·글자 모양·스타일 번호, 줄 나눔 값은 비운다).
+void restyleParagraph(model::Document& doc, model::Paragraph& para, const model::Style* was, const model::Style& now);
+// 문단 스타일 styleId 에서 now 로 갈 때의 옛 스타일. 같은 스타일이거나 글자 스타일이면 nullptr(스타일 모양 그대로)이다.
+const model::Style* restyleFrom(const model::Document& doc, std::uint32_t styleId, const model::Style& now);
+// style_commands.cpp. 스타일 표 명령(되돌리기 없이).
+EditResult commitStyleNow(model::Document& doc, std::vector<Node>& pages, const StyleDraft& draft,
+                          bool useStoredLineHeight, std::string& why);
+EditResult deleteStyleNow(model::Document& doc, std::vector<Node>& pages, std::uint32_t styleId, std::uint32_t replacement,
+                          bool useStoredLineHeight, std::string& why);
+EditResult moveStyleNow(model::Document& doc, std::vector<Node>& pages, std::uint32_t styleId, int delta,
+                        bool useStoredLineHeight, std::string& why);
+EditResult styleFromCaretNow(model::Document& doc, std::vector<Node>& pages, std::uint32_t styleId,
+                             bool useStoredLineHeight, std::string& why);
+EditResult clearCharStyleNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight, std::string& why);
+// 변경 내용 추적(track_commands.cpp). 기록 중 Delete·Backspace 를 지운 글 표시로 바꾼다. 했으면 참이다.
+bool trackDeleteNow(model::Document& doc, std::vector<Node>& pages, EditKey key, bool useStoredLineHeight, EditResult& out);
+// 친 글(paraFrom:charFrom ~ 캐럿)을 기록 중이면 넣은 글로, 아니면 표시 없는 글로 둔다. splitParagraphs 면 사이 문단 끝도.
+void trackMarkInserted(model::Document& doc, std::vector<Node>& pages, int story, int paraFrom, int charFrom,
+                       bool splitParagraphs);
+void mergeParagraphs(model::Paragraph& dst, const model::Paragraph& src);
+// 하이퍼링크(link_commands.cpp, pointer_hold.cpp, edit_commands.cpp).
+LinkSpot linkSpotAt(const model::Document& doc, const std::vector<Node>& pages, int page, int x, int y);
+// para 의 글자 번호 charIndex 를 감싼 하이퍼링크 필드. 없으면 nullptr 이고, 있으면 begin·end 는 링크 글자 구간이다.
+model::Control* hyperlinkAround(model::Paragraph& para, int charIndex, int& begin, int& end);
+// 링크 글 [startChar, endChar) 를 방문한 색(#800080 글자·밑줄)으로. 바뀌었으면 참이다.
+bool markLinkVisited(model::Document& doc, model::Paragraph& para, int startChar, int endChar);
+EditResult followLinkNow(model::Document& doc, std::vector<Node>& pages, int page, int x, int y, bool useStoredLineHeight,
+                         std::string& url, std::string& why);
+EditResult importStylesNow(model::Document& doc, std::vector<Node>& pages, const model::Document& source,
+                           const std::vector<std::string>& names, bool useStoredLineHeight, std::string& why);
+// toc_commands.cpp. 차례 만들기·새로 고침(되돌리기 없이).
+EditResult makeTocNow(model::Document& doc, std::vector<Node>& pages, const TocOptions& options,
+                      bool useStoredLineHeight, std::string& why);
+EditResult updateTocNow(model::Document& doc, std::vector<Node>& pages, bool all, bool useStoredLineHeight,
+                        std::string& why);
+// 문단에 문단 스타일을 입힌다(한글 스타일 적용: 직접 준 문단·글자 속성은 남고, 같은 스타일이면 모두 지운다).
+void applyParaStyle(model::Document& doc, model::Paragraph& para, const model::Style& st);
 
 // ---------------------------------------------------------------------------
 // edit_commands.cpp. 고친 자리를 다시 놓고 편집 결과를 만든다. 되돌리기(undo.cpp)도 쓴다
@@ -421,10 +564,18 @@ EditResult makeEditResult(const model::Document& doc, bool handled, bool changed
 // object_commands.cpp. 이름으로 가리킨 개체의 속성·지우기(되돌리기 없이).
 EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
                                const FormatFields& fields, bool useStoredLineHeight, std::string& why);
+EditResult insertEquationNow(model::Document& doc, std::vector<Node>& pages, const std::string& script,
+                             std::int32_t baseUnit, bool useStoredLineHeight, std::string& why);
+EditResult editEquationNow(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                           const std::string& script, std::int32_t baseUnit, bool useStoredLineHeight, std::string& why);
 EditResult deleteObjectNow(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
                            bool useStoredLineHeight, std::string& why);
 
 // 다시 짠 쪽에서 붙은 문단·zOrder 로 그 개체를 찾아 다시 고른다. 없으면 거짓이다.
+bool pickAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story, int paragraph,
+                        int item);
+// 고른 개체(첫 개체와 여러 개체 고르기로 더한 개체)를 모두 지운다. 고른 개체가 없으면 handled 가 거짓이다.
+EditResult deleteSelectedObjectsNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
                             int paragraph, int item);
 // 개체 노드가 가리키는 문서의 컨트롤. 없으면 nullptr 이다.
@@ -469,6 +620,41 @@ EditResult columnsNow(model::Document& doc, std::vector<Node>& pages, const Form
                       bool useStoredLineHeight, std::string& why);
 // 캐럿이 든 각주·미주를 닫고 그 주 바로 뒤로 간다(한글 주석 탭 닫기). 주 밖이면 아무것도 하지 않는다.
 EditResult leaveNoteNow(model::Document& doc, std::vector<Node>& pages);
+// 누름틀 넣기(한글 누름틀 고치기 대화 상자의 안내문·메모·필드 이름). 캐럿 자리에 손대지 않은 누름틀을 넣는다.
+EditResult insertClickHereNow(model::Document& doc, std::vector<Node>& pages, const std::string& direction,
+                              const std::string& memo, const std::string& name, bool useStoredLineHeight,
+                              std::string& error);
+// 캐럿이 손대지 않은 누름틀(안내문만 든 누름틀) 안이면 안내문을 지우고 그 누름틀을 고친 것으로 둔다. 캐럿은 누름틀
+// 시작이고, 이어 칠 글자 모양은 누름틀 앞 글자 모양이다(한글: 안내문 자리에 치면 안내문이 사라진다). 했으면 참.
+bool clearClickHereGuideAtCaret(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 캐럿 문단의 빈(고친) 누름틀에 안내문을 다시 넣고 손대지 않은 것으로 되돌린다(한글: 다 지우면 안내문이 보인다).
+bool restoreClickHereGuides(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 손대지 않은 누름틀 안(또는 바로 앞의 Delete, 바로 뒤의 BackSpace)에서 지우면 누름틀을 통째로 지운다.
+bool deleteClickHereAtCaret(model::Document& doc, std::vector<Node>& pages, EditKey key, bool useStoredLineHeight);
+// ←·→ 가 손대지 않은 누름틀을 한 칸으로 건넌다(앞 → 안 → 뒤). 했으면 참.
+bool moveOverClickHere(const model::Document& doc, const std::vector<Node>& pages, EditKey key);
+// 클릭한 캐럿이 안내문 글자 사이면 누름틀 안 자리로 옮긴다.
+void snapCaretIntoClickHere(const model::Document& doc, const std::vector<Node>& pages);
+// 누름틀 고치기 값(found, direction, memo, name, editable)과 고치기.
+FormatFields clickHereView(model::Document& doc, const std::vector<Node>& pages);
+EditResult modifyClickHereNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                              bool useStoredLineHeight, std::string& error);
+// 누름틀 안내문 숨기기(한글 2024): 블록 없는 캐럿이 손대지 않은 누름틀 안이면 안내문을 감추고(뒤 글이 당겨진다),
+// 캐럿이 나가면 다시 보인다. 편집이 아니라 보기 상태라 되돌리기 기록·고친 표시를 남기지 않는다.
+// 지금 캐럿에 맞추려면 바꿀 것이 있는지(가벼운 판단).
+bool clickHereGuideStale(const model::Document& doc, const std::vector<Node>& pages);
+// 캐럿에 맞춘다. 바꿨으면 참이고 relayout 에 다시 놓은 쪽이 든다.
+bool syncClickHereGuide(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight,
+                        EditRelayoutResult& relayout);
+// 숨긴 안내문을 되돌린다(편집·이동을 숨기지 않은 문서에서 하도록 그 앞에). 캐럿은 같은 논리 자리다.
+bool revealClickHereGuide(model::Document& doc, std::vector<Node>& pages, EditRelayoutResult& relayout);
+// 숨긴 안내문을 되돌린 문단(문서는 그대로). 숨긴 문단이 아니면 para 그대로다. 저장본·되돌리기 기록이 쓴다.
+model::Paragraph shownClickHereParagraph(const model::Paragraph& para, const paint_detail::HiddenClickGuide& hidden);
+// 문단 자체가 같은가(undo.cpp. 줄 정보는 보지 않는다).
+bool paragraphsAlike(const model::Paragraph& a, const model::Paragraph& b);
+// 누름틀 안내문·메모(필드 매개변수나 명령에서).
+std::string clickHereGuide(const model::Control& field);
+std::string clickHereMemo(const model::Control& field);
 EditResult insertHyperlinkNow(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                              const std::string& url, bool useStoredLineHeight, std::string& error);
 EditResult insertNoteNow(model::Document& doc, std::vector<Node>& pages, bool endnote, bool useStoredLineHeight,
@@ -495,7 +681,8 @@ EditResult replaceAllTextNow(model::Document& doc, std::vector<Node>& pages, con
 EditResult insertPictureNow(model::Document& doc, std::vector<Node>& pages, const Bytes& image, bool useStoredLineHeight,
                             std::int32_t width = 0, std::int32_t height = 0);
 EditResult insertShapeNow(model::Document& doc, std::vector<Node>& pages, int tool, int page, std::int32_t x0,
-                          std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight);
+                          std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight,
+                          const std::vector<model::ShapePoint>* points = nullptr);
 EditResult insertDrawnShapeNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 EditResult moveObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);

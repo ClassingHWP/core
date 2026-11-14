@@ -13,7 +13,7 @@ struct ProofEntry {
     const char* name;
 };
 
-// id 는 HWP 5.0 규격(표 154), HWPX 이름은 한글 2024 가 저장한 HWPX 의 글이다. 지움표·뺌표·붙임표·줄 붙임표·톱니표·
+// id 는 HWP 5.0 규격(표 154), HWPX 이름은 한글 2024 의 글이다. 지움표·뺌표·붙임표·줄 붙임표·톱니표·
 // 생각표·칭찬표·줄표·고침표·오른·왼 자리 옮김표·띄움 등(%sig)·메모 고침표는 한글이 저장한 HWP·HWPX 로 짝을 확인했다.
 constexpr ProofEntry kProofs[] = {
     {ProofKind::Delete, "%%*d", "PROOFREADING_MARKS_DELETE", "지움표"},

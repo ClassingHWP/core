@@ -402,18 +402,22 @@ int cursorSectionIndex(const model::Document& doc) {
     return 0;
 }
 
-Derived derive(const model::Document& doc, const std::vector<Node>& pages, const FormatFields& resolved) {
+CursorStyle baseStyle(const model::Document& doc, const std::vector<Node>& pages, const CaretPlace* base) {
+    return base ? cursorStyleForCaret(doc, *base) : cursorStyle(doc, pages);
+}
+
+Derived derive(const model::Document& doc, const std::vector<Node>& pages, const FormatFields& resolved,
+               const CaretPlace* base = nullptr) {
     Derived out;
-    const CursorStyle st = cursorStyle(doc, pages);
+    const CursorStyle st = baseStyle(doc, pages, base);
     out.scratch = scratchOf(doc);
     out.styleId = st.styleId;
     FormatPatch patch;
     for (const auto& [key, value] : resolved) setFormatField(patch, key, value);
     out.charShapeId = deriveCharShapeId(out.scratch, st.charShapeId, patch);
     out.paraShapeId = deriveParaShapeId(out.scratch, st.paraShapeId, patch);
-    const int section = cursorSectionIndex(doc);
-    out.sectionDefaultTab =
-        doc.sections.empty() ? 4000 : doc.sections[static_cast<std::size_t>(section)].defaultTab;
+    const int section = base ? 0 : cursorSectionIndex(doc);
+    out.sectionDefaultTab = doc.sections.empty() ? 4000 : doc.sections[static_cast<std::size_t>(section)].defaultTab;
     if (std::int32_t tab = 0; sectionDefaultTabOf(patch.fields, tab)) out.sectionDefaultTab = tab;
     return out;
 }
@@ -660,7 +664,7 @@ FormatView pageBorderView(const ValueMap& values) {
 }  // namespace
 
 FormatFields resolveFormatView(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                               const FormatFields& viewPatch) {
+                               const FormatFields& viewPatch, const CaretPlace* base) {
     FormatFields out;
     if (kind == FormatViewKind::PageBorder) {
         for (const auto& [key, value] : resolvePageBorder(doc, viewPatch)) out.emplace_back(key, value);
@@ -670,14 +674,18 @@ FormatFields resolveFormatView(const model::Document& doc, const std::vector<Nod
         for (const auto& [key, value] : resolvePage(mapOf(pageSetupAtCursor(doc)), viewPatch)) out.emplace_back(key, value);
         return out;
     }
-    for (const auto& [key, value] : resolveText(mapOf(formatFieldsAtCursor(doc, pages)), viewPatch)) {
+    const FormatFields now =
+        base ? formatFieldsOf(doc, cursorStyleForCaret(doc, *base),
+                              doc.sections.empty() ? 4000 : doc.sections.front().defaultTab)
+             : formatFieldsAtCursor(doc, pages);
+    for (const auto& [key, value] : resolveText(mapOf(now), viewPatch)) {
         out.emplace_back(key, value);
     }
     return out;
 }
 
 FormatView formatView(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                      const FormatFields& viewPatch) {
+                      const FormatFields& viewPatch, const CaretPlace* base) {
     if (kind == FormatViewKind::Table) {
         FormatView view;
         view.values = {{"rows", static_cast<double>(kTableStartRows)}, {"cols", static_cast<double>(kTableStartCols)}};
@@ -690,17 +698,17 @@ FormatView formatView(const model::Document& doc, const std::vector<Node>& pages
         for (const auto& [key, value] : resolvePage(values, viewPatch)) values[key] = value;
         return pageView(doc, values);
     }
-    const FormatFields resolved = resolveFormatView(doc, pages, kind, viewPatch);
-    return textView(fieldsOf(derive(doc, pages, resolved)));
+    const FormatFields resolved = resolveFormatView(doc, pages, kind, viewPatch, base);
+    return textView(fieldsOf(derive(doc, pages, resolved, base)));
 }
 
 PageBitmap renderFormatPreview(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                               const FormatFields& viewPatch, int width, int height) {
+                               const FormatFields& viewPatch, int width, int height, const CaretPlace* base) {
     if (kind == FormatViewKind::Page || kind == FormatViewKind::Table || kind == FormatViewKind::PageBorder || width <= 0 ||
         height < 32) {
         return {};
     }
-    Derived d = derive(doc, pages, resolveFormatView(doc, pages, kind, viewPatch));
+    Derived d = derive(doc, pages, resolveFormatView(doc, pages, kind, viewPatch, base), base);
     model::Document& sample = d.scratch;
 
     // 앞뒤 문단은 흐린 글자로 쓴다.

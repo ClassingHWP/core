@@ -58,6 +58,8 @@ struct RunStyle {
     std::int16_t relSize = 100;
     std::int16_t spacing = 0;
     std::int16_t charOffset = 0;
+    // 변경 추적(model::kTrackInsert·kTrackDelete). 그릴 때 넣은 글은 빨간 밑줄, 지운 글은 빨간 취소선이다.
+    std::uint8_t track = 0;
 
     bool operator==(const RunStyle&) const = default;
 };
@@ -67,7 +69,7 @@ const RunStyle* defaultRunStyle();
 // 꼴 값으로 공용 꼴 자리를 얻는다. 빈 이름은 없음이다.
 const RunStyle* runStyleOf(std::int32_t fontSize, const std::string& font, const std::string& markpen,
                            const std::string& tabLeader, std::int32_t ratio, std::int32_t relSize, std::int32_t spacing,
-                           std::int32_t charOffset);
+                           std::int32_t charOffset, std::uint8_t track = 0);
 
 struct LineRun {
     RunKind kind = RunKind::Text;
@@ -306,6 +308,17 @@ struct ObjectExtra {
     int eqBase = -1;               // 측정 기준선 퍼센트. 재지 않았으면 -1
     std::int32_t eqBaseUnit = 1000;  // 수식 글자 크기(1000 = 10pt). 그릴 때 다시 놓는다
     std::string eqFont;              // 수식 글꼴. 비어 있으면 HYhwpEQ
+    std::string artText;             // 글맵시 글(줄은 '\n')
+    std::string artFont;             // 글맵시 글꼴
+    int artShape = 42;               // 글맵시 모양 번호(42 직사각형)
+    int artLineSpacing = 120;
+    int artCharSpacing = 100;
+    std::string artAlign = "LEFT";
+    // 글맵시 그림자(NONE 이 아니면 있음). 자리는 개체 크기의 백분율이다.
+    bool artShadow = false;
+    std::string artShadowColor;
+    int artShadowX = 0;
+    int artShadowY = 0;
     int fileEqBase = -1;           // 파일 기준선. 요소 비교용이고 조판에는 안 쓴다
     std::int32_t fileWidth = 0;
     std::int32_t fileHeight = 0;

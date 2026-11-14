@@ -97,6 +97,7 @@ EditResult relayoutAfterObjectEdit(model::Document& doc, std::vector<Node>& page
 
 void clearObjectSelection() {
     PointerHold& hold = pointerHold();
+    hold.multiPicked.clear();
     if (!hold.selectedObject && !hold.objectHandles) return;
     hold.selectedObject = nullptr;
     hold.objectHandles = false;
@@ -271,6 +272,42 @@ EditResult deleteObjectNow(model::Document& doc, std::vector<Node>& pages, int s
     setPointerCursor(doc, pages, model::CursorPos{story, paragraph, charIndexToOffset(doc, pages, story, paragraph, charIndex)});
     const PointerCursor now = pointerCursor();
     result.cursor = now;
+    return result;
+}
+
+EditResult deleteSelectedObjectsNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    PointerHold& hold = pointerHold();
+    if (readOnly() || !hold.selectedObject || !hold.objectHandles) return {};
+    struct Ref {
+        int story;
+        int paragraph;
+        int item;
+    };
+    std::vector<Ref> refs;
+    const Node* first = hold.selectedObject;
+    if (first->ext().obj().anchorStory > 0 && first->ext().obj().anchorItem >= 0) {
+        refs.push_back({first->ext().obj().anchorStory, first->ext().obj().anchorParagraph, first->ext().obj().anchorItem});
+    }
+    for (const PointerHold::PickedObject& picked : hold.multiPicked) refs.push_back({picked.story, picked.paragraph, picked.item});
+    if (refs.empty()) return {};
+    // 뒤 항목부터 지운다. 앞 항목을 먼저 지우면 같은 문단 뒤 항목의 순번이 당겨진다.
+    std::sort(refs.begin(), refs.end(), [](const Ref& a, const Ref& b) {
+        if (a.story != b.story) return a.story > b.story;
+        if (a.paragraph != b.paragraph) return a.paragraph > b.paragraph;
+        return a.item > b.item;
+    });
+    refs.erase(std::unique(refs.begin(), refs.end(),
+                           [](const Ref& a, const Ref& b) {
+                               return a.story == b.story && a.paragraph == b.paragraph && a.item == b.item;
+                           }),
+               refs.end());
+    hold.multiPicked.clear();
+    EditResult result;
+    for (const Ref& ref : refs) {
+        std::string why;
+        EditResult one = deleteObjectNow(doc, pages, ref.story, ref.paragraph, ref.item, useStoredLineHeight, why);
+        if (one.documentChanged) result = one;
+    }
     return result;
 }
 

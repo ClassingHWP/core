@@ -375,7 +375,7 @@ EditResult setPageNumber(model::Document& doc, std::vector<Node>& pages, const F
     control->numFormat = textField(fields, "format", control->numFormat.empty() ? "DIGIT" : control->numFormat);
     const std::string side = textField(fields, "sideChar", control->prefix);
     control->prefix = control->suffix = side;
-    // 시작 번호(한글 2024 PageNumPos): 그 자리에 쪽 새 번호가 있으면 번호만 고치고,
+    // 시작 번호(한글 2024 APageNumPos): 그 자리에 쪽 새 번호가 있으면 번호만 고치고,
     // 없으면 1 이 아닐 때만 새로 넣는다.
     if (const double start = numberField(fields, "start", 0); start >= 1) {
         const auto number = static_cast<std::uint32_t>(std::clamp(std::lround(start), 1L, 65535L));
@@ -1101,7 +1101,7 @@ EditResult deletePages(model::Document& doc, std::vector<Node>& pages, const For
 }
 
 // ---- 메모 ----
-// 메모는 필드(%%me)다. 시작은 블록 앞, 끝(FieldEnd)은 블록 뒤에 두고 메모 글은 필드의 글 목록이다.
+// 메모는 필드(%%me)다. 시작은 블록 앞, 끝(FieldEnd)은 블록 뒤에 두고 메모 글은 필드의 글 목록이다(docs/memo-structure.md).
 // 메모 글 문단은 "메모" 스타일(한글 새 문서 17번, 영문 Memo)을 쓴다. 없으면 바탕글이다.
 
 struct MemoAt {
@@ -1116,6 +1116,20 @@ MemoAt memoAtCaret(model::Document& doc, const std::vector<Node>& pages) {
     if (!cur.active || cur.story <= 0) return out;
     model::Paragraph* para = storyParagraph(doc, cur.story, cur.paragraph);
     if (!para) return out;
+    // 지우기가 표시에 닿아 고른 메모. 그 캐럿 자리 그대로면 그 메모다.
+    PointerHold& hold = pointerHold();
+    if (hold.pendingMemo && hold.pendingMemoStory == cur.story && hold.pendingMemoPara == cur.paragraph &&
+        hold.pendingMemoOffset == cur.offset) {
+        for (model::Run& run : para->runs) {
+            for (model::InlineItem& item : run.items) {
+                if (item.type == model::InlineItem::Type::Control && &item.control == hold.pendingMemo) {
+                    out.para = para;
+                    out.memo = &item.control;
+                    return out;
+                }
+            }
+        }
+    }
     const int caret = offsetToCharIndex(doc, pages, cur.story, cur.paragraph, cur.offset);
     std::vector<model::Control*> open;
     int chars = 0;
@@ -1432,6 +1446,7 @@ EditResult deleteMemo(model::Document& doc, std::vector<Node>& pages, bool useSt
         }
         if (end) break;
     }
+    pointerHold().pendingMemo = nullptr;
     const HeldCaret held = holdCaret(doc, pages);
     if (end) eraseControl(*at.para, end);
     eraseControl(*at.para, at.memo);
@@ -1568,6 +1583,11 @@ FormatFields masterFields(const model::Document& doc) {
 
 
 }  // namespace
+
+EditResult paint_detail::deleteMemoNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    std::string why;
+    return deleteMemo(doc, pages, useStoredLineHeight, why);
+}
 
 const char* pageControlName(PageControlKind kind) {
     switch (kind) {

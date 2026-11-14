@@ -61,5 +61,6 @@ private:
 // raw deflate(zlib 헤더 없음) 해제 및 압축. HWP 스트림 압축 방식.
 bool inflateRaw(ByteView input, Bytes& out);
 bool deflateRaw(ByteView input, Bytes& out);
+std::uint32_t crc32(ByteView input);
 
 }  // namespace chwp::zip

@@ -15,6 +15,7 @@
 #include "chwp/render/scene.hpp"
 #include "render/paint_detail.hpp"
 #include "render/scene_detail.hpp"
+#include "render/painter.hpp"
 #include "render/picture.hpp"
 
 // 포인터를 누르고 끄는 동안의 상태. 캐럿, 범위 선택, 개체 선택과 크기 조절, 터치 제스처가 여기 있다.
@@ -43,6 +44,7 @@ int currentCaretPageHint() { return pointerHold().caretPage; }
 void clearPendingCharShape(PointerHold& hold) {
     hold.hasPendingCharShape = false;
     hold.pendingCharShapeId = 0;
+    hold.pendingCharStyleId = model::kNoCharStyle;
     hold.pendingCharStory = 0;
     hold.pendingCharPara = -1;
     hold.pendingCharOffset = -1;
@@ -101,7 +103,7 @@ bool inlineObjectControl(const model::Control& ctrl) {
     using model::ControlKind;
     return ctrl.placement && ctrl.placement->treatAsChar &&
            (ctrl.kind == ControlKind::Shape || ctrl.kind == ControlKind::Picture || ctrl.kind == ControlKind::Table ||
-            ctrl.kind == ControlKind::Container || ctrl.kind == ControlKind::Equation);
+            ctrl.kind == ControlKind::Container || ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole);
 }
 
 int controlCharOffset(const model::Paragraph& para, const model::Control* control) {
@@ -975,6 +977,7 @@ bool cornerOf(const ObjRef& obj, int px, int py, double radius) {
 }
 
 void showObject(PointerHold& hold, const std::vector<Node>& pages, int page, const ObjRef& obj) {
+    hold.multiPicked.clear();
     hold.boxes.clear();
     hold.selectedText.clear();
     hold.pins = false;
@@ -1004,6 +1007,26 @@ void showObject(PointerHold& hold, const std::vector<Node>& pages, int page, con
         hold.boxes.push_back(held);
     }
     bumpPointerPicture();
+}
+
+// 그 쪽에 그려진 개체(글 묶음·문단·항목 순번)의 쪽 상자를 여러 개체 고르기에 더한다. 없으면 거짓.
+bool pickAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story, int paragraph,
+                        int item) {
+    if (page < 0 || page >= static_cast<int>(pages.size())) return false;
+    PointerHold& hold = pointerHold();
+    bool found = false;
+    auto visit = [&](const Node& node, std::int32_t x, std::int32_t y) {
+        if (found || node.turned != 0) return false;
+        if (node.kind == NodeKind::Object && node.ext().obj().anchorStory == story &&
+            node.ext().obj().anchorParagraph == paragraph && node.ext().obj().anchorItem == item) {
+            hold.multiPicked.push_back(PointerHold::PickedObject{page, story, paragraph, item, x, y, node.width, node.height});
+            found = true;
+            return false;
+        }
+        return true;
+    };
+    walkPlacedNodes(doc, pages[static_cast<std::size_t>(page)], 0, 0, visit);
+    return found;
 }
 
 bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
@@ -1051,6 +1074,7 @@ void refreshPins(PointerHold& hold, const model::Document& doc, const std::vecto
 }
 
 void selectCaret(PointerHold& hold, const model::Document& doc, const std::vector<Node>& pages, int page, const CaretPlace& place) {
+    hold.multiPicked.clear();
     hold.selectedObject = nullptr;
     hold.objectHandles = false;
     hold.resizeHandle = -1;
@@ -1071,6 +1095,7 @@ void selectCaret(PointerHold& hold, const model::Document& doc, const std::vecto
 }
 
 void selectSpan(PointerHold& hold, const model::Document& doc, const std::vector<Node>& pages, int page, int story, int paraA, int offA, int paraB, int offB) {
+    hold.multiPicked.clear();
     hold.selectedObject = nullptr;
     hold.objectHandles = false;
     hold.resizeHandle = -1;
@@ -1185,6 +1210,41 @@ PaperHit hitMaster(const model::Document& doc, const Node& paper, int px, int py
         hit.bandStory = story;
     }
     return hit;
+}
+
+PaperHit hitPaper(const model::Document& doc, const Node& paper, int px, int py, int editBand, double edgeBand);
+
+LinkSpot linkSpotAt(const model::Document& doc, const std::vector<Node>& pages, int page, int x, int y) {
+    LinkSpot out;
+    if (page < 0 || page >= static_cast<int>(pages.size())) return out;
+    const PaperHit hit = hitPaper(doc, pages[static_cast<std::size_t>(page)], x, y, pointerHold().bandStory, 0);
+    if (hit.zone != ClickZone::Line || !hit.line.node || hit.line.turned) return out;
+    const Node& line = *hit.line.node;
+    // 줄 상자 안이어야 한다(줄 옆 빈 곳은 링크가 아니다).
+    if (y < hit.line.y || y >= hit.line.y + std::max<std::int32_t>(1, hit.line.h)) return out;
+    Painter painter;
+    painter.doc = &doc;
+    const std::vector<std::int32_t> edges = painter.glyphEdges(line, hit.line.x, hit.line.y, nullptr);
+    int glyph = -1;
+    for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+        if (x >= edges[i] && x < edges[i + 1]) {
+            glyph = static_cast<int>(i);
+            break;
+        }
+    }
+    if (glyph < 0) return out;
+    // 글자 한가운데를 잡아 그 글자의 번호를 얻는다.
+    const int charIndex = offsetToCharIndex(doc, pages, line.story, line.paragraph, line.start + glyph);
+    model::Paragraph* para = storyParagraph(const_cast<model::Document&>(doc), line.story, line.paragraph);
+    if (!para) return out;
+    int begin = 0;
+    int end = 0;
+    if (!hyperlinkAround(*para, charIndex, begin, end)) return out;
+    out.found = true;
+    out.story = line.story;
+    out.paragraph = line.paragraph;
+    out.charIndex = charIndex;
+    return out;
 }
 
 PaperHit hitPaper(const model::Document& doc, const Node& paper, int px, int py, int editBand, double edgeBand) {
@@ -1323,6 +1383,31 @@ void applyZone(PointerHold& hold, const model::Document& doc, const std::vector<
         selectCaret(hold, doc, pages, page, place);
         hold.eventText = start ? "줄 맨 앞" : "줄 맨 뒤";
     };
+    // Shift 를 누른 채 다른 개체를 누르면 고른 개체에 더하고, 이미 고른 개체면 뺀다(한글 여러 개체 고르기).
+    if (count == 1 && hit.zone == ClickZone::Object && !hit.objects.empty() && hold.shiftDown && hold.selectedObject &&
+        hold.objectHandles) {
+        const ObjRef* target = hit.pick >= 0 && hit.pick < static_cast<int>(hit.objects.size())
+                                   ? &hit.objects[static_cast<std::size_t>(hit.pick)]
+                                   : &hit.objects.front();
+        const Node* node = target ? target->node : nullptr;
+        if (node && node != hold.selectedObject && node->ext().obj().anchorStory > 0 && node->ext().obj().anchorItem >= 0) {
+            const int story = node->ext().obj().anchorStory;
+            const int paragraph = node->ext().obj().anchorParagraph;
+            const int item = node->ext().obj().anchorItem;
+            const auto same = std::find_if(hold.multiPicked.begin(), hold.multiPicked.end(), [&](const auto& picked) {
+                return picked.story == story && picked.paragraph == paragraph && picked.item == item;
+            });
+            if (same != hold.multiPicked.end()) {
+                hold.multiPicked.erase(same);
+            } else {
+                hold.multiPicked.push_back(PointerHold::PickedObject{page, story, paragraph, item, target->x, target->y,
+                                                                     target->w, target->h});
+            }
+            hold.eventText = "개체 " + std::to_string(hold.multiPicked.size() + 1) + "개 고름";
+            bumpPointerPicture();
+            return;
+        }
+    }
     if (count == 1 && hit.zone == ClickZone::Object && !hit.objects.empty()) {
         const ObjRef* target = hit.pick >= 0 && hit.pick < static_cast<int>(hit.objects.size())
                                    ? &hit.objects[static_cast<std::size_t>(hit.pick)]
@@ -1341,6 +1426,19 @@ void applyZone(PointerHold& hold, const model::Document& doc, const std::vector<
             hold.eventText = "개체 " + target->node->role;
         }
         return;
+    }
+    // 수식을 두 번 누르면 그 수식을 고르고 수식 편집기를 연다(한글 수식 고치기).
+    if (count == 2 && hit.zone == ClickZone::Object && !hit.objects.empty()) {
+        const ObjRef* target = nullptr;
+        for (const ObjRef& ref : hit.objects) {
+            if (ref.node && ref.node->role == "equation") target = &ref;
+        }
+        if (target) {
+            showObject(hold, pages, page, *target);
+            hold.openDialog = "equation";
+            hold.eventText = "수식 고치기";
+            return;
+        }
     }
     if (hit.zone == ClickZone::Line && hit.line.node) {
         if (count <= 1) {
@@ -2190,6 +2288,7 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
     hold.eventText.clear();
     hold.property.clear();
     if (percent > 0) hold.percent = percent;
+    if (kind == 1) hold.shiftDown = sample.shift;
     // 도형 그리기: 누른 자리부터 끈 자리까지가 도형 상자다. 그 쪽 밖으로 나가면 쪽 끝에서 멈춘다.
     if (hold.drawTool != 0 && !readOnly()) {
         const auto clampToPage = [&](std::int32_t& px, std::int32_t& py) {
@@ -2199,6 +2298,81 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
             px = std::clamp<std::int32_t>(px, 0, std::max<std::int32_t>(0, paper.width));
             py = std::clamp<std::int32_t>(py, 0, std::max<std::int32_t>(0, paper.height));
         };
+        const int tool = hold.drawTool;
+        const auto finishDraw = [&]() {
+            hold.drawing = false;
+            hold.drawPending = true;
+            hold.drawPendingTool = tool;
+            hold.drawTool = 0;
+        };
+        // 다각형·곡선: 누를 때마다 점을 더한다. 마지막 점 근처를 곧바로 다시 누르면(두 번 누르기) 끝나고, 다각형은 첫 점을
+        // 누르면 닫고 끝난다. 누른 채 끌면 그 점을 옮긴다.
+        if (tool == 7 || tool == 8) {
+            constexpr std::int32_t kNear = 300;  // 약 1mm
+            if (kind == 1 && page >= 0 && page < static_cast<int>(pages.size())) {
+                std::int32_t px = x;
+                std::int32_t py = y;
+                if (!hold.drawing) {
+                    hold.drawing = true;
+                    hold.drawPage = page;
+                    clampToPage(px, py);
+                    hold.drawPoints.assign(1, model::ShapePoint{px, py});
+                } else if (page == hold.drawPage) {
+                    clampToPage(px, py);
+                    const model::ShapePoint last = hold.drawPoints.back();
+                    const model::ShapePoint first = hold.drawPoints.front();
+                    const bool nearLast = std::abs(px - last.x) + std::abs(py - last.y) < kNear;
+                    const bool quick = sample.time <= 0 || hold.drawLastDown <= 0 || sample.time - hold.drawLastDown < 500;
+                    const bool closes = tool == 7 && hold.drawPoints.size() >= 3 &&
+                                        std::abs(px - first.x) + std::abs(py - first.y) < kNear;
+                    if ((nearLast && quick) || closes) {
+                        if (hold.drawPoints.size() >= (tool == 7 ? 3u : 2u)) finishDraw();
+                        else hold.drawing = false;
+                    } else if (!nearLast) {
+                        hold.drawPoints.push_back(model::ShapePoint{px, py});
+                    }
+                }
+                hold.drawLastDown = sample.time;
+            } else if (kind == 2 && hold.drawing && page == hold.drawPage && !hold.drawPoints.empty()) {
+                std::int32_t px = x;
+                std::int32_t py = y;
+                clampToPage(px, py);
+                hold.drawPoints.back() = model::ShapePoint{px, py};
+            } else if (kind == 4) {
+                hold.drawing = false;
+                hold.drawPoints.clear();
+            }
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
+        // 자유선: 누른 채 끈 자취를 점으로 모은다.
+        if (tool == 9) {
+            if (kind == 1 && page >= 0 && page < static_cast<int>(pages.size())) {
+                hold.drawing = true;
+                hold.drawPage = page;
+                std::int32_t px = x;
+                std::int32_t py = y;
+                clampToPage(px, py);
+                hold.drawPoints.assign(1, model::ShapePoint{px, py});
+            } else if ((kind == 2 || kind == 3) && hold.drawing) {
+                if (page == hold.drawPage) {
+                    std::int32_t px = x;
+                    std::int32_t py = y;
+                    clampToPage(px, py);
+                    const model::ShapePoint last = hold.drawPoints.back();
+                    if (std::abs(px - last.x) + std::abs(py - last.y) >= 120) hold.drawPoints.push_back({px, py});
+                }
+                if (kind == 3) {
+                    if (hold.drawPoints.size() >= 2) finishDraw();
+                    else hold.drawing = false;
+                }
+            } else if (kind == 4) {
+                hold.drawing = false;
+                hold.drawPoints.clear();
+            }
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
         if (kind == 1 && page >= 0 && page < static_cast<int>(pages.size())) {
             hold.drawing = true;
             hold.drawPage = page;
@@ -2401,6 +2575,11 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
         }
     } else if (kind == 3) {
         hold.tracking = false;
+        // 안내문을 눌렀으면 캐럿은 누름틀 안 한 자리다.
+        if (hold.caret.hit && hold.anchorPara == hold.focusPara && hold.anchorOff == hold.focusOff) {
+            hold.clickHereStory = -1;
+            snapCaretIntoClickHere(doc, pages);
+        }
         if (hold.caret.hit) {
             hold.eventText = "뗌 " + rangeText(hold) + " 커서 " + caretSpot(hold.caret, hold.caretPage);
         }
@@ -2538,6 +2717,7 @@ std::string hoverCursor(const model::Document& doc, const std::vector<Node>& pag
     // 머리말·꼬리말 편집 중에는 본문 줄 위도 글 커서를 보이지 않는다.
     if (hold.bandStory > 0 && hit.bandStory != hold.bandStory) return "default";
     if (hit.zone != ClickZone::Line) return "default";
+    if (linkSpotAt(doc, pages, page, x, y).found) return "pointer";
     return hit.line.turned ? "vertical-text" : "text";
 }
 
@@ -2777,8 +2957,9 @@ PointerView setPointerCursor(const model::Document& doc, const std::vector<Node>
                              model::CursorPos focus) {
     PointerHold& hold = pointerHold();
     hold.eventText.clear();
-    // 캐럿을 새로 놓으면 ↑↓ 가 따라갈 가로 자리도 새로 잰다(클릭과 같다).
+    // 캐럿을 새로 놓으면 ↑↓ 가 따라갈 가로 자리도 새로 잰다(클릭과 같다). 누름틀 안쪽 표시도 뗀다.
     hold.preferredX = -1;
+    hold.clickHereStory = -1;
     if (focus.story <= 0 || anchor.story <= 0 || focus.story != anchor.story) {
         const int kept = hold.percent;
         hold = {};

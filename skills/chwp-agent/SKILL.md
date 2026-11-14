@@ -1,6 +1,6 @@
 ---
 name: chwp-agent
-description: 한글(HWP·HWPX) 문서를 열어 글을 읽고, 찾고, 고치고(글 넣기·지우기·바꾸기·모두 바꾸기·글자/문단 서식·표 넣기·표 칸 채우기·표 줄/칸 넣기·지우기·칸 합치기·나누기·셀 테두리/배경·셀 크기 같게·그림·머리말/꼬리말·쪽 번호·바탕쪽·각주/미주·메모·교정 부호·단·구역·캡션·책갈피·하이퍼링크·도형·개체 속성), 쪽을 PNG 로 그려 확인하고, HWP 또는 HWPX 로 저장한다. 사용자가 .hwp/.hwpx 파일의 내용을 묻거나 고쳐 달라고 할 때 쓴다.
+description: 한글(HWP·HWPX) 문서를 열어 글을 읽고, 찾고, 고치고(글 넣기·지우기·바꾸기·모두 바꾸기·글자/문단 서식·표 넣기·표 칸 채우기·표 줄/칸 넣기·지우기·칸 합치기·나누기·셀 테두리/배경·셀 크기 같게·그림·머리말/꼬리말·쪽 번호·바탕쪽·각주/미주·메모·교정 부호·단·구역·캡션·책갈피·하이퍼링크·도형(호·다각형·곡선·자유선 포함)·수식·개체 속성), 쪽을 PNG 로 그려 확인하고, HWP·HWPX 또는 PDF 로 저장한다. 사용자가 .hwp/.hwpx 파일의 내용을 묻거나 고쳐 달라고 할 때 쓴다.
 ---
 
 # chwp-agent
@@ -31,7 +31,8 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
   글꼴 서버(`https://ede.kr/hwp/fonts/`, `CHWP_FONT_BASE` 로 바꿈)에서 받아 캐시(`~/.cache/chwp-agent/fonts`,
   `CHWP_FONT_CACHE`)에 넣는다. 글꼴 파일은 한 번 받으면 다시 받지 않고, 글꼴 목록(`index.json` 등)은 실행마다
   바뀌었는지만 묻는다. 고친 목록을 쓰려면 `CHWP_FONT_INDEX`·`CHWP_FONT_LICENSE_SWAP`·`CHWP_FONT_REPLACE` 에 파일 경로나
-  주소를 준다(reference.md 의 글꼴). 네트워크가 막힌 곳에서는 `--no-font-fetch` 로 캐시만 쓴다.
+  주소를 준다(reference.md 의 글꼴). **`--no-font-fetch` 는 붙이지 않는다.** 네트워크가 막혔을 거라 짐작해 미리
+  붙이면 받을 수 있던 글꼴도 빠진다. 받기가 실패해도 스크립트는 stderr 에 한 줄 남기고 캐시·대체 글꼴로 이어 간다.
 - `{"call":"info"}` 의 `missingFonts` 가 비어 있지 않으면 그 글꼴은 대체 글꼴로 재고 그렸다. 줄 나눔·그림이 한글과
   다를 수 있다고 사용자에게 알린다. `missingGlyphs` 가 비어 있지 않으면 그 글자(글머리표·기호 등)는 그림에서 비어
   나온다. 그림을 줄 때 어느 글자가 빠질 수 있는지 함께 알린다.
@@ -128,7 +129,7 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py "문서.hwp" render.jsonl --ou
 4. **확인**: 바뀐 문단을 `paragraph`/`text` 로 다시 읽고, 그 쪽을 `{"call":"layout","page":...}` 로 읽어
    줄 나눔·넘침(`overflow`)·표가 쪽에서 잘렸는지를 본다. 색·굵기처럼 눈으로 볼 모양만 `render` 로 그려 본다.
    찾은 결과의 `page` 를 그대로 `render` 의 `page` 로 넘기면 된다.
-5. **저장**: `--save 경로` 또는 `{"call":"save","path":"..."}`. 확장자(.hwp/.hwpx)로 형식을 정한다.
+5. **저장**: `--save 경로` 또는 `{"call":"save","path":"..."}`. 확장자(.hwp/.hwpx/.pdf)로 형식을 정한다. PDF 는 쪽 그림을 묶은 것이다.
    틀렸으면 `{"call":"undo"}` 로 마지막 apply 를 되돌린다(같은 실행 안에서만).
 
 ## 예

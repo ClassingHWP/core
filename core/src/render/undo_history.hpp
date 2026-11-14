@@ -34,6 +34,7 @@ struct UndoRecord {
     // 구역 칸(편집 용지·막힌 글꼴 바꾸기): 구역 전체와 글꼴 표를 맞바꾼다.
     std::vector<model::Section> sections;
     model::PerLang<std::vector<model::Font>> fonts;
+    std::vector<model::Style> styles;
     CaretMark caretBefore;  // 이 칸을 적용한 뒤 캐럿
     CaretMark caretAfter;   // 이 칸을 적용하기 전 캐럿(이어 치기 판단)
     bool closed = false;    // 되돌리기·다시 하기를 거쳤으면 더 잇지 않는다

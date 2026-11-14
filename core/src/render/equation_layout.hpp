@@ -55,6 +55,8 @@ EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUni
 // 10pt x_2 는 높이 1177, 기준선 72%다.
 EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUnit,
                                    std::string_view symbolFont = "HYhwpEQ");
+// 이름별 수식 글꼴 폭 표를 비운다. 글꼴이 들어오면 부른다(받기 전에 대체 글꼴 폭으로 채운 표가 남지 않게).
+void clearEquationFontCache();
 
 // 글꼴 원본으로 정사각 크기(높이 1~maxHeightPx)마다 힌팅·내장 비트맵이 바꾼 글자 진행폭을 모아
 // 폭 정보 파일에 넣을 CHgw 표를 만든다. 힌팅 없는 식과 같은 칸은 넣지 않는다. 원본이 없으면 빈 값이다.

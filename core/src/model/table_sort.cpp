@@ -1,8 +1,8 @@
-// 표 정렬(한글 2024 Sort, 표 칸 블록). 한글 2024 정렬과 같은 결과를 내도록 맞췄다.
+// 표 정렬(한글 2024 Sort, 표 칸 블록). 한글 2024 의 정렬 규칙을 그대로 따른다.
 //  - 줄마다 기준 칸의 첫 문단 글(HWP 원문: 탭·개체는 8 단위 확장 문자) 뒤에 문단 끝 \r 을 붙인 것이 키다.
-//  - 비교는 형식마다 글자·숫자·날짜·코드, 같으면 다음 기준. 내림차순은 결과 부호를 뒤집는다.
+//  - 비교는 형식마다 글자·숫자·날짜·코드 비교, 같으면 다음 기준. 내림차순은 결과 부호를 뒤집는다.
 //  - 차례 정하기는 한글 자체 qsort(8개 이하는 가장 큰 것을 끝으로 보내기, 그보다 크면 가운데 값 분할)다.
-// 결과는 한글로 같은 표를 정렬해 저장한 HWPX 로 맞췄다.
+// 결과는 한글로 같은 표를 정렬해 저장한 HWPX 로 맞췄다(tests/test_table_sort.cpp).
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -68,7 +68,7 @@ std::u16string keyText(const TableCell* cell) {
 void reverseUnits(std::u16string& s) { std::reverse(s.begin(), s.end()); }
 
 // 글자 형식: 키 길이만큼(0 문자 앞까지) 빼기표·하이픈(0x18)·탭을 지우고, 확장 문자는 첫 단위만
-// 남긴 뒤 Windows 사용자 로캘 비교(대소문자·결합 부호·가나·폭 무시) → 대소문자 무시 비교 → 코드 차례.
+// 남긴 뒤 로캘 비교 → 대소문자 무시 비교 → 코드 차례.
 std::u16string charForm(const std::u16string& s, int len, bool rear) {
     std::u16string out;
     int left = len;
@@ -497,7 +497,7 @@ void hangulQsort(std::vector<int>& a, Cmp cmp) {
     }
 }
 
-// 비교 하나(한글 비교 기준 하나). KeyOption 의 형식×2+내림이 0~7 을 벗어나면 한글은 그 비교를 만들지 않고
+// 비교 하나. KeyOption 의 형식×2+내림이 0~7 을 벗어나면 한글은 그 비교를 만들지 않고
 // 건너뛴다(뒤 비교가 앞 키와 짝지어진다).
 struct SortMethod {
     int format = 0;
@@ -601,7 +601,7 @@ struct FieldToken {
     int len = 0;
 };
 
-// 한글의 필드 나누기. 구분 기호를 지나면 남은 길이를
+// 한글의 필드 나누기와 같다. 구분 기호를 지나면 남은 길이를
 // 다음 글자의 단위(확장 문자 8)로 줄이는 버릇까지 같다.
 std::vector<FieldToken> fieldTokens(const std::u16string& s, std::size_t from, int len, const std::u16string& delims,
                                     bool ignoreMulti, int max) {
@@ -913,7 +913,8 @@ void rebuildRuns(Paragraph& para, const std::vector<Piece>& pieces) {
         if (para.runs.empty() || para.runs.back().charShapeId != p.charShapeId) para.runs.push_back(Run{p.charShapeId, {}});
         std::vector<InlineItem>& items = para.runs.back().items;
         if (p.item.type == InlineItem::Type::Text && !items.empty() && items.back().type == InlineItem::Type::Text &&
-            items.back().markpen == p.item.markpen && items.back().ignoreSpacing == p.item.ignoreSpacing) {
+            items.back().markpen == p.item.markpen && items.back().ignoreSpacing == p.item.ignoreSpacing &&
+            items.back().charStyleId == p.item.charStyleId) {
             items.back().text += p.item.text;
         } else {
             items.push_back(p.item);

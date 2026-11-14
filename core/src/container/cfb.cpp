@@ -580,4 +580,16 @@ bool CompoundWriter::build(Bytes& out, std::string* error) const {
     return true;
 }
 
+bool readOleStream(ByteView ole, std::string_view name, Bytes& out) {
+    std::size_t start = 0;
+    if (!CompoundFile::isCompoundFile(ole)) {
+        if (ole.size() < 12 || !CompoundFile::isCompoundFile(ole.subspan(4))) return false;
+        start = 4;
+    }
+    CompoundFile file;
+    if (!file.open(ole.subspan(start))) return false;
+    const Entry* entry = file.find(name);
+    return entry && entry->type == EntryType::Stream && file.readStream(*entry, out);
+}
+
 }  // namespace chwp::cfb

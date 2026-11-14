@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "chwp/model/memo.hpp"
 #include "chwp/model/proofreading.hpp"
 #include "export/layout.hpp"
 #include "include/core/SkPathBuilder.h"
@@ -30,11 +31,11 @@ const char* const kProofRed = "#FF0000";
 
 }  // namespace
 
-std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std::vector<Mark>& marks,
-                                                    const LinePlacement& place) const {
-    std::vector<ProofSpan> out;
+std::vector<Painter::FieldSpan> Painter::lineFieldSpans(const Node& node, const std::vector<Mark>& marks,
+                                                        const LinePlacement& place,
+                                                        bool (*pick)(const model::Control&)) const {
+    std::vector<FieldSpan> out;
     if (!doc || node.kind != NodeKind::Line || node.story <= 0 || node.paragraph < 0 || node.start < 0) return out;
-    if (!shownMarks().proofMarks()) return out;
     const model::Paragraph* para = storyParagraph(*doc, node.story, node.paragraph);
     if (!para) return out;
     const bool stored = !para->lineSegs.empty();
@@ -67,34 +68,16 @@ std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std:
         return zeroWidth && lastLine && at == lineEnd;
     };
     const auto startSpan = [&](Open& o, std::int32_t x, bool head) {
-        ProofSpan span;
-        span.kind = model::proofKindOf(*o.control);
-        // %sig 의 번호와 %spl 의 종류(1 자리 바꿈, 2 줄 서로 바꿈)는 명령 끝 수다.
-        span.sign = span.kind == model::ProofKind::Sign || span.kind == model::ProofKind::Split
-                        ? model::proofSignNumber(o.control->command)
-                        : 0;
-        span.text = model::proofText(o.control->command);
-        if (span.kind == model::ProofKind::Hyperlink) {
-            // 자료 연결 명령은 "주소|표시할 문자열;1;0;0;" 이다. 보이는 것은 표시할 문자열이다.
-            const std::string& cmd = o.control->command;
-            const std::size_t bar = cmd.find('|');
-            const std::size_t semi = cmd.find(';', bar == std::string::npos ? 0 : bar);
-            span.text = bar == std::string::npos ? std::string() : cmd.substr(bar + 1, semi == std::string::npos ? std::string::npos : semi - bar - 1);
-        }
+        FieldSpan span;
+        span.control = o.control;
         span.lineRight = std::max<std::int32_t>(node.width, place.end);
-        if (span.kind == model::ProofKind::RightMove || span.kind == model::ProofKind::LeftMove) {
-            if (!model::proofMove(o.control->command, span.moveStart, span.moveGap)) {
-                span.moveStart = 1500;
-                span.moveGap = 1000;
-            }
-        }
         span.x0 = x;
         span.x1 = place.end;
         span.head = head;
         span.charShapeId = o.charShapeId;
         span.lineLeft = lineLeft;
         o.span = out.size();
-        out.push_back(std::move(span));
+        out.push_back(span);
     };
     for (const model::Run& run : para->runs) {
         for (const model::InlineItem& item : run.items) {
@@ -107,9 +90,9 @@ std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std:
                     const int u = stored ? (cp == '\t' ? 8 : (cp > 0xFFFF ? 2 : 1)) : 1;
                     if (!passedStart && pos >= lineStart) {
                         passedStart = true;
-                        // 앞 줄에서 열린 교정 부호는 이 줄 머리부터 이어진다.
+                        // 앞 줄에서 열린 필드는 이 줄 머리부터 이어진다.
                         for (Open& o : open) {
-                            if (o.span == std::string::npos) startSpan(o, lineLeft, false);
+                            if (o.control && o.span == std::string::npos) startSpan(o, lineLeft, false);
                         }
                     }
                     if (inLine(pos, false) && cp != '\n') ++caret;
@@ -123,13 +106,13 @@ std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std:
             if (!passedStart && pos >= lineStart && inLine(pos, true)) {
                 passedStart = true;
                 for (Open& o : open) {
-                    if (o.span == std::string::npos) startSpan(o, lineLeft, false);
+                    if (o.control && o.span == std::string::npos) startSpan(o, lineLeft, false);
                 }
             }
             if (c.kind == model::ControlKind::Field) {
-                Open o{&c, std::string::npos, run.charShapeId};
-                const bool proof = model::proofKindOf(c) != model::ProofKind::None;
-                if (proof && inLine(pos, true)) startSpan(o, xAt(caret), true);
+                // 고르지 않은 필드도 짝을 맞추려고 쌓는다(끝 문자는 가장 안쪽 필드를 닫는다).
+                Open o{pick(c) ? &c : nullptr, std::string::npos, run.charShapeId};
+                if (o.control && inLine(pos, true)) startSpan(o, xAt(caret), true);
                 open.push_back(o);
             } else if (c.kind == model::ControlKind::FieldEnd) {
                 if (!open.empty()) {
@@ -148,10 +131,56 @@ std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std:
     // 이 줄에서 시작하지도 끝나지도 않고 지나가는 것은 줄 머리부터 끝까지다(문단 안에서만 본다).
     if (!passedStart) {
         for (Open& o : open) {
-            if (o.span == std::string::npos && model::proofKindOf(*o.control) != model::ProofKind::None) {
-                startSpan(o, lineLeft, false);
+            if (o.control && o.span == std::string::npos) startSpan(o, lineLeft, false);
+        }
+    }
+    return out;
+}
+
+namespace {
+
+bool isProofField(const model::Control& c) { return model::proofKindOf(c) != model::ProofKind::None; }
+
+// 메모 고침표(%%mr)는 교정 부호로 그린다. 범위 상자는 메모(%%me)만이다.
+bool isPlainMemoField(const model::Control& c) { return c.kind == model::ControlKind::Field && c.ctrlId == "%%me"; }
+
+}  // namespace
+
+std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std::vector<Mark>& marks,
+                                                    const LinePlacement& place) const {
+    std::vector<ProofSpan> out;
+    if (!shownMarks().proofMarks()) return out;
+    for (const FieldSpan& field : lineFieldSpans(node, marks, place, &isProofField)) {
+        ProofSpan span;
+        const model::Control& c = *field.control;
+        span.kind = model::proofKindOf(c);
+        // %sig 의 번호와 %spl 의 종류(1 자리 바꿈, 2 줄 서로 바꿈)는 명령 끝 수다.
+        span.sign = span.kind == model::ProofKind::Sign || span.kind == model::ProofKind::Split
+                        ? model::proofSignNumber(c.command)
+                        : 0;
+        span.text = model::proofText(c.command);
+        if (span.kind == model::ProofKind::Hyperlink) {
+            // 자료 연결 명령은 "주소|표시할 문자열;1;0;0;" 이다. 보이는 것은 표시할 문자열이다.
+            const std::string& cmd = c.command;
+            const std::size_t bar = cmd.find('|');
+            const std::size_t semi = cmd.find(';', bar == std::string::npos ? 0 : bar);
+            span.text = bar == std::string::npos ? std::string()
+                                                 : cmd.substr(bar + 1, semi == std::string::npos ? std::string::npos : semi - bar - 1);
+        }
+        span.lineRight = field.lineRight;
+        if (span.kind == model::ProofKind::RightMove || span.kind == model::ProofKind::LeftMove) {
+            if (!model::proofMove(c.command, span.moveStart, span.moveGap)) {
+                span.moveStart = 1500;
+                span.moveGap = 1000;
             }
         }
+        span.x0 = field.x0;
+        span.x1 = field.x1;
+        span.head = field.head;
+        span.tail = field.tail;
+        span.charShapeId = field.charShapeId;
+        span.lineLeft = field.lineLeft;
+        out.push_back(std::move(span));
     }
     // 자리 바꿈표는 범위 안 가른 자리(%spl 1)에서 위아래가 바뀐다.
     for (ProofSpan& span : out) {
@@ -160,9 +189,79 @@ std::vector<Painter::ProofSpan> Painter::lineProofs(const Node& node, const std:
             if (cut.kind == model::ProofKind::Split && cut.sign != 2 && cut.x0 > span.x0 && cut.x0 < span.x1) span.split = cut.x0;
         }
     }
-    out.erase(std::remove_if(out.begin(), out.end(), [](const ProofSpan& s) { return s.kind == model::ProofKind::None; }),
-              out.end());
     return out;
+}
+
+std::vector<Painter::MemoRange> Painter::lineMemoRanges(const Node& node, std::int32_t x, std::int32_t y,
+                                                        const std::vector<Mark>& marks, const LinePlacement& place) const {
+    std::vector<MemoRange> out;
+    if (!doc || !shownMarks().memo || node.story <= 0 || node.paragraph < 0) return out;
+    if (node.role == "glyph" || node.role == "reverse" || node.role == "glyphDeco") return out;
+    if (!lineHasMemoRange(node, doc)) return out;
+    const model::StorySlot* slot = ensureStoryMap(*doc).slot(node.story);
+    const int sectionIndex = slot && slot->sectionIndex >= 0 ? slot->sectionIndex : 0;
+    if (sectionIndex >= static_cast<int>(doc->sections.size())) return out;
+    const model::Section& section = doc->sections[static_cast<std::size_t>(sectionIndex)];
+    for (const FieldSpan& span : lineFieldSpans(node, marks, place, &isPlainMemoField)) {
+        if (span.x1 <= span.x0) continue;
+        const model::MemoShape shape = model::memoShapeFor(*doc, section, *span.control);
+        const model::CharShape* charShape = findCharShape(*doc, span.charShapeId);
+        const std::int32_t s = charShape && charShape->height > 0 ? charShape->height : 1000;
+        const std::int32_t b = y + node.marginTop + glyphBaseIn(node, s, node.font, 0).baseline;
+        MemoRange range;
+        range.x0 = x + span.x0;
+        range.x1 = x + span.x1;
+        range.top = b - s * 85 / 100;
+        range.bottom = b + s * 15 / 100;
+        range.head = span.head;
+        range.tail = span.tail;
+        range.fill = shape.fillColor.empty() || shape.fillColor == "none" ? std::string("#F0FFE9") : shape.fillColor;
+        range.line = shape.lineColor.empty() || shape.lineColor == "none" ? std::string("#B6D7AE") : shape.lineColor;
+        out.push_back(std::move(range));
+    }
+    return out;
+}
+
+// 메모 범위(한글 2024 화면 200·300·400% 에서 잼): 범위 글자 상자(기준선 위 0.85s, 아래 0.15s)를 메모 모양 채우기 색으로
+// 칠하고, 시작에는 '⟨', 끝에는 '⟩' 모양 테두리를 메모 모양 선 색 1픽셀로 긋는다. 모서리는 0.4mm(113) 깎는다.
+// 위아래 변은 긋지 않는다. 여러 줄에 걸치면 줄마다 칠하고, 테두리는 처음 줄 시작과 마지막 줄 끝에만 있다.
+// 메모 보이기를 끄면 그리지 않는다.
+void Painter::drawMemoRanges(const Node& node, std::int32_t x, std::int32_t y, const LinePlacement& place) {
+    if (placesOnly || !showGlyphs()) return;
+    const std::vector<MemoRange> ranges = lineMemoRanges(node, x, y, collectMarks(node), place);
+    if (ranges.empty()) return;
+    SkCanvas* sk = canvas();
+    for (const MemoRange& range : ranges) {
+        std::uint8_t fr = 0, fg = 0, fb = 0;
+        parseHex(range.fill, fr, fg, fb);
+        const int px0 = px(range.x0);
+        const int py0 = px(range.top);
+        const int px1 = px(range.x1);
+        const int py1 = px(range.bottom);
+        if (px1 > px0 && py1 > py0) fillRect(bitmap, px0, py0, px1 - px0, py1 - py0, fr, fg, fb);
+        if (!sk || (!range.head && !range.tail)) continue;
+        std::uint8_t lr = 0, lg = 0, lb = 0;
+        parseHex(range.line, lr, lg, lb);
+        SkPaint pen;
+        pen.setAntiAlias(true);
+        pen.setStyle(SkPaint::kStroke_Style);
+        pen.setStrokeWidth(0.f);
+        pen.setColor(SkColorSetRGB(lr, lg, lb));
+        const std::int32_t cut = std::min<std::int32_t>(kMemoRangeCut, (range.bottom - range.top) / 2);
+        const auto at = [&](std::int32_t hx, std::int32_t hy) {
+            return SkPoint::Make(static_cast<float>(hx * scale), static_cast<float>(hy * scale));
+        };
+        const auto edge = [&](std::int32_t ex, std::int32_t inward) {
+            SkPathBuilder path;
+            path.moveTo(at(ex + inward, range.top));
+            path.lineTo(at(ex, range.top + cut));
+            path.lineTo(at(ex, range.bottom - cut));
+            path.lineTo(at(ex + inward, range.bottom));
+            sk->drawPath(path.detach(), pen);
+        };
+        if (range.head) edge(range.x0, cut);
+        if (range.tail) edge(range.x1, -cut);
+    }
 }
 
 void Painter::drawProofMarks(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
@@ -405,6 +504,18 @@ void Painter::drawProofBackgrounds(const Node& node, std::int32_t x, std::int32_
         const int y1 = px(b + s * 8 / 100);
         if (x1 > x0 && y1 > y0) fillRect(bitmap, x0, y0, x1 - x0, y1 - y0, 0xD6, 0xD6, 0xD6);
     }
+}
+
+bool lineHasMemoRange(const Node& line, const model::Document* doc) {
+    if (!doc || line.story <= 0 || line.paragraph < 0 || !viewMarks().memo) return false;
+    const model::Paragraph* para = storyParagraph(*doc, line.story, line.paragraph);
+    if (!para) return false;
+    for (const model::Run& run : para->runs) {
+        for (const model::InlineItem& item : run.items) {
+            if (item.type == model::InlineItem::Type::Control && isPlainMemoField(item.control)) return true;
+        }
+    }
+    return false;
 }
 
 bool lineHasProofInk(const Node& line, const model::Document* doc) {

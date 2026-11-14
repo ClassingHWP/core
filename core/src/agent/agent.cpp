@@ -450,7 +450,12 @@ struct AgentDocument::Impl {
         const render::EditResult r = session.insertPicture(op.image, op.width, op.height);
         if (!r.documentChanged) return refused(r, "insertPicture");
         render::rebuildStoryMap(doc);
-        // 캐럿은 그림 바로 뒤다. 그 앞 글자(U+FFFC)인 그림의 개체 이름을 돌려준다.
+        objectBeforeCaret(ControlKind::Picture, report);
+        return {};
+    }
+
+    // 캐럿 바로 앞 글자(U+FFFC)가 kind 개체면 그 개체 이름을 report 에 적는다(넣은 개체 뒤에 캐럿이 있다).
+    void objectBeforeCaret(ControlKind kind, OpReport& report) {
         const Position end = caret();
         const std::vector<model::Paragraph>* paras = storyParas(end.story);
         if (paras && end.paragraph >= 0 && end.paragraph < static_cast<int>(paras->size()) && end.index > 0) {
@@ -461,7 +466,7 @@ struct AgentDocument::Impl {
                     if (entry.type == model::InlineItem::Type::Text) {
                         at += codePoints(entry.text);
                     } else if (render::paint_detail::isCaretCharControl(entry.control)) {
-                        if (at == end.index - 1 && entry.control.kind == ControlKind::Picture) {
+                        if (at == end.index - 1 && entry.control.kind == kind) {
                             report.object = objectRefOf(end.story, end.paragraph, ordinal);
                         }
                         ++at;
@@ -470,7 +475,6 @@ struct AgentDocument::Impl {
                 }
             }
         }
-        return {};
     }
 
     // story 칸이 든 표의 칸 그림.
@@ -841,28 +845,59 @@ struct AgentDocument::Impl {
             r = session.copyShape("paste", type, &why);
         } else if (name == "insertShape") {
             static const std::pair<const char*, int> kTools[] = {
-                {"rect", 1}, {"ellipse", 2}, {"line", 3}, {"textBox", 4}, {"verticalTextBox", 5}};
+                {"rect", 1}, {"ellipse", 2}, {"line", 3},  {"textBox", 4},     {"verticalTextBox", 5},
+                {"arc", 6},  {"polygon", 7}, {"curve", 8}, {"freeDrawing", 9}};
             const std::string toolName = argText(op, "tool", "rect");
             int tool = 0;
             for (const auto& [n, t] : kTools) {
                 if (toolName == n) tool = t;
             }
             if (tool == 0) {
-                return fail(Code::BadArgument, "insertShape: tool 은 rect, ellipse, line, textBox, verticalTextBox 입니다.");
+                return fail(Code::BadArgument,
+                            "insertShape: tool 은 rect, ellipse, line, textBox, verticalTextBox, arc, polygon, curve, "
+                            "freeDrawing 입니다.");
             }
             if (shapePage < 0) return fail(Code::BadArgument, "insertShape: page 가 없습니다.");
-            const auto x = static_cast<std::int32_t>(argNumber(op, "x", 0));
-            const auto y = static_cast<std::int32_t>(argNumber(op, "y", 0));
-            const auto w = static_cast<std::int32_t>(argNumber(op, "width", 0));
-            const auto h = static_cast<std::int32_t>(argNumber(op, "height", 0));
-            // 편집기는 2mm 보다 작게 끈 도형을 그리지 않는다.
-            if (tool != 3 && (w < 567 || h < 567)) {
-                return fail(Code::BadArgument, "insertShape: width·height 는 2mm(567) 이상입니다.");
+            if (tool >= 7) {
+                // 점들: "x,y x,y ..."(쪽 종이 좌표 HWPUNIT). 다각형은 3개, 곡선·자유선은 2개 이상.
+                std::vector<model::ShapePoint> points;
+                const std::string text = argText(op, "points");
+                const char* cursor = text.c_str();
+                const char* const stop = cursor + text.size();
+                while (cursor < stop) {
+                    while (cursor < stop && (*cursor == ' ' || *cursor == ';')) ++cursor;
+                    if (cursor >= stop) break;
+                    char* end = nullptr;
+                    const long px = std::strtol(cursor, &end, 10);
+                    if (end == cursor || *end != ',') return fail(Code::BadArgument, "insertShape: points 는 x,y x,y ... 입니다.");
+                    const char* next = end + 1;
+                    const long py = std::strtol(next, &end, 10);
+                    if (end == next) return fail(Code::BadArgument, "insertShape: points 는 x,y x,y ... 입니다.");
+                    points.push_back(model::ShapePoint{static_cast<std::int32_t>(px), static_cast<std::int32_t>(py)});
+                    cursor = end;
+                }
+                if (points.size() < (tool == 7 ? 3u : 2u)) {
+                    return fail(Code::BadArgument, "insertShape: " + toolName + " 은 점이 " + (tool == 7 ? "3" : "2") +
+                                                       "개 이상이어야 합니다.");
+                }
+                r = session.insertShapePoints(tool, shapePage, points);
+                if (!r.documentChanged) {
+                    return fail(Code::BadArgument, "insertShape: 점들을 감싼 상자가 2mm(567) 보다 작습니다.");
+                }
+            } else {
+                const auto x = static_cast<std::int32_t>(argNumber(op, "x", 0));
+                const auto y = static_cast<std::int32_t>(argNumber(op, "y", 0));
+                const auto w = static_cast<std::int32_t>(argNumber(op, "width", 0));
+                const auto h = static_cast<std::int32_t>(argNumber(op, "height", 0));
+                // 편집기는 2mm 보다 작게 끈 도형을 그리지 않는다.
+                if (tool != 3 && (w < 567 || h < 567)) {
+                    return fail(Code::BadArgument, "insertShape: width·height 는 2mm(567) 이상입니다.");
+                }
+                if (tool == 3 && std::max(std::abs(w), std::abs(h)) < 567) {
+                    return fail(Code::BadArgument, "insertShape: 선 길이는 2mm(567) 이상입니다.");
+                }
+                r = session.insertShape(tool, shapePage, x, y, x + w, y + h);
             }
-            if (tool == 3 && std::max(std::abs(w), std::abs(h)) < 567) {
-                return fail(Code::BadArgument, "insertShape: 선 길이는 2mm(567) 이상입니다.");
-            }
-            r = session.insertShape(tool, shapePage, x, y, x + w, y + h);
             if (r.documentChanged) {
                 // 새 도형은 그 글 묶음에서 가장 앞(zOrder 가 가장 큰) 개체다.
                 const std::vector<model::Paragraph>* paras = storyParas(r.dirtyStory);
@@ -883,7 +918,29 @@ struct AgentDocument::Impl {
                     if (best >= 0) report.object = objectRefOf(r.dirtyStory, r.dirtyParagraph, best);
                 }
             }
-            typeAfter = tool >= 4;
+            typeAfter = tool == 4 || tool == 5;
+        } else if (name == "insertEquation") {
+            // 한글 수식 스크립트. size 는 글자 크기(pt, 기본 10).
+            const std::string script = argText(op, "script");
+            if (script.empty()) return fail(Code::BadArgument, "insertEquation: script 가 없습니다.");
+            const double size = argNumber(op, "size", 10);
+            if (size < 1 || size > 4096) return fail(Code::BadArgument, "insertEquation: size 는 1~4096(pt) 입니다.");
+            r = session.insertEquation(script, static_cast<std::int32_t>(size * 100 + 0.5), &why);
+            if (r.documentChanged) {
+                render::rebuildStoryMap(doc);
+                objectBeforeCaret(ControlKind::Equation, report);
+            }
+        } else if (name == "equation") {
+            // 이름으로 가리킨 수식의 스크립트(그리고 size 를 주면 글자 크기)를 고친다.
+            if (!op.hasObject) return fail(Code::BadArgument, "equation: object 가 없습니다.");
+            const std::string script = argText(op, "script");
+            if (script.empty()) return fail(Code::BadArgument, "equation: script 가 없습니다.");
+            const double size = argNumber(op, "size", 0);
+            if (size < 0 || size > 4096) return fail(Code::BadArgument, "equation: size 는 1~4096(pt) 입니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            r = session.editEquationAt(op.object.story, op.object.paragraph, item, script,
+                                       static_cast<std::int32_t>(size * 100 + 0.5), &why);
         } else if (name == "objectProperties" || name == "deleteObject") {
             if (!op.hasObject) return fail(Code::BadArgument, name + ": object 가 없습니다.");
             int item = -1;
@@ -915,7 +972,7 @@ struct AgentDocument::Impl {
         const bool known = render::pageControlKindOf(name, kind) || name == "noteShape" || name == "pageBorder" ||
                            name == "sectionSettings" || name == "columns" || name == "tableProperties" ||
                            name == "glyphGroup" || name == "sortParagraphs" || name == "bookmark" ||
-                           name == "objectProperties";
+                           name == "objectProperties" || name == "equation";
         if (!known) return fail(Code::BadArgument, "view: " + name + " 은 읽을 값이 없습니다.");
         bool placed = false;
         if (Status s = placeCommand(op, placed); !s.ok()) return s;
@@ -939,6 +996,24 @@ struct AgentDocument::Impl {
             fields = session.sortView(setOf(op));
         } else if (name == "bookmark") {
             fields = session.bookmarkView();
+        } else if (name == "equation") {
+            // 수식의 스크립트와 글자 크기(pt).
+            if (!op.hasObject) return fail(Code::BadArgument, "equation: object 가 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            if (!render::selectAnchoredObject(doc, pages, op.object.story, op.object.paragraph, item)) {
+                return fail(Code::BadArgument, "equation: 그 개체를 쪽에서 찾지 못했습니다.");
+            }
+            int story = -1;
+            int paragraph = -1;
+            int at = -1;
+            if (!render::selectedEquationAt(doc, story, paragraph, at)) return fail(Code::BadArgument, "equation: 수식이 아닙니다.");
+            for (const auto& [key, value] : session.equationView()) {
+                if (key == "script") fields.emplace_back(key, value);
+                if (key == "baseUnit") {
+                    if (const double* unit = std::get_if<double>(&value)) fields.emplace_back("size", *unit / 100.0);
+                }
+            }
         } else {
             if (!op.hasObject) return fail(Code::BadArgument, name + ": object 가 없습니다.");
             int item = -1;
@@ -1010,6 +1085,15 @@ Result<std::unique_ptr<AgentDocument>> AgentDocument::open(ByteView bytes) {
     impl->session.layout();
     impl->indexPages();
     out.value = std::unique_ptr<AgentDocument>(new AgentDocument(std::move(impl)));
+    return out;
+}
+
+Result<Bytes> AgentDocument::exportPdf(int dpi) {
+    Result<Bytes> out;
+    impl_->frames.clear();
+    out.value = impl_->session.exportPdf(dpi, impl_->frames);
+    impl_->frames.clear();
+    if (out.value.empty()) out.status = fail(Code::SaveFailed, "PDF 를 만들지 못했습니다(쪽이 없거나 그리지 못함).");
     return out;
 }
 
@@ -1487,7 +1571,8 @@ std::vector<std::string> commandNames() {
     std::vector<std::string> names = {"insertNote", "exchangeNotes", "noteShape", "pageBorder", "sectionSettings",
                                       "columns", "caption", "bookmark", "tableToText", "textToTable", "deleteMarks",
                                       "tableProperties", "glyphGroup", "convertText", "sortParagraphs", "insertHyperlink",
-                                      "copyShape", "insertShape", "objectProperties", "deleteObject"};
+                                      "copyShape", "insertShape", "objectProperties", "deleteObject", "insertEquation",
+                                      "equation"};
     // 쪽 탭 컨트롤(머리말·꼬리말·쪽 번호·바탕쪽·메모·교정 부호 ...)은 편집기 이름 그대로다.
     for (int k = 0; k <= static_cast<int>(render::PageControlKind::InsertProofMark); ++k) {
         names.emplace_back(render::pageControlName(static_cast<render::PageControlKind>(k)));

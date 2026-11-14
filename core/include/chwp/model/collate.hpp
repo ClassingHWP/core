@@ -1,8 +1,8 @@
 #pragma once
 
-// Windows 한국어(로캘 0x412) 정렬 비교. 한글 2024 표 정렬은 Windows 한국어 정렬 차례로 글을 견주므로, 같은 결과를
+// Windows 한국어(로캘 0x412) 정렬 비교. 한글 2024 표 정렬은 Windows CompareStringW 로 글을 견주므로, 같은 결과를
 // 내도록 LCMapStringW(LCMAP_SORTKEY) 와 같은 정렬 키를 만든다. 키를 바이트 차례로 견주면 CompareStringW 결과와 같다.
-// 글자마다의 키 조각과 옛한글 낱자 합침 표는 Windows 정렬 키에서 뽑아 넣었다.
+// 글자마다의 키 조각과 옛한글 낱자 합침 표는 tools/collate/gen_windows_collation.py 가 Windows 에서 뽑아 넣었다.
 
 #include <string>
 #include <string_view>

@@ -2006,6 +2006,18 @@ bool fontWinMetrics(const std::string& face, std::int32_t& ascent, std::int32_t&
     return ascent + descent > 0;
 }
 
+bool fontHheaMetrics(const std::string& face, std::int32_t& ascender, std::int32_t& descender) {
+    ascender = 0;
+    descender = 0;
+    if (face.empty()) return false;
+    std::lock_guard lock(gMutex);
+    const Metrics* metrics = metricsFor(face);
+    if (!metrics) return false;
+    ascender = metrics->ascender;
+    descender = metrics->descender;
+    return ascender - descender > 0;
+}
+
 std::int32_t fontBaseline(const std::string& face, std::int32_t em) {
     if (face.empty() || em <= 0) return -1;
     const FontWhyFallback why("기준선", 0, &face);
@@ -2298,12 +2310,9 @@ void useParagraphs(const model::Document& doc, const std::vector<model::Paragrap
                     useText(doc, run.charShapeId, "0123456789()-.ivxIVX" + control.prefix + control.suffix, false, out);
                     break;
                 case model::ControlKind::Equation: {
-                    // 수식은 고른 수식 글꼴로 재고 그리며, 그 글꼴에 없는 글자는 HyhwpEQ·HancomEQN 에서 찾는다
-                    // (render/equation_draw symbolFaces). 받을 차례도 같다. 이름이 비면 HyhwpEQ 다.
-                    const std::string chosen = control.equationFont.empty() || control.equationFont == "HYhwpEQ"
-                                                   ? std::string("HyhwpEQ")
-                                                   : control.equationFont;
-                    for (const std::string& face : {chosen, std::string("HyhwpEQ"), std::string("HancomEQN")}) {
+                    // 수식은 고른 수식 글꼴로 재고 그리며, 그 글꼴에 없는 글자는 HyhwpEQ·HancomEQN 에서 찾고 숫자·한글 자모
+                    // 같은 글자는 한컴바탕으로 잰다(equationFontFaces). 받을 차례도 같다.
+                    for (const std::string& face : equationFontFaces(control.equationFont)) {
                         if (std::find(out.equationFaces.begin(), out.equationFaces.end(), face) == out.equationFaces.end())
                             out.equationFaces.push_back(face);
                     }
@@ -2315,6 +2324,12 @@ void useParagraphs(const model::Document& doc, const std::vector<model::Paragrap
                     useText(doc, run.charShapeId, control.subText, false, out);
                     break;
                 default:
+                    // 글맵시는 제 글꼴의 윤곽으로 그린다. 그 글꼴을 받는다(수식 글꼴과 같이 둔다).
+                    if (control.textArt && !control.textArt->fontName.empty() &&
+                        std::find(out.equationFaces.begin(), out.equationFaces.end(), control.textArt->fontName) ==
+                            out.equationFaces.end()) {
+                        out.equationFaces.push_back(control.textArt->fontName);
+                    }
                     break;
                 }
                 useControl(doc, control, out, depth);
@@ -2333,6 +2348,20 @@ UsedFaces documentUsedFaces(const model::Document& doc) {
 }
 
 }  // namespace
+
+std::vector<std::string> equationFontFaces(const std::string& chosen) {
+    const std::string symbol = chosen.empty() || chosen == "HYhwpEQ" ? std::string("HyhwpEQ") : chosen;
+    std::vector<std::string> out;
+    for (const std::string& face : {symbol, std::string("HyhwpEQ"), std::string("HancomEQN"), std::string("Haansoft Batang")}) {
+        if (std::find(out.begin(), out.end(), face) == out.end()) out.push_back(face);
+    }
+    return out;
+}
+
+bool fontPending(const std::string& face) {
+    if (fontCatalogPath(face).empty()) return false;
+    return !fontFaceAvailable(face);
+}
 
 std::vector<std::string> documentFontFaces(const model::Document& doc) {
     const UsedFaces used = documentUsedFaces(doc);

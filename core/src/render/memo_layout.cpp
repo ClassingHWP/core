@@ -1,5 +1,5 @@
-// 메모 상자 배치(화면). 한글 2024 의 메모 배치와 같다.
-// 좌표는 HWPUNIT 이고, 세로 쌓기는 쪽 본문 영역 위를 0 으로 한다.
+// 메모 상자 배치(화면). 한글 2024 의 메모 배치를 옮겼다.
+// 식과 측정은 docs/memo-structure.md 8절이다. 좌표는 HWPUNIT 이고, 세로 쌓기는 쪽 본문 영역 위를 0 으로 한다.
 //
 // - 가로: R(오른쪽 여백) ≥ 14mm 이고 W(메모 너비) < R − 14mm 이면 상자 오른쪽이 쪽 오른쪽 − 6mm, 아니면 본문 오른쪽 + 10mm.
 //   답글은 10mm 들여 놓고 폭이 10mm 좁다.
@@ -31,7 +31,7 @@ Node layoutBand(const model::Document& doc, const std::vector<model::Paragraph>&
 
 namespace {
 
-constexpr std::int32_t kMm = 283;          // 1mm (283465 ÷ 1000 을 반올림)
+constexpr std::int32_t kMm = 283;          // 1mm (1000 분의 283465 를 반올림)
 constexpr std::int32_t kHeadHeight = 1700;  // 머리글 6mm
 constexpr std::int32_t kGap = kMm;          // 상자 사이
 
@@ -359,7 +359,7 @@ void placeMemos(const model::Document& doc, std::vector<Node>& pages, std::vecto
                                                                                         : b.memo->subLists.front().paragraphs;
             b.text = detail::layoutBand(doc, paras, std::max<std::int32_t>(kMm, b.width - 2 * kMm), "", false);
             // 메모 글 높이는 마지막 줄의 글자 상자 아래까지다(마지막 줄 아래 줄 간격은 넣지 않는다).
-            // 한 줄 9pt 메모의 본문이 900 + 위아래 1mm = 1466 이다(한글 화면 측정).
+            // 한 줄 9pt 메모의 본문이 900 + 위아래 1mm = 1466 이다(한글 화면 측정, docs/memo-structure.md 8.3절).
             std::int32_t textH = 0;
             const auto lastLine = [&](const auto& self, const Node& n, std::int32_t oy) -> void {
                 if (n.kind == NodeKind::Line) {

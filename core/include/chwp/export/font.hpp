@@ -26,6 +26,12 @@ void requestDocumentFontFaces(const model::Document& doc);
 // 굵게 쓰는 글꼴은 굵은 짝 이름을, 파일이 없는 글꼴이 있으면 폭·그리기를 대신하는 함초롬바탕을,
 // 사용자 영역 글자가 있으면 그 기호 대체(같은 계열 함초롬, Wingdings)를 함께 넣는다.
 std::vector<std::string> documentFontFaces(const model::Document& doc);
+// 수식 하나를 재고 그리는 글꼴(받을 차례). 고른 수식 글꼴(비면 HyhwpEQ), 그 글꼴에 없는 글자를 찾는 HyhwpEQ·HancomEQN,
+// 그리고 수식 글꼴에 없는 글자(한글 자모·한자 등)와 로만 글자(숫자 등)를 재는 한컴바탕(Haansoft Batang)이다.
+// 한컴바탕은 한글이 수식의 모든 언어 글꼴 칸에 쓰는 이름이다(render/equation_layout).
+std::vector<std::string> equationFontFaces(const std::string& chosen);
+// 셸 글꼴 목록에 있어 받을 수 있는데 아직 올라오지 않은 글꼴인지. 목록이 없으면(이 기기 글꼴만 쓰면) 기다릴 것이 없다.
+bool fontPending(const std::string& face);
 
 // 받은 글꼴에 없는 문서 글자가 있으면 그 자리의 대체 글꼴(문서 대체, 같은 계열 함초롬, 함초롬바탕) 중
 // 아직 올라오지 않은 이름. 받은 글꼴로만 판단하고 파일을 새로 열지 않는다. 비면 더 받을 것이 없다.

@@ -1,5 +1,9 @@
 #include "chwp/app/doc_session.hpp"
 
+#include "chwp/render/link_commands.hpp"
+#include "chwp/render/track_commands.hpp"
+#include "chwp/export/pdf.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -48,12 +52,21 @@ std::string licenseSwapPreferences() {
     return writer.take();
 }
 
-bool DocSession::open(Bytes bytes, std::string* error, std::vector<std::string>* warnings) {
+bool DocSession::open(Bytes bytes, std::string* error, std::vector<std::string>* warnings,
+                      const std::string& password) {
     close();
     file = std::move(bytes);
-    ParseResult result = parseDocument(file);
+    ParseOptions options;
+    options.password = password;
+    ParseResult result = parseDocument(file, options);
     if (!result.ok) {
-        if (error) *error = result.error;
+        if (result.needPassword) {
+            lockedFile_ = std::move(file);
+            wrongPassword_ = result.wrongPassword;
+            if (error) *error = result.wrongPassword ? "암호가 틀렸습니다." : "암호가 걸린 문서입니다.";
+        } else if (error) {
+            *error = result.error;
+        }
         file.clear();
         file.shrink_to_fit();
         return false;
@@ -63,6 +76,16 @@ bool DocSession::open(Bytes bytes, std::string* error, std::vector<std::string>*
     if (warnings) *warnings = std::move(result.warnings);
     render::setPictureFile(file);
     return true;
+}
+
+bool DocSession::unlock(const std::string& password, std::string* error, std::vector<std::string>* warnings) {
+    if (lockedFile_.empty()) {
+        if (error) *error = "암호를 기다리는 문서가 없습니다.";
+        return false;
+    }
+    Bytes bytes = std::move(lockedFile_);
+    lockedFile_.clear();
+    return open(std::move(bytes), error, warnings, password);
 }
 
 void DocSession::openBlank() {
@@ -82,6 +105,9 @@ void DocSession::close() {
     render::clearUndoHistory();
     edit.clearCursor();
     sourceFormat = model::SourceFormat::Unknown;
+    lockedFile_.clear();
+    lockedFile_.shrink_to_fit();
+    wrongPassword_ = false;
     fontWants_.clear();
     editedOnce_ = false;
     savedOnce_ = false;
@@ -269,8 +295,10 @@ bool DocSession::fontsLanded(const std::vector<std::string>& faces) {
     // (빈 새 문서에서 첫 편집이 부른 글꼴이 글을 치기 전에 들어온 때) 그 기억을 지운다. 지우지 않으면 뒤에 친
     // 글자가 계속 없는 글꼴로 그려져 보이지 않는다.
     if (!faces.empty() || renamed) render::clearGlyphWarm();
+    // 수식 글꼴을 받는 중에 넣거나 고친 수식은 그때 잰 크기다. 글꼴이 다 왔으면 다시 잰다(한글이 재는 크기).
+    const int remeasured = render::remeasurePendingEquations(doc);
     if (pages.empty()) return false;
-    bool used = renamed;
+    bool used = renamed || remeasured > 0;
     if (!used) {
         const std::vector<std::string> inDoc = layout::documentFontFaces(doc);
         for (const std::string& face : faces) {
@@ -284,6 +312,15 @@ bool DocSession::fontsLanded(const std::vector<std::string>& faces) {
     if (!used) return false;
     relayoutAll();
     return true;
+}
+
+void DocSession::viewMarksChanged(const render::ViewMarks& before) {
+    const render::ViewMarks now = render::viewMarks();
+    if (before == now) return;
+    // 이름표 폭은 줄 자리(placeLine)에 든다. 지난 자리 기록은 옛 표시로 잰 것이다.
+    render::invalidateLinePlaces({}, true);
+    if (pages.empty()) return;
+    if (before.memo != now.memo || before.control != now.control) render::placeMemos(doc, pages);
 }
 
 render::EditResult DocSession::insertText(const std::string& text, bool composing) {
@@ -346,6 +383,87 @@ std::vector<render::EditResult> DocSession::insertPlainText(const std::string& t
 render::EditResult DocSession::keyDown(render::EditKey key, bool shift, bool ctrl, bool alt) {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editKeyDown(doc, pages, key, shift, ctrl, alt, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::followLinkAt(int page, int x, int y, std::string* url, std::string* why) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editFollowLinkAt(doc, pages, page, x, y, storedLineHeight, url, why);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::insertClickHere(const std::string& direction, const std::string& memo,
+                                                const std::string& name, std::string* why) {
+    const render::EditScope bound = wholeScope();
+    render::EditResult result = render::editInsertClickHere(doc, pages, direction, memo, name, storedLineHeight, why);
+    noteEdit(result);
+    return result;
+}
+
+render::FormatFields DocSession::clickHereView() {
+    const render::EditScope bound = wholeScope();
+    return render::clickHereFields(doc, pages);
+}
+
+render::EditResult DocSession::modifyClickHere(const render::FormatFields& fields, std::string* why) {
+    const render::EditScope bound = wholeScope();
+    render::EditResult result = render::editModifyClickHere(doc, pages, fields, storedLineHeight, why);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::syncClickHereGuide() {
+    {
+        // 가벼운 판단은 쪽을 다 쌓지 않고 한다. 맞출 것이 있을 때만 문서 전체 쪽을 잡는다.
+        const render::EditScope scope(edit);
+        if (!render::clickHereGuideNeedsSync(doc, pages)) return {};
+    }
+    const render::EditScope scope = wholeScope();
+    return render::editSyncClickHereGuide(doc, pages, storedLineHeight);
+}
+
+render::EditResult DocSession::revealClickHereGuide() {
+    {
+        const render::EditScope scope(edit);
+        if (!render::clickHereGuideHidden()) return {};
+    }
+    const render::EditScope scope = wholeScope();
+    return render::editRevealClickHereGuide(doc, pages);
+}
+
+render::EditResult DocSession::toggleTrackChanges() {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editToggleTrackChanges(doc, pages);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::resolveChanges(bool accept, const std::string& scope, std::string* why) {
+    const render::EditScope bound = wholeScope();
+    render::EditResult result = render::editResolveChangesUndo(doc, pages, accept, scope, storedLineHeight, why);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::moveToChange(bool forward) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editMoveToChange(doc, pages, forward);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::linkHistory(bool forward) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editLinkHistory(doc, pages, forward);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::moveToView(const std::vector<render::ViewBand>& bands, bool end, bool shift) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editMoveToView(doc, pages, bands, end, shift);
     noteEdit(result);
     return result;
 }
@@ -538,6 +656,99 @@ render::EditResult DocSession::pageBorder(const render::FormatFields& fields, bo
     return result;
 }
 
+render::FormatFields DocSession::beginStyleDraft(int editing) {
+    const render::EditScope scope = wholeScope();
+    styleDraft = render::beginStyleDraft(doc, pages, editing);
+    return render::styleDraftFields(styleDraft);
+}
+
+render::FormatFields DocSession::styleDraftFields() const { return render::styleDraftFields(styleDraft); }
+
+render::FormatFields DocSession::setStyleDraftFields(const render::FormatFields& fields) {
+    render::setStyleDraftFields(styleDraft, fields);
+    return render::styleDraftFields(styleDraft);
+}
+
+render::FormatView DocSession::styleDraftFormatView(bool para, const render::FormatFields& patch) {
+    const render::EditScope scope = wholeScope();
+    const render::FormatViewKind kind = para ? render::FormatViewKind::Para : render::FormatViewKind::Char;
+    return render::formatView(styleDraft.scratch, {}, kind, patch, &styleDraft.place);
+}
+
+void DocSession::applyStyleDraftFormat(bool para, const render::FormatFields& patch) {
+    const render::EditScope scope = wholeScope();
+    const render::FormatViewKind kind = para ? render::FormatViewKind::Para : render::FormatViewKind::Char;
+    const render::FormatFields resolved =
+        render::resolveFormatView(styleDraft.scratch, {}, kind, patch, &styleDraft.place);
+    render::applyStyleDraftFormat(styleDraft, para, resolved);
+}
+
+render::PageBitmap DocSession::styleDraftPreview(bool para, const render::FormatFields& patch, int width, int height) {
+    const render::EditScope scope = wholeScope();
+    const render::FormatViewKind kind = para ? render::FormatViewKind::Para : render::FormatViewKind::Char;
+    return render::renderFormatPreview(styleDraft.scratch, {}, kind, patch, width, height, &styleDraft.place);
+}
+
+render::EditResult DocSession::commitStyleDraft(std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editCommitStyle(doc, pages, styleDraft, storedLineHeight, error);
+    noteEdit(result);
+    if (result.documentChanged) styleDraft = render::StyleDraft{};
+    return result;
+}
+
+void DocSession::endStyleDraft() { styleDraft = render::StyleDraft{}; }
+
+render::EditResult DocSession::deleteStyle(std::uint32_t styleId, std::uint32_t replacement, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editDeleteStyle(doc, pages, styleId, replacement, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::moveStyle(std::uint32_t styleId, int delta, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editMoveStyle(doc, pages, styleId, delta, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::styleFromCaret(std::uint32_t styleId, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editStyleFromCaret(doc, pages, styleId, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::importStyles(const model::Document& source, const std::vector<std::string>& names,
+                                            std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editImportStyles(doc, pages, source, names, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::makeToc(const render::TocOptions& options, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editMakeToc(doc, pages, options, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::updateToc(bool all, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editUpdateToc(doc, pages, all, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::clearCharStyle(std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editClearCharStyle(doc, pages, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
 render::EditResult DocSession::caption(const std::string& caption, std::string* error) {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editCaption(doc, pages, caption, storedLineHeight, error);
@@ -711,6 +922,35 @@ render::EditResult DocSession::insertHyperlink(const std::string& text, const st
     return result;
 }
 
+render::FormatFields DocSession::equationView() {
+    const render::EditScope scope = wholeScope();
+    return render::equationView(doc);
+}
+
+render::EditResult DocSession::insertEquation(const std::string& script, std::int32_t baseUnit, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editInsertEquation(doc, pages, script, baseUnit, storedLineHeight, error);
+    // 수식 글꼴(HancomEQN·HyhwpEQ·한컴바탕)은 문서에 수식이 처음 생길 때 받아야 한다.
+    noteEdit(result, layout::equationFontFaces("HancomEQN"));
+    return result;
+}
+
+render::EditResult DocSession::editEquation(const std::string& script, std::int32_t baseUnit, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editEquation(doc, pages, script, baseUnit, storedLineHeight, error);
+    noteEdit(result, layout::equationFontFaces("HancomEQN"));
+    return result;
+}
+
+render::EditResult DocSession::editEquationAt(int story, int paragraph, int item, const std::string& script,
+                                              std::int32_t baseUnit, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result =
+        render::editEquationAt(doc, pages, story, paragraph, item, script, baseUnit, storedLineHeight, error);
+    noteEdit(result, layout::equationFontFaces("HancomEQN"));
+    return result;
+}
+
 render::FormatFields DocSession::pageControlFields(render::PageControlKind kind) {
     const render::EditScope scope = wholeScope();
     return render::pageControlFields(doc, pages, kind);
@@ -828,6 +1068,13 @@ render::EditResult DocSession::insertShape(int tool, int page, std::int32_t x0, 
     return result;
 }
 
+render::EditResult DocSession::insertShapePoints(int tool, int page, const std::vector<model::ShapePoint>& points) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editInsertShapePoints(doc, pages, tool, page, points, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
 bool DocSession::selectObject(int story, int paragraph, int item) {
     const render::EditScope scope = wholeScope();
     render::clearObjectSelection();
@@ -890,14 +1137,49 @@ render::PageImage DocSession::renderPage(int index, int pixelHeight, render::Fra
     return image;
 }
 
+Bytes DocSession::exportPdf(int dpi, render::FrameCache& frames, int from, int to) {
+    const render::EditScope scope = wholeScope();
+    if (pages.empty()) return {};
+    const int last = static_cast<int>(pages.size()) - 1;
+    from = std::clamp(from, 0, last);
+    to = to < 0 ? last : std::clamp(to, from, last);
+    dpi = std::clamp(dpi, 72, 600);
+    exporter::PdfWriter writer(doc.metadata.title);
+    for (int index = from; index <= to; ++index) {
+        render::Node& page = pages[static_cast<std::size_t>(index)];
+        if (page.spansLater) render::ensurePageSpans(doc, page);
+        const int pixelHeight = std::clamp(static_cast<int>(std::lround(page.height * dpi / 7200.0)), 32, 8000);
+        render::PageBitmap bitmap = render::renderPageGpu(doc, pages, index, pixelHeight, frames);
+        if (bitmap.rgba.empty()) bitmap = render::renderPageBitmap(doc, page, pixelHeight);
+        exporter::PdfPage out;
+        out.paperWidth = page.width;
+        out.paperHeight = page.height;
+        out.pixelWidth = bitmap.width;
+        out.pixelHeight = bitmap.height;
+        out.rgba = std::move(bitmap.rgba);
+        if (!writer.addPage(out)) return {};
+    }
+    return writer.finish();
+}
+
 render::EditResult DocSession::undo() {
     const render::EditScope scope = wholeScope();
-    return render::editUndo(doc, pages, storedLineHeight);
+    return remeasureRestored(render::editUndo(doc, pages, storedLineHeight));
 }
 
 render::EditResult DocSession::redo() {
     const render::EditScope scope = wholeScope();
-    return render::editRedo(doc, pages, storedLineHeight);
+    return remeasureRestored(render::editRedo(doc, pages, storedLineHeight));
+}
+
+render::EditResult DocSession::remeasureRestored(render::EditResult result) {
+    // 되돌리기 기록은 수식을 잰 그때의 크기를 품는다. 글꼴을 받는 중에 잰 수식이 돌아왔는데 이제 글꼴이 다 왔으면
+    // 다시 재고 쪽을 처음부터 놓는다.
+    if (!result.documentChanged || render::remeasurePendingEquations(doc) == 0) return result;
+    relayoutAll();
+    result.fullInvalidation = true;
+    result.pageListChanged = true;
+    return result;
 }
 
 bool DocSession::canUndo() {

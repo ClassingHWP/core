@@ -295,6 +295,10 @@ val packOpen(const app::OpenResult& result) {
     out.set("faces", faces);
     out.set("docState", result.docState);
     out.set("name", result.name);
+    out.set("needPassword", result.needPassword);
+    out.set("wrongPassword", result.wrongPassword);
+    out.set("notice", result.notice);
+    out.set("locked", result.locked);
     return out;
 }
 
@@ -451,6 +455,7 @@ app::InputPointer parsePointer(const val& item) {
     p.y = inputNumber(item, "y", 0);
     p.t = inputNumber(item, "t", 0);
     p.button = inputInt(item, "button", 0);
+    p.shift = inputFlag(item, "shift");
     return p;
 }
 
@@ -549,6 +554,7 @@ val packInput(const app::InputReport& report) {
             out.set("selectPhase", sel.selectPhase);
             if (sel.pinTap) out.set("pinTap", true);
             if (!sel.dialog.empty()) out.set("dialog", sel.dialog);
+            if (!sel.notice.empty()) out.set("notice", sel.notice);
             out.set("active", sel.active);
             out.set("caret", sel.caret);
             if (sel.styled) {
@@ -640,6 +646,11 @@ void postToShell(std::function<void()> work) {
 #endif
 }
 
+void notifyOpenUrl(const std::string& url) {
+    val hook = val::module_property("onOpenUrl");
+    if (hook.typeOf().as<std::string>() == "function") hook(url);
+}
+
 void notifyFontsSettled(int batch) {
     val hook = val::module_property("onFontsSettled");
     if (hook.typeOf().as<std::string>() == "function") hook(batch);
@@ -720,6 +731,7 @@ struct InstallHost {
         host.cameraChanged = &notifyCamera;
         host.post = &postToShell;
         host.fontsSettled = &notifyFontsSettled;
+        host.openUrl = &notifyOpenUrl;
         app::setHost(std::move(host));
         chwp::layout::setFontFaceRequestHandler(&publishFontFaces, nullptr);
     }
@@ -815,6 +827,7 @@ val licenseFontSwaps() {
 
 val openDocument(const val& input) { return packOpen(app::openDocument(toBytes(input))); }
 val newDocument() { return packOpen(app::newDocument()); }
+val unlockDocument(const std::string& password) { return packOpen(app::unlockDocument(password)); }
 
 val viewApply(const val& msg) { return packView(app::applyView(parseViewPatch(msg))); }
 
@@ -1069,6 +1082,25 @@ val editCopyShape(const std::string& action, int type) { return packEditReport(a
 val editTableText(const val& fields) { return packEditReport(app::editTableText(fieldsOf(fields))); }
 val editDeleteMarks(const val& fields) { return packEditReport(app::editDeleteMarks(fieldsOf(fields))); }
 val bookmarkView() { return packFields(app::bookmarkViewNow()); }
+val clickHereView() { return packFields(app::clickHereViewNow()); }
+val editClickHere(const val& fields) { return packEditReport(app::editClickHere(fieldsOf(fields))); }
+
+val styleView(int styleId) { return packFields(app::styleViewNow(styleId)); }
+
+val openStyleSource(const val& input) { return packFields(app::openStyleSource(toBytes(input))); }
+
+val exportStyles() {
+    const std::optional<chwp::Bytes> bytes = app::exportStyles();
+    return bytes ? toUint8ArrayVal(*bytes) : val::null();
+}
+
+val tocCommand(const std::string& action, const val& fields) {
+    return packEditReport(app::editToc(action, fieldsOf(fields)));
+}
+
+val styleCommand(const std::string& action, const val& fields) {
+    return packEditReport(app::editStyleCommand(action, fieldsOf(fields)));
+}
 val editTableProperties(const val& fields) { return packEditReport(app::editTableProperties(fieldsOf(fields))); }
 val tablePropertiesView() { return packFields(app::tablePropertiesViewNow()); }
 val editGlyphGroup(const val& fields) { return packEditReport(app::editGlyphGroup(fieldsOf(fields))); }
@@ -1086,6 +1118,19 @@ val applyViewGuides(const val& fields) { return packFields(app::applyViewGuides(
 val editInsertNote(bool endnote) { return packEditReport(app::editInsertNote(endnote)); }
 val editInsertHyperlink(const std::string& text, const std::string& url) {
     return packEditReport(app::editInsertHyperlink(text, url));
+}
+// PDF 로 저장·인쇄. 어떻게 그려 묶을지는 코어(exportPdfNow)가 정한다. 바이트를 Uint8Array 로 넘긴다.
+val exportPdf(int dpi) { return toUint8ArrayVal(app::exportPdfNow(dpi)); }
+std::string printBlockedReason() { return app::printBlockedReason(); }
+// 수식 편집기. 넣을지 고칠지(고른 수식)와 크기 재기는 코어가 정한다. 미리 보기는 코어가 그린 SVG 글이다.
+val equationView() { return packFields(app::equationViewNow()); }
+val editEquation(const std::string& script, int baseUnit) { return packEditReport(app::editEquationSubmit(script, baseUnit)); }
+val equationPreview(const std::string& script, int baseUnit) {
+    bool ready = true;
+    val out = val::object();
+    out.set("svg", app::equationPreviewNow(script, baseUnit, &ready));
+    out.set("ready", ready);
+    return out;
 }
 
 // 표 편집. 이름과 값은 코어(editTableFields)가 정한다.
@@ -1187,6 +1232,7 @@ EMSCRIPTEN_BINDINGS(chwp) {
     // malloc 이 지금 내준 바이트. WASM 메모리는 줄지 않으니 순간 최대치와 지금 쓰는 양을 나눠 보려고 둔다.
     emscripten::function("memoryInUse", +[]() { return static_cast<double>(mallinfo().uordblks); });
     emscripten::function("openDocument", &openDocument);
+    emscripten::function("unlockDocument", &unlockDocument);
     emscripten::function("newDocument", &newDocument);
     emscripten::function("setFontCatalog", &setFontCatalog);
     emscripten::function("setFontLicenseSwaps", &setFontLicenseSwaps);
@@ -1246,6 +1292,13 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("editTableText", &editTableText);
     emscripten::function("editDeleteMarks", &editDeleteMarks);
     emscripten::function("bookmarkView", &bookmarkView);
+    emscripten::function("clickHereView", &clickHereView);
+    emscripten::function("editClickHere", &editClickHere);
+    emscripten::function("styleView", &styleView);
+    emscripten::function("styleCommand", &styleCommand);
+    emscripten::function("tocCommand", &tocCommand);
+    emscripten::function("openStyleSource", &openStyleSource);
+    emscripten::function("exportStyles", &exportStyles);
     emscripten::function("tablePropertiesView", &tablePropertiesView);
     emscripten::function("editGlyphGroup", &editGlyphGroup);
     emscripten::function("glyphGroupView", &glyphGroupView);
@@ -1258,6 +1311,11 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("sectionSettingsView", &sectionSettingsView);
     emscripten::function("columnView", &columnView);
     emscripten::function("editInsertHyperlink", &editInsertHyperlink);
+    emscripten::function("exportPdf", &exportPdf);
+    emscripten::function("printBlockedReason", &printBlockedReason);
+    emscripten::function("equationView", &equationView);
+    emscripten::function("editEquation", &editEquation);
+    emscripten::function("equationPreview", &equationPreview);
     emscripten::function("pageControlFields", &pageControlFields);
     emscripten::function("editShortcut", &editShortcut);
     emscripten::function("editFindReplace", &editFindReplace);

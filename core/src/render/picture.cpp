@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "chwp/reader.hpp"
+#include "chwp/render/metafile_preview.hpp"
 #include "chwp/render/cache_budget.hpp"
 #include "chwp/render/paint.hpp"
 
@@ -170,6 +171,14 @@ std::shared_ptr<CachedPicture> decodePicture(const std::uint8_t* bytes, int byte
     if (!bytes || byteCount <= 0) return cached;
     int w = 0, h = 0, channels = 0;
     unsigned char* decoded = stbi_load_from_memory(bytes, byteCount, &w, &h, &channels, 4);
+    if (!decoded) {
+        // OLE 개체(차트 포함)와 WMF·EMF 그림은 안에 든 미리 보기 비트맵으로 그린다.
+        Bytes bmp;
+        const ByteView view(bytes, static_cast<std::size_t>(byteCount));
+        if (olePreviewBitmap(view, bmp) || metafileBitmap(view, bmp)) {
+            decoded = stbi_load_from_memory(bmp.data(), static_cast<int>(bmp.size()), &w, &h, &channels, 4);
+        }
+    }
     if (!decoded) return cached;
     if (w <= 0 || h <= 0) {
         stbi_image_free(decoded);

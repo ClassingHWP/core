@@ -2,7 +2,10 @@
 #include "chwp/model/proofreading.hpp"
 #include "chwp/hwp/hwp_writer.hpp"
 
+#include "chwp/common/crypto.hpp"
+
 #include <algorithm>
+#include <random>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -77,6 +80,9 @@ struct MemoWriteContext {
     std::unordered_map<const Control*, std::uint32_t> id;
 };
 thread_local MemoWriteContext gMemos;
+
+// 문서 암호로 잠글 때의 DES 열쇠(write 동안만). 비어 있으면 잠그지 않는다.
+thread_local Bytes gPasswordKey;
 
 std::uint32_t hexToColorRef(std::string_view s, std::uint32_t defaultVal = 0x00000000u) {
     if (s.empty() || s == "none") return defaultVal;
@@ -166,6 +172,7 @@ struct HwpBinEntry {
     std::string ext;
     std::string streamPath;   // "BinData/BIN0001.png"
     bool isLink = false;
+    bool isStorage = false;  // OLE 개체(스토리지)
     std::string linkPath;
     Bytes rawData;
 };
@@ -193,6 +200,7 @@ HwpBinRegistry buildHwpBinRegistry(const Document& doc, ByteView sourceData) {
         e.ext = item.extension.empty() ? "bin" : item.extension;
         if (!e.ext.empty() && e.ext.front() == '.') e.ext.erase(e.ext.begin());
         e.isLink = (item.storage == "LINK");
+        e.isStorage = (item.storage == "STORAGE");
         e.linkPath = item.path;
 
         char nameBuf[64];
@@ -243,7 +251,23 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         w.u32(0);  // list id
         w.u32(0);  // para id
         w.u32(0);  // char pos
-        appendRecord(stream, tag::DocumentProperties, 0, w.view());
+        if (!gPasswordKey.empty()) {
+            // 잠근 문서는 문서 속성 앞에 256 바이트를 둔다. 한글은 무작위 씨앗의 MS rand() 배열(숨긴 내용은 0)을 쓴다.
+            ByteWriter padded;
+            std::random_device rd;
+            crypto::MsvcRand rnd(rd());
+            std::size_t filled = 0;
+            while (filled < 256) {
+                const auto value = static_cast<std::uint8_t>(rnd.next() & 0xFF);
+                const int count = (rnd.next() & 0x0F) + 1;
+                for (int i = 0; i < count && filled < 256; ++i, ++filled) padded.u8(value);
+            }
+            const Bytes props = w.take();
+            for (const std::uint8_t b : props) padded.u8(b);
+            appendRecord(stream, tag::DocumentProperties, 0, padded.view());
+        } else {
+            appendRecord(stream, tag::DocumentProperties, 0, w.view());
+        }
     }
 
     // 준비된 각 테이블 개수 계산 (비어 있으면 기본 1개씩 생성)
@@ -308,8 +332,9 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         };
         // 메모 모양, 변경 추적 내용, 변경 추적 작성자 개수. 문서 수준 변경 추적(TrackChange)은 세지 않는다.
         w.i32(static_cast<std::int32_t>(h.memoShapes.size()));
-        w.i32(keptCount(tag::TrackChangeContent));
-        w.i32(keptCount(tag::TrackChangeAuthor));
+        (void)keptCount;
+        w.i32(static_cast<std::int32_t>(h.trackChanges.size()));
+        w.i32(static_cast<std::int32_t>(h.trackAuthors.size()));
         appendRecord(stream, tag::IdMappings, 0, w.view());
     }
 
@@ -322,7 +347,7 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
             w.hwpString(b.linkPath);
         } else {
             const std::uint16_t compBits = compress ? (1u << 4) : (2u << 4);
-            w.u16(static_cast<std::uint16_t>(1u | compBits));  // EMBEDDING
+            w.u16(static_cast<std::uint16_t>((b.isStorage ? 2u : 1u) | compBits));  // EMBEDDING, OLE 는 STORAGE
             w.u16(b.binId);
             w.hwpString(b.ext);
         }
@@ -649,7 +674,7 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         appendRecord(stream, tag::Style, 1, w.view());
     }
 
-    // 메모 모양(22바이트)은 스타일 뒤에 온다.
+    // 메모 모양(22바이트)은 스타일 뒤에 온다(docs/memo-structure.md 2.1절).
     for (const MemoShape& m : h.memoShapes) {
         ByteWriter w;
         w.u32(m.width);
@@ -671,13 +696,50 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         }
         return wrote;
     };
+    // 변경 추적 작성자·기록. 한글 2024 는 금칙 글자(FORBIDDEN_CHAR) 앞에 둔다. 차례가 다르면 한글이 본문을 읽지 못한다.
+    const auto writeTrackRecords = [&] {
+        // 기록: 종류(u32 0x10 넣기·0x11 지우기·0x12 글자 모양·0x13 문단 모양), 지역 시각(년·월·일·시·분 u16), 작성자(u32), 0 8 바이트.
+        for (const TrackAuthor& a : h.trackAuthors) {
+            ByteWriter w;
+            const std::u16string name = utf8ToUtf16(a.name);
+            w.u16(static_cast<std::uint16_t>(name.size()));
+            w.u16(0);
+            for (const char16_t ch : name) w.u16(static_cast<std::uint16_t>(ch));
+            w.u32(a.mark ? 1u : 0u);
+            w.u32(0);
+            appendRecord(stream, tag::TrackChangeAuthor, 1, w.view());
+        }
+        for (const TrackChange& tc : h.trackChanges) {
+            if (!tc.hwpRaw.empty()) {
+                appendRecord(stream, tag::TrackChangeContent, 1, ByteView(tc.hwpRaw));
+                continue;
+            }
+            ByteWriter w;
+            const std::uint32_t type = tc.type == "Delete" ? 0x11u : tc.type == "CharShape" ? 0x12u : tc.type == "ParaShape" ? 0x13u : 0x10u;
+            w.u32(type);
+            int year = 0, month = 0, day = 0, hour = 0, minute = 0;
+            trackDateToLocal(tc.date, year, month, day, hour, minute);
+            for (const int v : {year, month, day, hour, minute}) w.u16(static_cast<std::uint16_t>(v));
+            w.u32(tc.authorId);
+            if (type == 0x12u || type == 0x13u) w.u32(tc.charShapeId.value_or(tc.paraShapeId.value_or(0)));
+            w.u32(0);
+            w.u32(0);
+            appendRecord(stream, tag::TrackChangeContent, 1, w.view());
+        }
+    };
+    bool trackWritten = false;
     for (const KeptRecord& rec : h.kept) {
         if (rec.tag == tag::CompatibleDocument || rec.tag == tag::LayoutCompatibility || rec.tag == tag::TrackChange ||
-            rec.tag == tag::MemoShape) {
+            rec.tag == tag::MemoShape || rec.tag == tag::TrackChangeContent || rec.tag == tag::TrackChangeAuthor) {
             continue;
+        }
+        if (rec.tag == tag::ForbiddenChar && !trackWritten) {
+            writeTrackRecords();
+            trackWritten = true;
         }
         appendRecord(stream, rec.tag, 1, ByteView(rec.data));
     }
+    if (!trackWritten) writeTrackRecords();
     // 12. CompatibleDocument(단계 0)와 그 아래 LayoutCompatibility(단계 1), 그 뒤 변경 추적(단계 1).
     // 한글은 이 차례·단계가 다르면 파일을 열지 않는다.
     if (!writeKept(tag::CompatibleDocument, 0)) {
@@ -690,7 +752,22 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         for (int i = 0; i < 5; ++i) w.u32(0);
         appendRecord(stream, tag::LayoutCompatibility, 1, w.view());
     }
-    writeKept(tag::TrackChange, 1);
+    // 변경 추적 설정: 첫 u32 가 HWPX trackchageConfig flags 와 같다(기록 중 1 번 비트). 읽은 것이 있으면 그 뒤 바이트는 그대로.
+    {
+        bool wrote = false;
+        for (const KeptRecord& rec : h.kept) {
+            if (rec.tag != tag::TrackChange) continue;
+            Bytes data = rec.data;
+            if (data.size() >= 4) writeU32LE(data.data(), h.trackConfigFlags);
+            appendRecord(stream, tag::TrackChange, 1, ByteView(data));
+            wrote = true;
+        }
+        if (!wrote && (h.trackConfigFlags != 56u || !h.trackChanges.empty())) {
+            Bytes data(1032, 0);
+            writeU32LE(data.data(), h.trackConfigFlags);
+            appendRecord(stream, tag::TrackChange, 1, ByteView(data));
+        }
+    }
 
     return stream.take();
 }
@@ -844,7 +921,7 @@ void writePlacementBytes(ByteWriter& w, const Control& ctrl) {
     w.i16(static_cast<std::int16_t>(p.marginRight));
     w.i16(static_cast<std::int16_t>(p.marginTop));
     w.i16(static_cast<std::int16_t>(p.marginBottom));
-    w.u32(0x50000001u);  // instance id
+    w.u32(p.instanceId != 0 ? p.instanceId : 0x50000001u);  // instance id
     w.i32(0);            // prevent page break
     w.hwpString("");     // description
 }
@@ -957,6 +1034,9 @@ std::uint32_t shapeIdForControl(const Control& ctrl, std::string& st) {
     if (st == "polygon") return makeCtrlId('$', 'p', 'o', 'l');
     if (st == "curve") return makeCtrlId('$', 'c', 'u', 'r');
     if (st == "textart") return makeCtrlId('$', 't', 'a', 't');
+    if (st == "video") return makeCtrlId('$', 'v', 'i', 'd');
+    // 모르는 개체(예: 양식 개체)는 읽은 id 를 그대로 쓴다. 딸린 레코드는 kept 로 같이 간다.
+    if (st.size() == 4 && st[0] == '$') return makeCtrlId(st[0], st[1], st[2], st[3]);
     st = "rect";
     return makeCtrlId('$', 'r', 'e', 'c');
 }
@@ -1022,8 +1102,9 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
             for (double v : identMat) w.f64(v);
         }
 
+        // 글맵시도 그리기 개체라 선·채움·그림자를 둔다(한글 2024 글맵시 공통 레코드는 252 바이트다).
         const bool hasInk = (st == "rect" || st == "ellipse" || st == "line" || st == "arc" ||
-                             st == "polygon" || st == "curve");
+                             st == "polygon" || st == "curve" || st == "textart");
         if (hasInk) {
             const std::uint8_t lineKind = toHwpBorderKind(ctrl.strokeType);
             const std::uint32_t strokeAttr =
@@ -1243,6 +1324,62 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         for (const auto& child : ctrl.children) {
             writeShapeComponentRecords(stream, child, compLevel + 1, bins, groupDepth + 1);
         }
+    }
+    // HWPX 에서 온 OLE·동영상·글맵시는 보관한 HWP 레코드가 없다. 모델 값으로 만든다.
+    const auto kept = [&](std::uint16_t t) {
+        return std::any_of(ctrl.kept.begin(), ctrl.kept.end(), [t](const KeptRecord& rec) { return rec.tag == t; });
+    };
+    if (st == "ole" && !kept(tag::ShapeComponentOle)) {
+        // 개체 속성 u32(보이는 면, 모니커, 기준선, 종류), 크기, BinData id, 테두리 색·굵기·속성, 예약.
+        const OleInfo ole = ctrl.ole.value_or(OleInfo{});
+        ByteWriter w;
+        w.u32(static_cast<std::uint32_t>(oleAspectCode(ole.drawAspect)) | (ole.hasMoniker ? 0x100u : 0u) |
+              ((static_cast<std::uint32_t>(ole.eqBaseLine) & 0x7Fu) << 9) |
+              (static_cast<std::uint32_t>(oleObjectTypeCode(ole.objectType)) << 16));
+        w.i32(ole.extentX > 0 ? ole.extentX : static_cast<std::int32_t>(curW));
+        w.i32(ole.extentY > 0 ? ole.extentY : static_cast<std::int32_t>(curH));
+        w.u16(bins.resolve(ctrl.binItemId));
+        w.u32(0);
+        w.i32(0);
+        w.u32(0);
+        w.u32(0);
+        appendRecord(stream, tag::ShapeComponentOle, compLevel + 1, w.view());
+    } else if (st == "video" && !kept(tag::VideoData)) {
+        // 종류 i32(0 로컬, 1 웹), 로컬이면 동영상 BinData id, 웹이면 태그 글, 그다음 첫 장면 그림 BinData id.
+        const VideoInfo video = ctrl.video.value_or(VideoInfo{});
+        ByteWriter w;
+        const bool web = video.type == "Web";
+        w.i32(web ? 1 : 0);
+        if (web) w.hwpString(video.tag);
+        else w.u16(bins.resolve(video.fileBinId));
+        w.u16(bins.resolve(ctrl.binItemId));
+        appendRecord(stream, tag::VideoData, compLevel + 1, w.view());
+    } else if (st == "textart" && !kept(tag::ShapeComponentTextArt)) {
+        const TextArt art = ctrl.textArt.value_or(TextArt{});
+        ByteWriter w;
+        const bool noCorners = std::all_of(art.corners.begin(), art.corners.end(),
+                                           [](const ShapePoint& pt) { return pt.x == 0 && pt.y == 0; });
+        const ShapePoint fallback[4] = {{0, 0}, {rw, 0}, {rw, rh}, {0, rh}};
+        for (int k = 0; k < 4; ++k) {
+            const ShapePoint pt = noCorners ? fallback[k] : art.corners[static_cast<std::size_t>(k)];
+            w.i32(pt.x);
+            w.i32(pt.y);
+        }
+        w.hwpString(ctrl.text);
+        w.hwpString(art.fontName);
+        w.hwpString(art.fontStyle);
+        w.i32(art.fontType == "HFT" ? 2 : 1);
+        const int shape = art.shapeNumber >= 0 ? art.shapeNumber : textArtShapeCode(art.shape);
+        w.i32(shape >= 0 ? shape : textArtShapeCode("RECTANGLE"));
+        w.i32(art.lineSpacing);
+        w.i32(art.charSpacing);
+        w.i32(textArtAlignCode(art.align));
+        w.i32(textArtShadowCode(art.shadowType));
+        w.i32(art.shadowX);
+        w.i32(art.shadowY);
+        w.u32(hexToColorRef(art.shadowColor, 0x00000000u));
+        w.i32(0);
+        appendRecord(stream, tag::ShapeComponentTextArt, compLevel + 1, w.view());
     }
     for (const KeptRecord& rec : ctrl.kept) {
         if (rec.tag == tag::ShapeComponentLine || rec.tag == tag::ShapeComponentEllipse ||
@@ -1691,7 +1828,7 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
         case ControlKind::Field: {
             ByteWriter w;
             if (isMemoField(ctrl)) {
-                // 한글은 메모 필드의 CTRL_HEADER 를 %unk 로 쓰고 글 쪽 확장 문자에 %%me 를 둔다(한글 2024 와 같다).
+                // 한글은 메모 필드의 CTRL_HEADER 를 %unk 로 쓰고 글 쪽 확장 문자에 %%me 를 둔다.
                 // 명령 안 메모 번호와 꼬리의 메모 번호는 문서 차례로 다시 매긴 값이다.
                 const std::uint32_t number = gMemos.number.count(&ctrl) ? gMemos.number[&ctrl] : 1u;
                 MemoCommand cmd = parseMemoCommand(ctrl.command);
@@ -1783,6 +1920,17 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
         std::uint32_t colorRef24 = 0;
     };
     std::vector<MarkRange> markRanges;
+    // 글자 스타일 영역(종류 1, 하위 24비트가 스타일 번호). 글의 글자 스타일에서 다시 만든다.
+    std::vector<MarkRange> styleRanges;
+    // 변경 추적 영역(ViewText 에만 쓴다): 넣은 글 0x10, 지운 글 0x11, 글자 모양 바꿈 0x12. 하위 24비트는 기록 번호다.
+    struct TrackRange {
+        std::uint32_t start = 0;
+        std::uint32_t end = 0;
+        std::uint32_t kind = 0;
+        std::uint32_t change = 0;
+        std::uint32_t mark = 0;
+    };
+    std::vector<TrackRange> trackRanges;
 
     struct PendingControl {
         const Control* ptr = nullptr;
@@ -1843,6 +1991,7 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
     }
 
     for (const auto& r : para.runs) {
+        const std::uint32_t runStartPos = wcharPos;
         if (charShapeMap.empty() || charShapeMap.back().second != r.charShapeId) {
             if (!charShapeMap.empty() && charShapeMap.back().first == wcharPos) {
                 charShapeMap.back().second = r.charShapeId;
@@ -1909,6 +2058,26 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
                 const std::uint32_t cref = hexToColorRef(item.markpen, 0x00FFFF00u) & 0xFFFFFFu;
                 markRanges.push_back(MarkRange{itemStartPos, wcharPos, cref});
             }
+            if (item.type == InlineItem::Type::Text && item.charStyleId != kNoCharStyle && wcharPos > itemStartPos) {
+                if (!styleRanges.empty() && styleRanges.back().end == itemStartPos &&
+                    styleRanges.back().colorRef24 == item.charStyleId) {
+                    styleRanges.back().end = wcharPos;
+                } else {
+                    styleRanges.push_back(MarkRange{itemStartPos, wcharPos, item.charStyleId});
+                }
+            }
+            if (item.track != 0 && wcharPos > itemStartPos) {
+                const std::uint32_t kind = item.track == kTrackInsert ? 0x10u : 0x11u;
+                if (!trackRanges.empty() && trackRanges.back().end == itemStartPos && trackRanges.back().kind == kind &&
+                    trackRanges.back().mark == item.trackMark && trackRanges.back().change == item.trackChange) {
+                    trackRanges.back().end = wcharPos;
+                } else {
+                    trackRanges.push_back(TrackRange{itemStartPos, wcharPos, kind, item.trackChange, item.trackMark});
+                }
+            }
+        }
+        if (r.charTrackChange != 0 && wcharPos > runStartPos) {
+            trackRanges.push_back(TrackRange{runStartPos, wcharPos, 0x12u, r.charTrackChange, 0});
         }
     }
 
@@ -1919,14 +2088,21 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
     // 문단 끝 문자 (CR = 13)
     textWriter.u16(13);
     ++wcharPos;
+    // 넣은·지운 문단 끝: 문단 끝 글자만 덮는다.
+    if (para.endTrack.track != 0) {
+        trackRanges.push_back(TrackRange{wcharPos - 1, wcharPos, para.endTrack.track == kTrackInsert ? 0x10u : 0x11u,
+                                         para.endTrack.change, para.endTrack.mark});
+    }
 
     // 형광펜 밖의 영역(글자 겹침·책갈피 등)은 읽은 그대로 다시 쓴다. 형광펜(종류 2)은 위에서 글자로부터 다시 만들었다.
     std::vector<const TextRange*> keptRanges;
     for (const TextRange& range : para.ranges) {
-        if (range.kind != 2) keptRanges.push_back(&range);
+        if (range.kind != 2 && range.kind != 1 && range.kind != 0x10 && range.kind != 0x11 && range.kind != 0x12) {
+            keptRanges.push_back(&range);
+        }
     }
     // 한글은 문단 머리의 영역 개수가 PARA_RANGE_TAG 의 항목 수와 다르면 파일을 열지 않는다.
-    const std::size_t rangeCount = markRanges.size() + keptRanges.size();
+    const std::size_t rangeCount = markRanges.size() + styleRanges.size() + keptRanges.size() + trackRanges.size();
 
     // 1. ParaHeader
     {
@@ -1943,7 +2119,7 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
         w.u16(static_cast<std::uint16_t>(charShapeMap.size()));
         w.u16(static_cast<std::uint16_t>(rangeCount));
         w.u16(static_cast<std::uint16_t>(para.lineSegs.size()));
-        w.u32(0);
+        w.u32(para.fileId);  // instance id(차례 하이퍼링크 대상)
         w.u16(0);
         appendRecord(stream, tag::ParaHeader, baseLevel, w.view());
     }
@@ -1988,10 +2164,20 @@ void writeParagraphRecords(ByteWriter& stream, const Paragraph& para, std::uint1
             w.u32(mr.end);
             w.u32((2u << 24) | (mr.colorRef24 & 0xFFFFFFu));
         }
+        for (const auto& sr : styleRanges) {
+            w.u32(sr.start);
+            w.u32(sr.end);
+            w.u32((1u << 24) | (sr.colorRef24 & 0xFFFFFFu));
+        }
         for (const TextRange* range : keptRanges) {
             w.u32(range->start);
             w.u32(range->end);
             w.u32((range->kind << 24) | (range->data & 0xFFFFFFu));
+        }
+        for (const TrackRange& tr : trackRanges) {
+            w.u32(tr.start);
+            w.u32(tr.end);
+            w.u32((tr.kind << 24) | (tr.change & 0xFFFFFFu));
         }
         appendRecord(stream, tag::ParaRangeTag, baseLevel + 1, w.view());
     }
@@ -2135,16 +2321,118 @@ Bytes buildPrvTextStream(const Document& doc) {
     return w.take();
 }
 
-Bytes buildFileHeaderStream(bool compressed) {
+Bytes buildFileHeaderStream(bool compressed, bool tracked, bool distribution, bool password) {
     Bytes header(256, 0);
     static constexpr char kSig[] = "HWP Document File";
     std::memcpy(header.data(), kSig, sizeof(kSig) - 1);
     writeU32LE(header.data() + 32, 0x05010100u);  // 5.1.1.0
-    writeU32LE(header.data() + 36, compressed ? 1u : 0u);
+    // 0 번 비트 압축, 1 번 비트 문서 암호, 2 번 비트 배포용 문서, 14 번 비트 변경 추적 문서(BodyText 최종본 + ViewText 바뀐 글 표시).
+    writeU32LE(header.data() + 36,
+               (compressed ? 1u : 0u) | (password ? (1u << 1) : 0u) | (distribution ? (1u << 2) : 0u) |
+                   (tracked ? (1u << 14) : 0u));
     return header;
 }
 
+// 배포용 문서의 BodyText 에 두는 안내 구역. 구역 첫 문단의 구역·단 정의만 남기고 안내 글을 붙인다(한글이 쓰는 글과 같다).
+Section distributionNoticeSection(const Section& source) {
+    Section out = source;
+    out.paragraphs.resize(std::min<std::size_t>(out.paragraphs.size(), 1));
+    if (out.paragraphs.empty()) out.paragraphs.emplace_back();
+    Paragraph& para = out.paragraphs.front();
+    para.lineSegs.clear();
+    for (Run& run : para.runs) {
+        std::erase_if(run.items, [](const InlineItem& item) {
+            return item.type != InlineItem::Type::Control ||
+                   (item.control.ctrlId != "secd" && item.control.ctrlId != "cold");
+        });
+    }
+    if (para.runs.empty()) para.runs.emplace_back();
+    para.runs.back().items.push_back(InlineItem::makeText(
+        "이 문서는 상위 버전의 배포용 문서입니다. 문서를 읽으려면 최신 버전의 한글 또는 한글 전용 뷰어가 필요합니다."
+        "(주의! 현재 상태에서 문서를 저장하는 경우 원래 문서의 내용이 사라집니다.)"));
+    return out;
+}
+
+// 문단 목록에 바뀐 글 표시가 있는가(칸·글상자 안 포함).
+bool listTracked(const std::vector<Paragraph>& paras);
+bool controlTracked(const Control& c) {
+    if (c.table) {
+        for (const auto& cell : c.table->cells) {
+            if (listTracked(cell.content.paragraphs)) return true;
+        }
+    }
+    if (c.caption && listTracked(c.caption->content.paragraphs)) return true;
+    for (const auto& sub : c.subLists) {
+        if (listTracked(sub.paragraphs)) return true;
+    }
+    for (const auto& child : c.children) {
+        if (controlTracked(child)) return true;
+    }
+    return false;
+}
+bool listTracked(const std::vector<Paragraph>& paras) {
+    for (const Paragraph& para : paras) {
+        if (para.endTrack.track != 0) return true;
+        for (const Run& run : para.runs) {
+            if (run.charTrackChange != 0) return true;
+            for (const InlineItem& item : run.items) {
+                if (item.track != 0) return true;
+                if (item.type == InlineItem::Type::Control && controlTracked(item.control)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 최종본(BodyText): 지운 글을 빼고 넣은 글 표시를 없앤다. 지운 문단 끝은 다음 문단과 합친다.
+void finalList(std::vector<Paragraph>& paras);
+void finalControl(Control& c) {
+    if (c.table) {
+        for (auto& cell : c.table->cells) finalList(cell.content.paragraphs);
+    }
+    if (c.caption) finalList(c.caption->content.paragraphs);
+    for (auto& sub : c.subLists) finalList(sub.paragraphs);
+    for (auto& child : c.children) finalControl(child);
+}
+void finalList(std::vector<Paragraph>& paras) {
+    for (Paragraph& para : paras) {
+        for (Run& run : para.runs) {
+            run.charTrackChange = 0;
+            std::vector<InlineItem> keep;
+            for (InlineItem& item : run.items) {
+                if (item.track == kTrackDelete) continue;
+                item.track = 0;
+                item.trackChange = 0;
+                item.trackMark = 0;
+                if (item.type == InlineItem::Type::Control) finalControl(item.control);
+                keep.push_back(std::move(item));
+            }
+            run.items = std::move(keep);
+        }
+        para.lineSegs.clear();
+    }
+    for (std::size_t p = 0; p + 1 < paras.size();) {
+        if (paras[p].endTrack.track == kTrackDelete) {
+            paras[p].endTrack = paras[p + 1].endTrack;
+            for (Run& run : paras[p + 1].runs) paras[p].runs.push_back(std::move(run));
+            paras.erase(paras.begin() + static_cast<std::ptrdiff_t>(p + 1));
+            continue;
+        }
+        paras[p].endTrack = ParaEndTrack{};
+        ++p;
+    }
+    if (!paras.empty()) paras.back().endTrack = ParaEndTrack{};
+}
+
 bool maybeCompress(ByteView raw, bool compress, Bytes& out, std::string* error) {
+    if (!gPasswordKey.empty()) {
+        // 잠근 스트림은 deflate 를 안에 품는다(압축 여부와 상관없다).
+        if (!encryptPasswordStream(raw, gPasswordKey, out)) {
+            if (error) *error = "HWP stream encryption failed";
+            return false;
+        }
+        return true;
+    }
     if (!compress) {
         out.assign(raw.begin(), raw.end());
         return true;
@@ -2163,8 +2451,19 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
     out.clear();
     cfb::CompoundWriter cfb;
 
-    // 1. FileHeader (256 bytes, 항상 비압축)
-    cfb.addStream("FileHeader", buildFileHeaderStream(options.compress));
+    // 1. FileHeader (256 bytes, 항상 비압축). 바뀐 글 표시가 있으면 변경 추적 문서다.
+    bool tracked = false;
+    for (const Section& s : doc.sections) tracked = tracked || listTracked(s.paragraphs);
+    // 배포용 문서는 배포용 그대로 쓴다(본문은 읽을 때 받은 열쇠로 암호화한 ViewText). 변경 추적과 같이 쓰지 않는다.
+    const bool distribution = doc.format.distribution && doc.format.distributeData.size() == 256;
+    if (distribution) tracked = false;
+    // 문서 암호가 있으면 FileHeader·요약 정보 말고 모든 스트림을 그 암호로 잠근다(한글 2024). 배포용 문서는 배포용 잠금만 쓴다.
+    const bool locked = !doc.format.password.empty() && !distribution;
+    gPasswordKey = locked ? passwordKey(doc.format.password) : Bytes{};
+    struct KeyReset {
+        ~KeyReset() { gPasswordKey.clear(); }
+    } keyReset;
+    cfb.addStream("FileHeader", buildFileHeaderStream(options.compress, tracked, distribution, locked));
 
     const HwpBinRegistry bins = buildHwpBinRegistry(doc, options.sourceData);
 
@@ -2197,7 +2496,36 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
         sectionsPtr = &fallbackSections;
     }
     for (std::size_t i = 0; i < sectionsPtr->size(); ++i) {
-        const Bytes rawSec = buildSectionStream((*sectionsPtr)[i], bins, i + 1 == sectionsPtr->size());
+        const bool last = i + 1 == sectionsPtr->size();
+        if (distribution) {
+            const Bytes rawNotice = buildSectionStream(distributionNoticeSection((*sectionsPtr)[i]), bins, last);
+            Bytes storedNotice;
+            if (!maybeCompress(rawNotice, options.compress, storedNotice, error)) return false;
+            cfb.addStream("BodyText/Section" + std::to_string(i), std::move(storedNotice));
+            const Bytes rawView = buildSectionStream((*sectionsPtr)[i], bins, last);
+            Bytes storedView;
+            if (!encryptDistributedStream(rawView, options.compress, doc.format.distributeData, storedView)) {
+                if (error) *error = "failed to encrypt distribution document body";
+                return false;
+            }
+            cfb.addStream("ViewText/Section" + std::to_string(i), std::move(storedView));
+            continue;
+        }
+        if (tracked) {
+            // 최종본은 BodyText, 바뀐 글 표시가 든 전체 글은 ViewText 다(한글 2024).
+            Section finalSec = (*sectionsPtr)[i];
+            finalList(finalSec.paragraphs);
+            const Bytes rawFinal = buildSectionStream(finalSec, bins, last);
+            Bytes storedFinal;
+            if (!maybeCompress(rawFinal, options.compress, storedFinal, error)) return false;
+            cfb.addStream("BodyText/Section" + std::to_string(i), std::move(storedFinal));
+            const Bytes rawView = buildSectionStream((*sectionsPtr)[i], bins, last);
+            Bytes storedView;
+            if (!maybeCompress(rawView, options.compress, storedView, error)) return false;
+            cfb.addStream("ViewText/Section" + std::to_string(i), std::move(storedView));
+            continue;
+        }
+        const Bytes rawSec = buildSectionStream((*sectionsPtr)[i], bins, last);
         Bytes storedSec;
         if (!maybeCompress(rawSec, options.compress, storedSec, error)) return false;
         cfb.addStream("BodyText/Section" + std::to_string(i), std::move(storedSec));
@@ -2234,7 +2562,8 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
 
     // 5. \x05HwpSummaryInformation & PrvText
     cfb.addStream("\x05HwpSummaryInformation", buildSummaryInformationStream(doc.metadata));
-    cfb.addStream("PrvText", buildPrvTextStream(doc));
+    // 잠근 문서는 미리 보기 글을 두지 않는다(본문이 풀린 채로 남는다. 한글도 쓰지 않는다).
+    if (!locked) cfb.addStream("PrvText", buildPrvTextStream(doc));
 
     return cfb.build(out, error);
 }

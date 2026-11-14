@@ -95,7 +95,7 @@ CellRead cellValue(const TableCell& cell) {
     return {};
 }
 
-// 평균(AVG·AVERAGE)의 ABOVE·LEFT 범위는 바로 위(왼쪽) 셀이 그 방향 소계면 뺀다(한글 2024 와 같다).
+// 평균(AVG·AVERAGE)의 ABOVE·LEFT 범위는 바로 위(왼쪽) 셀이 그 방향 소계면 뺀다(한글의 범위 바꾸기).
 // 소계는 셀 첫 계산식(앞 '=' 하나 뺌)에서 처음 나오는 '(' 뒤로 짝 맞는 ')' 가 있고, 그 '(' 부터가
 // "(ABOVE)"·"(LEFT)" 로 시작하는 식이다. 대소문자·빈칸은 그대로 비교한다.
 bool directionSubtotal(const TableCell& cell, std::string_view dir) {
@@ -485,7 +485,7 @@ private:
         return rangeCells(r0, c0, r1, c1, out);
     }
 
-    // 쉬운 범위는 한글이 셀 범위로 바꿔 계산한다(한글 2024 와 같다).
+    // 쉬운 범위는 한글이 셀 범위로 바꿔 계산한다(한글의 범위 바꾸기를 따라 감).
     //   - 이름 없음: ABOVE 는 첫 줄부터 바로 위 줄까지, BELOW 는 아래 줄부터 끝 줄까지(LEFT·RIGHT 도 같다).
     //     평균이면 바로 위(왼쪽) 셀이 그 방향 소계일 때 그 셀을 뺀다(바로 위가 첫 줄이면 빼지 않는다).
     //   - 이름 있음: 바로 이웃 셀부터 바깥으로, 그 주소에 셀이 있고 이름이 같은 동안 잇는다(합친 셀에 덮인 자리에서 끝).

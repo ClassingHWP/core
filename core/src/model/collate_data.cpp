@@ -1,4 +1,4 @@
-// 만들어 넣은 표 파일이다. 손으로 고치지 않는다.
+// tools/collate/gen_windows_collation.py 로 만든 파일이다. 손으로 고치지 않는다.
 // Windows 한국어(0x412) 정렬 키 조각표(raw deflate). 풀린 크기 751112 바이트.
 #include <cstddef>
 

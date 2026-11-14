@@ -610,8 +610,12 @@ struct Painter {
     void thickLine(int x0, int y0, int x1, int y1, int thick, std::uint8_t r, std::uint8_t g, std::uint8_t b);
 
     void drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
+    // 점들로 채우고 긋는다. 채움은 닫힌 모양, 선은 점을 차례로 잇기만 한다(한글 2024: 다각형·곡선·자유선의 선은 닫지 않는다).
+    void drawPoints(const Node& node, const std::vector<model::ShapePoint>& points, std::int32_t x, std::int32_t y,
+                    PaintLayer place);
 
     void equation(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
+    void textArt(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
 
     bool roundContains(int col, int row, int width, int height, int radius);
 
@@ -715,6 +719,7 @@ struct Painter {
         std::string hatchColor;
         std::string shade;
         std::string markpen;
+        std::uint8_t track = 0;  // 변경 추적: 1 넣은 글(빨간 밑줄), 2 지운 글(빨간 취소선)
         std::string leader;
         const Node* object = nullptr;
         // 각주·미주 번호 전체와 글자마다의 폭. 1) 은 한 마크다. 비어 있으면 번호가 아니다.
@@ -872,6 +877,35 @@ struct Painter {
         std::int32_t moveGap = 0;
     };
     std::vector<ProofSpan> lineProofs(const Node& node, const std::vector<Mark>& marks, const LinePlacement& place) const;
+    // 줄 안 필드 범위(pick 이 고른 필드만). x 는 줄 x 기준이다. 시작·끝이 이 줄에 있으면 head·tail 이 참이다.
+    struct FieldSpan {
+        const model::Control* control = nullptr;
+        std::int32_t x0 = 0;
+        std::int32_t x1 = 0;
+        std::int32_t lineLeft = 0;
+        std::int32_t lineRight = 0;
+        bool head = false;
+        bool tail = false;
+        std::uint32_t charShapeId = 0;
+    };
+    std::vector<FieldSpan> lineFieldSpans(const Node& node, const std::vector<Mark>& marks, const LinePlacement& place,
+                                          bool (*pick)(const model::Control&)) const;
+    // 줄 안 메모 범위 상자(쪽 좌표 HWPUNIT). 글자 상자 높이이고, 메모 시작·끝이 이 줄에 있으면 head·tail 이다.
+    struct MemoRange {
+        std::int32_t x0 = 0;
+        std::int32_t x1 = 0;
+        std::int32_t top = 0;
+        std::int32_t bottom = 0;
+        bool head = false;
+        bool tail = false;
+        std::string fill;
+        std::string line;
+    };
+    static constexpr std::int32_t kMemoRangeCut = 113;  // 테두리 모서리를 깎는 길이 0.4mm
+    std::vector<MemoRange> lineMemoRanges(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
+                                          const LinePlacement& place) const;
+    // 메모 범위 상자(채우기와 '⟨' '⟩' 테두리). 글자 뒤에 그린다.
+    void drawMemoRanges(const Node& node, std::int32_t x, std::int32_t y, const LinePlacement& place);
     void drawProofMarks(const Node& node, std::int32_t x, std::int32_t y, const std::vector<Mark>& marks,
                         const LinePlacement& place);
     // 글 뒤에 까는 교정 부호 바탕(자료 연결의 회색). 글자보다 먼저 그린다.

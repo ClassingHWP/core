@@ -1196,8 +1196,25 @@ Status callSave(Call& c) {
     if (const Json* v = c.request.get("format")) {
         if (Status s = readText(v, "format", format); !s.ok()) return s;
     }
+    // PDF: 편집기 인쇄·PDF 로 저장과 같은 쪽 그림. dpi 는 72~600(기본 200)이다.
+    const bool pdfPath = path.size() >= 4 && (path.compare(path.size() - 4, 4, ".pdf") == 0 ||
+                                              path.compare(path.size() - 4, 4, ".PDF") == 0);
+    if (format == "pdf" || (format.empty() && pdfPath)) {
+        double dpi = 200;
+        if (const Json* v = c.request.get("dpi")) {
+            if (v->type != Json::Type::Number || v->number < 72 || v->number > 600) return bad("dpi 는 72~600 입니다.");
+            dpi = v->number;
+        }
+        Result<Bytes> pdf = c.doc.exportPdf(static_cast<int>(dpi));
+        if (!pdf.ok()) return pdf.status;
+        c.w.field("file", path);
+        c.w.field("format", std::string("pdf"));
+        c.w.field("bytes", static_cast<std::int64_t>(pdf.value.size()));
+        c.files.push_back({path, std::move(pdf.value)});
+        return {};
+    }
     const std::optional<model::SourceFormat> target = c.doc.saveFormatFor(path, format);
-    if (!target) return bad("format 은 hwp 또는 hwpx 입니다.");
+    if (!target) return bad("format 은 hwp, hwpx, pdf 입니다.");
     Result<Bytes> saved = c.doc.save(*target);
     if (!saved.ok()) return saved.status;
     c.w.field("file", path);

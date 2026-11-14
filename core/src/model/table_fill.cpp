@@ -15,7 +15,7 @@ namespace chwp::model {
 
 namespace {
 
-// 한글 2024 의 기본 자동 채우기 목록. 끝 다음은 처음이다.
+// 한글 2024 의 기본 자동 채우기 목록(HOffice130\Bin\AutoFill.dat 의 [Standard]). 끝 다음은 처음이다.
 constexpr const char* kLists[] = {
     "일월,이월,삼월,사월,오월,유월,칠월,팔월,구월,시월,십일월,십이월",
     "1月,2月,3月,4月,5月,6月,7月,8月,9月,10月,11月,12月",

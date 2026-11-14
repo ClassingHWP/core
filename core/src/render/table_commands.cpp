@@ -146,6 +146,10 @@ const model::Style* captionStyle(const model::Document& doc) {
 
 // 문서 차례로 표 캡션 번호를 세어 control 의 번호를 정한다. control 앞의 표 번호 수 + 1.
 int captionNumberOf(const model::Document& doc, const model::Control* control, const std::string& numType) {
+    // 개체 번호 범주와 같으면 그 개체 번호다(캡션 없는 앞 개체도 센다).
+    if (model::objectNumberingType(control->kind, control->placement ? control->placement->numberingType : "") == numType) {
+        return model::objectNumber(doc, control);
+    }
     int count = 0;
     bool found = false;
     std::function<void(const std::vector<model::Paragraph>&)> walk = [&](const std::vector<model::Paragraph>& paras) {
@@ -275,7 +279,7 @@ bool tableEditHost(const model::Document& doc, const TableEditCommand& cmd, int&
 
 // 캡션 넣기·옮기기·떼기(한글 2024 TableCaptionPos*·CaptionPos*·DetachCaption). 표·그림·도형·수식이 같은 규칙이다:
 // 폭 30 mm(8504), 간격 3 mm(850), "캡션" 스타일 문단에 번호 종류 이름("표 "·"그림 "·"수식 ") + 번호 + " ".
-// 있는 캡션은 글을 두고 자리만 바꾼다. 가로 캡션의 lastWidth 는 개체 폭이다(한글 2024 에서 확인).
+// 있는 캡션은 글을 두고 자리만 바꾼다. 가로 캡션의 lastWidth 는 개체 폭이다(한글 COM 으로 확인).
 namespace paint_detail {
 
 CaptionChange setObjectCaption(model::Document& doc, model::Control& control, const std::string& wanted, int hostStory,

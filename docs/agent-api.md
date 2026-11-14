@@ -154,7 +154,7 @@ bool redo();
 | `insertTable` | `at`, 행·열, 칸 너비, 칸 글 | **새로** |
 | `setCellText` | `{object,row,col}`, `text` | 칸 story 에 insert/delete 로 |
 | `insertPicture` | `at`, `file`(셸이 읽음)·`base64`, `width`·`height`(HU) | 있음(2026-11-10). 글자처럼 넣는다 |
-| `insertEquation` | `at`, 한글 수식 스크립트 | **새로** (측정은 `measureHangulEquation`) |
+| `insertEquation` | `at`, `script`, `size`(pt) | 됨: 명령 op `insertEquation`·`equation`(고치기), 크기는 한글 수식 엔진과 같게 잰다 |
 | `deleteObject` | `object` | 있음(2026-11-10). `render::editDeleteObject` |
 | `objectProperties` | `object`, `set`(놓기·크기·바깥 여백) | 있음(2026-11-10). `render::editObjectProperties`, 크기는 손잡이 조절과 같은 규칙 |
 | 편집기 명령 | 머리말·꼬리말·쪽 번호·바탕쪽·쪽 지우기·메모·교정 부호·블록 계산·각주/미주·주석 모양·쪽 테두리·구역·단·표 속성·표↔문자열·캡션·책갈피·하이퍼링크·덧말·글자 바꾸기·정렬·조판 부호 지우기·모양 복사·도형 | 있음(2026-11-10). `OpKind::Command`(command 이름, 자리 at·range·object·story·section, set·args). 값은 `commandView`(JSON `view`) |

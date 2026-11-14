@@ -6,6 +6,7 @@
 #include "chwp/reader.hpp"
 #include "chwp/render/view.hpp"
 #include "render/equation_draw.hpp"
+#include "render/textart_layout.hpp"
 
 // Painter: 도형과 수식: 경로, 둥근 상자, 타원
 
@@ -35,8 +36,88 @@ void Painter::thickLine(int x0, int y0, int x1, int y1, int thick, std::uint8_t 
     }
 }
 
+namespace {
+
+// 한글 2024 곡선(hp:curve CURVE 마디): 점들을 지나는 3차 베지어. 안쪽 점의 접선은 (다음 점 − 앞 점)/2, 끝점의 접선은
+// (3·(이웃 점 − 끝점) − 이웃 점의 접선)/2 이고, 마디마다 16 조각의 꺾은선으로 긋는다. 한글이 만든 PDF 의 곡선 꺾은선과
+// 같다(점 (0,0)(4500,4500)(9000,0)(13500,4500) 의 마디 가운데가 (2254,3092)(6752,2253)(11250,1402)).
+std::vector<model::ShapePoint> hangulCurvePoints(const std::vector<model::ShapePoint>& points) {
+    const std::size_t n = points.size();
+    if (n < 3) return points;
+    std::vector<double> tx(n);
+    std::vector<double> ty(n);
+    for (std::size_t i = 1; i + 1 < n; ++i) {
+        tx[i] = (points[i + 1].x - points[i - 1].x) / 2.0;
+        ty[i] = (points[i + 1].y - points[i - 1].y) / 2.0;
+    }
+    tx[0] = (3.0 * (points[1].x - points[0].x) - tx[1]) / 2.0;
+    ty[0] = (3.0 * (points[1].y - points[0].y) - ty[1]) / 2.0;
+    tx[n - 1] = (3.0 * (points[n - 1].x - points[n - 2].x) - tx[n - 2]) / 2.0;
+    ty[n - 1] = (3.0 * (points[n - 1].y - points[n - 2].y) - ty[n - 2]) / 2.0;
+    std::vector<model::ShapePoint> out;
+    out.push_back(points.front());
+    constexpr int kSteps = 16;
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        const double x0 = points[i].x;
+        const double y0 = points[i].y;
+        const double x3 = points[i + 1].x;
+        const double y3 = points[i + 1].y;
+        const double x1 = x0 + tx[i] / 3.0;
+        const double y1 = y0 + ty[i] / 3.0;
+        const double x2 = x3 - tx[i + 1] / 3.0;
+        const double y2 = y3 - ty[i + 1] / 3.0;
+        for (int s = 1; s <= kSteps; ++s) {
+            const double t = static_cast<double>(s) / kSteps;
+            const double u = 1.0 - t;
+            const double bx = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
+            const double by = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
+            out.push_back(model::ShapePoint{static_cast<std::int32_t>(std::lround(bx)), static_cast<std::int32_t>(std::lround(by))});
+        }
+    }
+    return out;
+}
+
+// 한글 2024 호(hp:arc NORMAL): 중심에서 ax2 끝을 지나 ax1 끝까지의 사분 타원. 한글 PDF 는 한 3차 베지어로 긋는다
+// (조절점 ax2 + k·(ax1 − 중심), ax1 + k·(ax2 − 중심), k = 0.5523). 여기서는 32 조각으로 편다.
+std::vector<model::ShapePoint> hangulArcPoints(const std::vector<model::ShapePoint>& points) {
+    std::vector<model::ShapePoint> out;
+    if (points.size() < 3) return out;
+    const model::ShapePoint c = points[0];
+    const model::ShapePoint a1 = points[1];
+    const model::ShapePoint a2 = points[2];
+    constexpr double k = 0.5523;
+    const double x0 = a2.x;
+    const double y0 = a2.y;
+    const double x1 = a2.x + k * (a1.x - c.x);
+    const double y1 = a2.y + k * (a1.y - c.y);
+    const double x2 = a1.x + k * (a2.x - c.x);
+    const double y2 = a1.y + k * (a2.y - c.y);
+    const double x3 = a1.x;
+    const double y3 = a1.y;
+    constexpr int kSteps = 32;
+    for (int s = 0; s <= kSteps; ++s) {
+        const double t = static_cast<double>(s) / kSteps;
+        const double u = 1.0 - t;
+        const double bx = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
+        const double by = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
+        out.push_back(model::ShapePoint{static_cast<std::int32_t>(std::lround(bx)), static_cast<std::int32_t>(std::lround(by))});
+    }
+    return out;
+}
+
+}  // namespace
+
 void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place) {
-    if (node.ext().obj().points.size() < 2) return;
+    if (node.ext().obj().shapeType == "curve") {
+        drawPoints(node, hangulCurvePoints(node.ext().obj().points), x, y, place);
+        return;
+    }
+    drawPoints(node, node.ext().obj().points, x, y, place);
+}
+
+void Painter::drawPoints(const Node& node, const std::vector<model::ShapePoint>& points, std::int32_t x, std::int32_t y,
+                         PaintLayer place) {
+    if (points.size() < 2) return;
     std::uint8_t r, g, b;
     const bool stroke = !node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE";
     parseHex(node.ext().borderLeft.color.empty() ? "#000000" : node.ext().borderLeft.color, r, g, b);
@@ -45,20 +126,20 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     if (show(place) && close) {
         std::uint8_t fr, fg, fb;
         parseHex(node.ext().fillColor, fr, fg, fb);
-        int minY = px(y + node.ext().obj().points[0].y);
+        int minY = px(y + points[0].y);
         int maxY = minY;
-        for (const auto& point : node.ext().obj().points) {
+        for (const auto& point : points) {
             const int py = px(y + point.y);
             minY = std::min(minY, py);
             maxY = std::max(maxY, py);
         }
-        const std::size_t count = node.ext().obj().points.size();
+        const std::size_t count = points.size();
         for (int scan = minY; scan <= maxY; ++scan) {
             std::vector<int> hits;
             for (std::size_t i = 0; i < count; ++i) {
-                const int x0 = px(x + node.ext().obj().points[i].x);
-                const int y0 = px(y + node.ext().obj().points[i].y);
-                const auto& next = node.ext().obj().points[(i + 1) % count];
+                const int x0 = px(x + points[i].x);
+                const int y0 = px(y + points[i].y);
+                const auto& next = points[(i + 1) % count];
                 const int x1 = px(x + next.x);
                 const int y1 = px(y + next.y);
                 if (y0 == y1 || scan < std::min(y0, y1) || scan >= std::max(y0, y1)) continue;
@@ -76,11 +157,10 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     if (dashes >= 2) {
         if (SkCanvas* canvas = this->canvas()) {
             SkPathBuilder path;
-            path.moveTo(static_cast<float>(px(x + node.ext().obj().points[0].x)), static_cast<float>(px(y + node.ext().obj().points[0].y)));
-            for (std::size_t i = 1; i < node.ext().obj().points.size(); ++i) {
-                path.lineTo(static_cast<float>(px(x + node.ext().obj().points[i].x)), static_cast<float>(px(y + node.ext().obj().points[i].y)));
+            path.moveTo(static_cast<float>(px(x + points[0].x)), static_cast<float>(px(y + points[0].y)));
+            for (std::size_t i = 1; i < points.size(); ++i) {
+                path.lineTo(static_cast<float>(px(x + points[i].x)), static_cast<float>(px(y + points[i].y)));
             }
-            if (close) path.close();
             SkPaint paint;
             paint.setAntiAlias(true);
             paint.setStyle(SkPaint::kStroke_Style);
@@ -123,14 +203,9 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
             ++slot;
         }
     };
-    for (std::size_t i = 0; i + 1 < node.ext().obj().points.size(); ++i) {
-        segment(px(x + node.ext().obj().points[i].x), px(y + node.ext().obj().points[i].y), px(x + node.ext().obj().points[i + 1].x),
-                px(y + node.ext().obj().points[i + 1].y));
-    }
-    if (close) {
-        const auto& tail = node.ext().obj().points.back();
-        const auto& head = node.ext().obj().points.front();
-        segment(px(x + tail.x), px(y + tail.y), px(x + head.x), px(y + head.y));
+    for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+        segment(px(x + points[i].x), px(y + points[i].y), px(x + points[i + 1].x),
+                px(y + points[i + 1].y));
     }
 }
 
@@ -440,8 +515,94 @@ bool holdsText(const Node& node) {
 }
 }  // namespace
 
+// 글맵시: 한글 2024 를 재서 맞춘 모양(textart_layout)으로 글자 윤곽을 휘어 개체 상자에 두고, 개체 채움색으로 칠하고
+// 선으로 두른다. 그림자가 있으면 글을 그림자 몫을 뺀 칸에 채우고 그림자를 먼저 그림자 색으로 칠한다(선은 두르지 않는다).
+void Painter::textArt(const Node& node, std::int32_t x, std::int32_t y, PaintLayer) {
+    SkCanvas* canvas = this->canvas();
+    const ObjectExtra& obj = node.ext().obj();
+    const std::string& text = obj.artText;
+    if (!canvas || text.empty() || node.width <= 0 || node.height <= 0) return;
+    model::TextArt art;
+    art.shapeNumber = obj.artShape;
+    art.lineSpacing = obj.artLineSpacing;
+    art.charSpacing = obj.artCharSpacing;
+    art.align = obj.artAlign;
+    std::vector<ArtCommand> outline = textArtOutline(text, obj.artFont, art);
+    std::vector<ArtCommand> shadow;
+    if (obj.artShadow) {
+        ArtShadowFit fit = fitTextArtShadow(outline, obj.artShadowX, obj.artShadowY);
+        outline = std::move(fit.text);
+        shadow = std::move(fit.shadow);
+    }
+    if (outline.empty()) return;
+    const float left = glyphPx(x);
+    const float top = glyphPx(y);
+    const float w = glyphPx(x + node.width) - left;
+    const float h = glyphPx(y + node.height) - top;
+    const auto at = [&](float nx, float ny) { return SkPoint::Make(left + nx * w, top + ny * h); };
+    const auto build = [&](const std::vector<ArtCommand>& commands) {
+        SkPathBuilder path;
+        bool started = false;
+        for (const ArtCommand& c : commands) {
+            if (c.verb == GlyphVerb::Move) {
+                if (started) path.close();
+                path.moveTo(at(c.x, c.y));
+                started = true;
+            } else if (c.verb == GlyphVerb::Line) {
+                path.lineTo(at(c.x, c.y));
+            } else if (c.verb == GlyphVerb::Quad) {
+                path.quadTo(at(c.c1x, c.c1y), at(c.x, c.y));
+            } else {
+                path.cubicTo(at(c.c1x, c.c1y), at(c.c2x, c.c2y), at(c.x, c.y));
+            }
+        }
+        if (started) path.close();
+        return path.detach();
+    };
+    const auto fillWith = [&](const SkPath& shape, const std::string& color) {
+        SkPaint fill;
+        fill.setAntiAlias(true);
+        std::uint8_t r = 0, g = 0, b = 0;
+        if (!color.empty() && color != "none") parseHex(color, r, g, b);
+        // 한글은 그림자 투명도(alpha)를 그리지 않는다(쪽 그림·PDF 모두 불투명).
+        fill.setColor(SkColorSetARGB(255, r, g, b));
+        canvas->drawPath(shape, fill);
+    };
+    if (!shadow.empty()) fillWith(build(shadow), obj.artShadowColor.empty() ? "#000000" : obj.artShadowColor);
+    const SkPath shape = build(outline);
+    fillWith(shape, node.ext().fillColor);
+    const BorderEdge& edge = node.ext().borderLeft;
+    if (!edge.type.empty() && edge.type != "NONE" && edge.width > 0) {
+        SkPaint stroke;
+        stroke.setAntiAlias(true);
+        stroke.setStyle(SkPaint::kStroke_Style);
+        stroke.setStrokeWidth(std::max(1.f, static_cast<float>(edge.width) * scale));
+        std::uint8_t sr = 0, sg = 0, sb = 0;
+        parseHex(edge.color.empty() ? "#000000" : edge.color, sr, sg, sb);
+        stroke.setColor(SkColorSetARGB(255, sr, sg, sb));
+        canvas->drawPath(shape, stroke);
+    }
+}
+
 void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
     const PaintLayer place = objectPlace(node);
+    if (node.ext().obj().shapeType == "textart") {
+        if (show(place)) textArt(node, x, y, place);
+        return;
+    }
+    // 호: 채움은 개체 상자 전체, 선은 사분 타원이다(한글 2024 가 그린 PDF 와 같다).
+    if (node.ext().obj().shapeType == "arc" && node.ext().obj().points.size() >= 3) {
+        if (show(place) && !node.ext().fillColor.empty() && node.ext().fillColor != "none") {
+            std::uint8_t fr, fg, fb;
+            parseHex(node.ext().fillColor, fr, fg, fb);
+            fillRect(bitmap, px(x), px(y), std::max(1, px(x + node.width) - px(x)), std::max(1, px(y + node.height) - px(y)),
+                     fr, fg, fb);
+        }
+        Node outline = node;
+        outline.extMut().fillColor.clear();
+        drawPoints(outline, hangulArcPoints(node.ext().obj().points), x, y, place);
+        return;
+    }
     if (node.ext().obj().shapeType == "ellipse" || node.ext().obj().shapeType == "arc") {
         ellipseBox(x, y, node.width, node.height, node.ext().fillColor, node.ext().borderLeft, place);
         return;

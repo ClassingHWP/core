@@ -96,7 +96,7 @@ int shownStory(const model::Document& doc, const std::vector<Node>& pages, const
 
 }  // namespace
 
-// 각주↔미주 바꾸기(한글 2024 ExchangeFootnoteEndnote, 한글 2024 에서 확인). mode 0 모든 각주를 미주로,
+// 각주↔미주 바꾸기(한글 2024 ExchangeFootnoteEndnote, 숨긴 한글 COM 으로 확인). mode 0 모든 각주를 미주로,
 // 1 모든 미주를 각주로, 2 서로 바꾸기. 바꾼 주는 종류(fn·en), 안 글의 번호 종류(FOOTNOTE·ENDNOTE), 그리고 안 글 문단이
 // 각주 스타일이면 미주 스타일로(거꾸로도) 바뀐다. 문단·글자 모양은 그대로다. 번호는 문서 차례로 다시 센다.
 EditResult exchangeNotesNow(model::Document& doc, std::vector<Node>& pages, int mode, bool useStoredLineHeight,

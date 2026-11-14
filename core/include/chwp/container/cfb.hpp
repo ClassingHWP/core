@@ -79,4 +79,7 @@ private:
     std::vector<StreamItem> streams_;
 };
 
+// 한글 OLE 묶음(앞 4 바이트 길이 + 복합 파일, 또는 복합 파일)에서 스트림 하나를 읽는다. 없으면 거짓.
+bool readOleStream(ByteView ole, std::string_view name, Bytes& out);
+
 }  // namespace chwp::cfb

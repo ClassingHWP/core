@@ -333,7 +333,9 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 | `sortParagraphs` | `range`, `set.key1Position`·`key1Format`·`key1Desc`·`delimiter` … | 본문 정렬 |
 | `deleteMarks` | `range`, `set.marks`(지울 조판 부호 이름, 줄로 나눔) | 조판 부호 지우기 |
 | `copyShape` | `at`(가져올 자리), `range`(입힐 블록), `type`(0 글자, 1 문단, 2 둘 다, 4 스타일) | 모양 복사 |
-| `insertShape` | `page`, `tool`(`rect`·`ellipse`·`line`·`textBox`·`verticalTextBox`), `x`·`y`·`width`·`height`(HU 또는 `"30mm"`), `text` | 종이 좌표에 도형을 그린다(글 앞, 종이 기준). 응답 op 의 `object` 가 새 개체 이름이다. 선은 (x, y)→(x+width, y+height) |
+| `insertShape` | `page`, `tool`(`rect`·`ellipse`·`line`·`textBox`·`verticalTextBox`·`arc`·`polygon`·`curve`·`freeDrawing`), 상자 도형은 `x`·`y`·`width`·`height`(HU 또는 `"30mm"`), 점 도형(`polygon`·`curve`·`freeDrawing`)은 `points`(`"x,y x,y ..."` 종이 좌표 HU), `text` | 종이 좌표에 도형을 그린다(글 앞, 종이 기준, 선 검정 0.12mm). 응답 op 의 `object` 가 새 개체 이름이다. 선은 (x, y)→(x+width, y+height). `arc` 는 상자 왼쪽 위가 중심인 사분 호, `polygon` 은 점 3개 이상(흰 채움), `curve` 는 점 2개 이상을 잇는 곡선(흰 채움), `freeDrawing` 은 채우지 않은 꺾은선이다 |
+| `insertEquation` | `at`, `script`(한글 수식 스크립트), `size`(pt, 기본 10) | 수식을 **글자처럼** 넣는다(`at` 자리에 `￼` 한 글자). 상자 크기·기준선은 한글 수식 엔진과 같게 잰 값이다. 응답 `object` 가 새 수식 이름이다. 스크립트 예: `x = {-b +- sqrt {b^2 - 4ac}} over {2a}`, `sum _{k=1} ^{n} k^2`, `lim _{x -> 0} {sin x} over x` |
+| `equation` | `object`, `script`, `size`(pt, 주지 않으면 그대로) | 수식을 고친다. `view` 로 지금 `script`·`size` 를 읽는다 |
 | `objectProperties` | `object`, `set` | 개체 놓기·크기. 값의 뜻과 예는 「개체 놓기」(`paragraph` 의 `placement` 이름: `treatAsChar`, `textWrap`, `textFlow`, `vertRelTo`, `horzRelTo`, `vertAlign`, `horzAlign`, `vertOffset`, `horzOffset`, `width`, `height`, `zOrder`, `flowWithText`, `allowOverlap`, 바깥 여백 `marginLeft`·`marginRight`·`marginTop`·`marginBottom`. HU). 크기는 손잡이 크기 조절과 같다(표는 칸·줄을 비율대로) |
 | `deleteObject` | `object` | 개체를 지운다(표면 칸 글까지) |
 
@@ -417,3 +419,5 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 ### save
 `{"call":"save","path":"out/고친본.hwpx","format":"hwpx"}` → `{"file":"...","format":"hwpx","bytes":12345}`.
 `format` 이 없으면 확장자, 그것도 없으면 연 형식이다. CLI 의 `--save 경로` 는 마지막에 이 요청을 하나 더 부른다.
+PDF 로도 쓴다: `{"call":"save","path":"out/고친본.pdf","dpi":200}`(또는 `"format":"pdf"`). 편집기의 인쇄·PDF 로 저장과 같이
+쪽마다 `dpi`(72~600, 기본 200)로 그린 그림을 종이 크기에 채운다(글은 그림이라 PDF 에서 고르거나 찾을 수 없다).

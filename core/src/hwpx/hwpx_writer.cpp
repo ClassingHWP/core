@@ -6,10 +6,13 @@
 #include <cstdio>
 #include <cstring>
 #include <pugixml.hpp>
+#include <random>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
+#include "chwp/common/crypto.hpp"
+#include "chwp/container/cfb.hpp"
 #include "chwp/container/zip.hpp"
 #include "chwp/model/table_formula.hpp"
 #include "chwp/model/memo.hpp"
@@ -132,7 +135,8 @@ const char* toHwpxFieldType(std::string_view ctrlId) {
     if (ctrlId == "%%me") return "MEMO";
     if (ctrlId == "%smr") return "SUMMERY";  // 한글 2024 가 쓰는 철자 그대로(SUMMARY 가 아니다)
     if (ctrlId == "%usr") return "USER_INFO";
-    return "HYPERLINK";
+    if (ctrlId == "%toc") return "TABLEOFCONTENTS";
+    return nullptr;
 }
 
 // BinItem 매핑 도우미: HWP("1", "2"...) 및 HWPX("image1"...) 모두 일관된 HWPX manifest id 로 매핑.
@@ -143,6 +147,8 @@ struct BinRegistry {
         std::string mediaType;
         std::string ext;
         bool embedded = true;
+        // OLE 처럼 묶음 안에 있지만 한글이 isEmbeded="0" 으로 적는 항목(STORAGE).
+        bool storage = false;
         Bytes data;
     };
 
@@ -201,6 +207,7 @@ BinRegistry buildBinRegistry(const Document& doc, ByteView sourceData) {
         }
         e.mediaType = guessMediaType(e.ext, item.mediaType);
         e.embedded = item.storage != "LINK";
+        e.storage = item.storage == "STORAGE";
 
         if (!item.data.empty()) {
             e.data = item.data;
@@ -649,6 +656,33 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
         }
     }
 
+    // 10. 변경 추적 기록·작성자(한글 2024 와 같은 자리: refList 끝). 기록 중 여부는 head 의 trackchageConfig.
+    if (!h.trackChanges.empty()) {
+        auto list = refList.append_child("hh:trackChanges");
+        list.append_attribute("itemCnt") = static_cast<unsigned>(h.trackChanges.size());
+        for (const TrackChange& tc : h.trackChanges) {
+            auto n = list.append_child("hh:trackChange");
+            n.append_attribute("type") = tc.type.c_str();
+            n.append_attribute("date") = tc.date.c_str();
+            n.append_attribute("authorID") = tc.authorId;
+            n.append_attribute("hide") = tc.hide ? 1 : 0;
+            n.append_attribute("id") = tc.id;
+            if (tc.charShapeId) n.append_attribute("charshapeID") = *tc.charShapeId;
+            if (tc.paraShapeId) n.append_attribute("parashapeID") = *tc.paraShapeId;
+        }
+    }
+    if (!h.trackAuthors.empty()) {
+        auto list = refList.append_child("hh:trackChangeAuthors");
+        list.append_attribute("itemCnt") = static_cast<unsigned>(h.trackAuthors.size());
+        for (const TrackAuthor& a : h.trackAuthors) {
+            auto n = list.append_child("hh:trackChangeAuthor");
+            n.append_attribute("name") = a.name.c_str();
+            n.append_attribute("mark") = a.mark ? 1 : 0;
+            n.append_attribute("id") = a.id;
+        }
+    }
+    head.append_child("hh:trackchageConfig").append_attribute("flags") = h.trackConfigFlags;
+
     return serializeXml(xml);
 }
 
@@ -686,7 +720,7 @@ void writeSubListNode(pugi::xml_node parent, const SubList& sub, const BinRegist
 void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinRegistry& bins,
                          std::uint32_t defaultId, bool grouped = false) {
     const Placement p = ctrl.placement.value_or(Placement{});
-    objNode.append_attribute("id") = defaultId;
+    objNode.append_attribute("id") = p.instanceId != 0 ? p.instanceId : defaultId;
     objNode.append_attribute("zOrder") = p.zOrder;
     objNode.append_attribute("numberingType") = objectNumberingType(ctrl.kind, p.numberingType);
     if (!grouped || !p.textWrap.empty()) {
@@ -1046,7 +1080,155 @@ void writeShapeGeometryAndCommon(pugi::xml_node node, const Control& ctrl, const
     writeMat("hc:rotMatrix", {1.0, 0.0, 0.0, 0.0, 1.0, 0.0});
 }
 
+// 보관한 개체의 딸린 묶음 항목(차트 XML). write 가 비우고 마지막에 묶음에 담는다.
+thread_local std::vector<std::pair<std::string, Bytes>> gKeptParts;
+
+bool isKeptObjectName(std::string_view name) {
+    static const std::string_view names[] = {"hp:ole", "hp:chart", "hp:video", "hp:textart"};
+    for (auto n : names) {
+        if (n == name) return true;
+    }
+    return false;
+}
+
+// 보관한 원본 XML 의 개체 하나에 지금 위치·크기를 적는다.
+void patchKeptPlacement(pugi::xml_node obj, const Control& ctrl, bool grouped) {
+    if (!ctrl.placement) return;
+    const Placement& p = *ctrl.placement;
+    const auto set = [](pugi::xml_node node, const char* name, auto value) {
+        if (!node) return;
+        pugi::xml_attribute attr = node.attribute(name);
+        if (!attr) attr = node.append_attribute(name);
+        attr = value;
+    };
+    set(obj, "zOrder", p.zOrder);
+    if (!p.textWrap.empty()) set(obj, "textWrap", p.textWrap.c_str());
+    if (!p.textFlow.empty()) set(obj, "textFlow", p.textFlow.c_str());
+    if (pugi::xml_node sz = obj.child("hp:sz")) {
+        set(sz, "width", p.width);
+        set(sz, "height", p.height);
+    }
+    // 크기를 바꿨으면 현재 크기와 늘림 행렬도 같이 바꾼다(한글은 처음 크기 × 늘림 = 현재 크기로 그린다).
+    pugi::xml_node org = obj.child("hp:orgSz");
+    pugi::xml_node cur = obj.child("hp:curSz");
+    if (cur && cur.attribute("width").as_int() != 0) {
+        set(cur, "width", p.width);
+        set(cur, "height", p.height);
+        const int orgW = org.attribute("width").as_int();
+        const int orgH = org.attribute("height").as_int();
+        if (pugi::xml_node sca = obj.child("hp:renderingInfo").child("hc:scaMatrix"); sca && orgW > 0 && orgH > 0) {
+            set(sca, "e1", static_cast<double>(p.width) / orgW);
+            set(sca, "e5", static_cast<double>(p.height) / orgH);
+        }
+    }
+    if (!grouped) {
+        if (pugi::xml_node pos = obj.child("hp:pos")) {
+            set(pos, "treatAsChar", p.treatAsChar ? 1 : 0);
+            set(pos, "flowWithText", p.flowWithText ? 1 : 0);
+            set(pos, "allowOverlap", p.allowOverlap ? 1 : 0);
+            if (!p.vertRelTo.empty()) set(pos, "vertRelTo", p.vertRelTo.c_str());
+            if (!p.horzRelTo.empty()) set(pos, "horzRelTo", p.horzRelTo.c_str());
+            if (!p.vertAlign.empty()) set(pos, "vertAlign", p.vertAlign.c_str());
+            if (!p.horzAlign.empty()) set(pos, "horzAlign", p.horzAlign.c_str());
+            set(pos, "vertOffset", p.vertOffset);
+            set(pos, "horzOffset", p.horzOffset);
+        }
+    }
+    if (pugi::xml_node out = obj.child("hp:outMargin")) {
+        set(out, "left", p.marginLeft);
+        set(out, "right", p.marginRight);
+        set(out, "top", p.marginTop);
+        set(out, "bottom", p.marginBottom);
+    }
+}
+
+// HWPX 에서 읽어 보관한 개체(차트·동영상·OLE·글맵시)를 원본 XML 로 쓴다. 위치·크기와 묶음 id 만 지금 값으로 고친다.
+bool writeKeptObject(pugi::xml_node parent, const Control& ctrl, const BinRegistry& bins, int groupLevel) {
+    pugi::xml_document kept;
+    if (!kept.load_buffer(ctrl.hwpxXml.data(), ctrl.hwpxXml.size(), pugi::parse_default | pugi::parse_ws_pcdata,
+                          pugi::encoding_utf8)) {
+        return false;
+    }
+    pugi::xml_node root = kept.document_element();
+    if (!root) return false;
+    // 모든 요소의 묶음 id 를 고치고, 개체 요소(맨 위 개체, 또는 hp:switch 가지의 개체)에 위치·크기를 적는다.
+    const auto visit = [&](auto& self, pugi::xml_node node) -> void {
+        for (const char* ref : {"binaryItemIDRef", "fileIDRef", "imageIDRef"}) {
+            if (pugi::xml_attribute attr = node.attribute(ref); attr && *attr.value() != 0) {
+                attr = bins.resolveId(attr.value()).c_str();
+            }
+        }
+        if (pugi::xml_attribute chart = node.attribute("chartIDRef")) {
+            const std::string from = chart.value();
+            for (const auto& [path, bytes] : ctrl.hwpxParts) {
+                if (path != from) continue;
+                const std::string to = "Chart/chart" + std::to_string(gKeptParts.size() + 1) + ".xml";
+                gKeptParts.emplace_back(to, bytes);
+                chart = to.c_str();
+                break;
+            }
+        }
+        const std::string_view up = node.parent() ? std::string_view(node.parent().name()) : std::string_view();
+        if (isKeptObjectName(node.name()) && (node == root || up == "hp:case" || up == "hp:default")) {
+            patchKeptPlacement(node, ctrl, groupLevel > 0);
+        }
+        for (pugi::xml_node child : node.children()) {
+            if (child.type() == pugi::node_element) self(self, child);
+        }
+    };
+    visit(visit, root);
+    parent.append_copy(root);
+    return true;
+}
+
+// 테두리 없음(한글이 OLE 에 쓰는 선 모양).
+void writeNoLineShape(pugi::xml_node node) {
+    auto ls = node.append_child("hp:lineShape");
+    ls.append_attribute("color") = "#000000";
+    ls.append_attribute("width") = 0;
+    ls.append_attribute("style") = "NONE";
+    ls.append_attribute("endCap") = "ROUND";
+    ls.append_attribute("headStyle") = "NORMAL";
+    ls.append_attribute("tailStyle") = "NORMAL";
+    ls.append_attribute("headfill") = 0;
+    ls.append_attribute("tailfill") = 0;
+    ls.append_attribute("headSz") = "SMALL_SMALL";
+    ls.append_attribute("tailSz") = "SMALL_SMALL";
+    ls.append_attribute("outlineStyle") = "NORMAL";
+    ls.append_attribute("alpha") = 0;
+}
+
+// OLE(한글 2024 hp:ole 꼴): 공통 속성·모양 뒤 objectType·binaryItemIDRef·hasMoniker·drawAspect·eqBaseLine,
+// 자식은 hc:extent 와 선 모양.
+void writeOleNode(pugi::xml_node parent, const Control& ctrl, const BinRegistry& bins, int groupLevel) {
+    const OleInfo ole = ctrl.ole.value_or(OleInfo{});
+    auto node = parent.append_child("hp:ole");
+    writeShapeGeometryAndCommon(node, ctrl, bins, groupLevel);
+    node.append_attribute("objectType") = ole.objectType.c_str();
+    node.append_attribute("binaryItemIDRef") = bins.resolveId(ctrl.binItemId).c_str();
+    node.append_attribute("hasMoniker") = ole.hasMoniker ? 1 : 0;
+    node.append_attribute("drawAspect") = ole.drawAspect.c_str();
+    node.append_attribute("eqBaseLine") = ole.eqBaseLine;
+    const Placement p = ctrl.placement.value_or(Placement{});
+    auto extent = node.append_child("hc:extent");
+    extent.append_attribute("x") = ole.extentX > 0 ? ole.extentX : static_cast<std::int32_t>(p.width);
+    extent.append_attribute("y") = ole.extentY > 0 ? ole.extentY : static_cast<std::int32_t>(p.height);
+    writeNoLineShape(node);
+}
+
+// 동영상(한글 2024 hp:video 꼴): videotype·fileIDRef(동영상)·imageIDRef(첫 장면)·tag.
+void writeVideoNode(pugi::xml_node parent, const Control& ctrl, const BinRegistry& bins, int groupLevel) {
+    const VideoInfo video = ctrl.video.value_or(VideoInfo{});
+    auto node = parent.append_child("hp:video");
+    writeShapeGeometryAndCommon(node, ctrl, bins, groupLevel);
+    node.append_attribute("videotype") = video.type.c_str();
+    if (video.type != "Web") node.append_attribute("fileIDRef") = bins.resolveId(video.fileBinId).c_str();
+    node.append_attribute("imageIDRef") = bins.resolveId(ctrl.binItemId).c_str();
+    node.append_attribute("tag") = video.tag.c_str();
+}
+
 void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegistry& bins, int groupLevel) {
+    if (!ctrl.hwpxXml.empty() && writeKeptObject(parent, ctrl, bins, groupLevel)) return;
     if (ctrl.kind == ControlKind::Table) {
         writeTableNode(parent, ctrl, bins);
         return;
@@ -1142,9 +1324,38 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
     }
 
     // Container / Ole / Shape
+    // HWP 에서 온 차트(OLE 안에 OOXMLChartContents 가 든 것)는 한글처럼 hp:switch 로 쓴다:
+    // hp:case(ooxmlchart) 의 hp:chart(크기·위치만, chartIDRef 는 차트 XML) + hp:default 의 hp:ole(그 OLE).
+    if (ctrl.kind == ControlKind::Ole && !ctrl.binItemId.empty() && groupLevel == 0) {
+        const std::string id = bins.resolveId(ctrl.binItemId);
+        for (const auto& entry : bins.entries) {
+            if (entry.id != id) continue;
+            Bytes chartXml;
+            if (!cfb::readOleStream(entry.data, "OOXMLChartContents", chartXml) || chartXml.empty()) break;
+            const std::string path = "Chart/chart" + std::to_string(gKeptParts.size() + 1) + ".xml";
+            gKeptParts.emplace_back(path, std::move(chartXml));
+            auto sw = parent.append_child("hp:switch");
+            auto cs = sw.append_child("hp:case");
+            cs.append_attribute("hp:required-namespace") = "http://www.hancom.co.kr/hwpml/2016/ooxmlchart";
+            auto chart = cs.append_child("hp:chart");
+            writePlacementNodes(chart, ctrl, bins, 1732656412u, false);
+            chart.append_attribute("chartIDRef") = path.c_str();
+            Control fallback = ctrl;
+            fallback.hwpxXml.clear();
+            writeOleNode(sw.append_child("hp:default"), fallback, bins, groupLevel);
+            return;
+        }
+    }
+    if (ctrl.kind == ControlKind::Ole) {
+        writeOleNode(parent, ctrl, bins, groupLevel);
+        return;
+    }
+    if (ctrl.video) {
+        writeVideoNode(parent, ctrl, bins, groupLevel);
+        return;
+    }
     std::string tag = "hp:rect";
     if (ctrl.kind == ControlKind::Container || ctrl.shapeType == "container") tag = "hp:container";
-    else if (ctrl.kind == ControlKind::Ole || ctrl.shapeType == "ole") tag = "hp:ole";
     else if (ctrl.shapeType == "ellipse") tag = "hp:ellipse";
     else if (ctrl.shapeType == "line") tag = "hp:line";
     else if (ctrl.shapeType == "arc") tag = "hp:arc";
@@ -1164,6 +1375,8 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
         node.append_attribute("arcType") = "NORMAL";
     } else if (tag == "hp:arc") {
         node.append_attribute("type") = "NORMAL";
+    } else if (tag == "hp:textart") {
+        node.append_attribute("text") = ctrl.text.c_str();
     }
 
     if (ctrl.kind != ControlKind::Container && ctrl.shapeType != "container") {
@@ -1226,6 +1439,40 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
         return ptVal;
     };
 
+    if (tag == "hp:textart") {
+        const TextArt art = ctrl.textArt.value_or(TextArt{});
+        auto shadow = node.append_child("hp:shadow");
+        shadow.append_attribute("type") = "NONE";
+        shadow.append_attribute("color") = "#B2B2B2";
+        shadow.append_attribute("offsetX") = 0;
+        shadow.append_attribute("offsetY") = 0;
+        shadow.append_attribute("alpha") = 0;
+        const bool noCorners = std::all_of(art.corners.begin(), art.corners.end(),
+                                           [](const ShapePoint& pt) { return pt.x == 0 && pt.y == 0; });
+        const ShapePoint fallback[4] = {{0, 0}, {orgW, 0}, {orgW, orgH}, {0, orgH}};
+        for (int k = 0; k < 4; ++k) {
+            const std::string ptName = "hc:pt" + std::to_string(k);
+            const ShapePoint pt = noCorners ? fallback[k] : art.corners[static_cast<std::size_t>(k)];
+            auto ptNode = node.append_child(ptName.c_str());
+            ptNode.append_attribute("x") = pt.x;
+            ptNode.append_attribute("y") = pt.y;
+        }
+        auto pr = node.append_child("hp:textartPr");
+        pr.append_attribute("fontName") = art.fontName.c_str();
+        pr.append_attribute("fontStyle") = art.fontStyle.c_str();
+        pr.append_attribute("fontType") = art.fontType.c_str();
+        const std::string shapeName = !art.shape.empty() ? art.shape : textArtShapeName(art.shapeNumber);
+        pr.append_attribute("textShape") = shapeName.empty() ? "RECTANGLE" : shapeName.c_str();
+        pr.append_attribute("lineSpacing") = art.lineSpacing;
+        pr.append_attribute("charSpacing") = art.charSpacing;
+        pr.append_attribute("align") = art.align.c_str();
+        auto artShadow = pr.append_child("hp:shadow");
+        artShadow.append_attribute("type") = art.shadowType.c_str();
+        artShadow.append_attribute("color") = art.shadowColor.c_str();
+        artShadow.append_attribute("offsetX") = art.shadowX;
+        artShadow.append_attribute("offsetY") = art.shadowY;
+        artShadow.append_attribute("alpha") = art.shadowAlpha;
+    }
     if (tag == "hp:rect") {
         const std::pair<const char*, ShapePoint> corners[4] = {
             {"hc:pt0", {0, 0}},
@@ -1265,7 +1512,9 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
         };
         if (ctrl.points.size() >= 3) {
             const char* tags[] = {"hc:center", "hc:ax1", "hc:ax2", "hc:start1", "hc:end1", "hc:start2", "hc:end2"};
-            for (int i = 0; i < 7; ++i) {
+            // 호는 중심과 두 축 끝뿐이다(한글 2024 가 쓰는 hp:arc).
+            const int count = tag == "hp:arc" ? 3 : 7;
+            for (int i = 0; i < count; ++i) {
                 const ShapePoint pt = i < static_cast<int>(ctrl.points.size()) ? transformPt(ctrl.points[static_cast<std::size_t>(i)])
                                                                                 : ShapePoint{0, 0};
                 addPt(tags[i], pt.x, pt.y);
@@ -1440,7 +1689,10 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
             const std::uint32_t fieldId = memo && memoId != gFieldIds.memoId.end() ? memoId->second : gFieldIds.next++;
             gFieldIds.open.push_back(fieldId);
             fb.append_attribute("id") = fieldId;
-            fb.append_attribute("type") = toHwpxFieldType(ctrl.ctrlId);
+            // 모르는 필드는 읽은 이름 그대로 쓴다. 이름도 없으면(HWP 에서 온 모르는 필드) 예전처럼 HYPERLINK 다.
+            const char* fieldType = toHwpxFieldType(ctrl.ctrlId);
+            fb.append_attribute("type") =
+                fieldType ? fieldType : (!ctrl.fieldType.empty() ? ctrl.fieldType.c_str() : "HYPERLINK");
             fb.append_attribute("name") = ctrl.name.c_str();
             if (ctrl.fieldProps & 1u) fb.append_attribute("editable") = "1";
             if (ctrl.fieldProps & 0x8000u) fb.append_attribute("dirty") = "1";
@@ -1476,11 +1728,20 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
                 // 한글 2024 교정 부호: zorder 는 차례 번호(%sig 는 -1), fieldid 는 id 네 글자의 정수, Prop 은 늘 둔다.
                 fb.append_attribute("zorder") = ctrl.memoNumber > 0 ? static_cast<int>(ctrl.memoNumber) : -1;
                 fb.append_attribute("fieldid") = ctrlIdNumber(ctrl.ctrlId);
+            } else if (ctrl.ctrlId == "%clk") {
+                // 한글 2024 누름틀: 고친 표시를 늘 적고(손대지 않았으면 0 — 안의 글은 안내문이다), zorder -1, fieldid 는 %clk.
+                if (!(ctrl.fieldProps & 0x8000u)) fb.append_attribute("dirty") = "0";
+                fb.append_attribute("zorder") = -1;
+                fb.append_attribute("fieldid") = ctrlIdNumber(ctrl.ctrlId);
             }
             auto params = fb.append_child("hp:parameters");
+            params.append_attribute("cnt") = 0;
+            params.append_attribute("name") = "";
             const auto stringParam = [&](const char* name, const std::string& value) {
                 auto sp = params.append_child("hp:stringParam");
                 sp.append_attribute("name") = name;
+                // 명령 끝 빈칸이 뜻을 가진다(누름틀 "...:  "). 한글처럼 공백을 지키라고 적는다.
+                if (std::string_view(name) == "Command") sp.append_attribute("xml:space") = "preserve";
                 sp.text().set(value.c_str());
             };
             if (ctrl.fieldExtra != 0 || proof) {
@@ -1489,6 +1750,7 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
                 ip.text().set(static_cast<unsigned>(ctrl.fieldExtra));
             }
             stringParam("Command", ctrl.command);
+            for (const auto& [name, value] : ctrl.fieldStrings) stringParam(name.c_str(), value);
             // 계산식은 한글처럼 명령을 나눈 식·결과 형식·마지막 결과도 둔다.
             // 형식이 없는 명령("식;결과")이면 한글처럼 명령 전체를 Formula 로 둔다.
             if (ctrl.ctrlId == "%fmu") {
@@ -1499,6 +1761,7 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
                     stringParam("LastResult", f.result);
                 }
             }
+            params.attribute("cnt") = static_cast<unsigned>(std::distance(params.children().begin(), params.children().end()));
             break;
         }
         case ControlKind::HiddenComment: {
@@ -1547,9 +1810,22 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
     }
 }
 
-void writeTextWithSpecials(pugi::xml_node runNode, std::string_view text) {
+// 변경 추적 표시(한글처럼 hp:t 안에 둔다). begin 이면 시작, 아니면 끝(paraend 0).
+void appendTrackMark(pugi::xml_node tNode, std::uint8_t track, std::uint32_t change, std::uint32_t mark, bool begin) {
+    const char* name = track == kTrackInsert ? (begin ? "hp:insertBegin" : "hp:insertEnd")
+                                             : (begin ? "hp:deleteBegin" : "hp:deleteEnd");
+    auto n = tNode.append_child(name);
+    n.append_attribute("Id") = mark;
+    n.append_attribute("TcId") = change;
+    if (!begin) n.append_attribute("paraend") = 0;
+}
+
+void writeTextWithSpecials(pugi::xml_node runNode, std::string_view text, std::uint32_t charStyle = kNoCharStyle,
+                           const InlineItem* openTrack = nullptr, const InlineItem* closeTrack = nullptr) {
     if (text.empty()) return;
     auto tNode = runNode.append_child("hp:t");
+    if (charStyle != kNoCharStyle) tNode.append_attribute("charStyleIDRef") = charStyle;
+    if (openTrack) appendTrackMark(tNode, openTrack->track, openTrack->trackChange, openTrack->trackMark, true);
     std::string chunk;
     auto flushChunk = [&]() {
         if (!chunk.empty()) {
@@ -1584,12 +1860,13 @@ void writeTextWithSpecials(pugi::xml_node runNode, std::string_view text) {
         }
     }
     flushChunk();
+    if (closeTrack) appendTrackMark(tNode, closeTrack->track, closeTrack->trackChange, closeTrack->trackMark, false);
 }
 
 void writeParagraphNode(pugi::xml_node parent, const Paragraph& para, const BinRegistry& bins,
                         const Section* firstParaSec, std::size_t masterPageBaseIdx) {
     auto pNode = parent.append_child("hp:p");
-    pNode.append_attribute("id") = 2147483648u;
+    pNode.append_attribute("id") = para.fileId != 0 ? para.fileId : 2147483648u;
     pNode.append_attribute("paraPrIDRef") = para.paraShapeId;
     pNode.append_attribute("styleIDRef") = para.styleId;
     pNode.append_attribute("pageBreak") = para.pageBreak ? 1 : 0;
@@ -1616,9 +1893,19 @@ void writeParagraphNode(pugi::xml_node parent, const Paragraph& para, const BinR
             secPrWritten = true;
         }
     } else {
+        // 변경 추적 쌍은 같은 (종류, 쌍 id) 가 이어지는 동안 하나다. 글 조각 안에 시작·끝을 넣고, 개체면 빈 hp:t 에 둔다.
+        std::vector<const InlineItem*> flat;
+        for (const auto& r : para.runs) {
+            for (const auto& it : r.items) flat.push_back(&it);
+        }
+        const auto sameTrack = [](const InlineItem* a, const InlineItem* b) {
+            return a && b && a->track == b->track && a->trackMark == b->trackMark && a->trackChange == b->trackChange;
+        };
+        std::size_t flatAt = 0;
         for (const auto& r : para.runs) {
             auto runNode = pNode.append_child("hp:run");
             runNode.append_attribute("charPrIDRef") = r.charShapeId;
+            if (r.charTrackChange != 0) runNode.append_attribute("charTcId") = r.charTrackChange;
             if (firstParaSec && !secPrWritten && !hasSecCtrlInPara) {
                 writeSecPrNode(runNode, nullptr, firstParaSec, masterPageBaseIdx);
                 secPrWritten = true;
@@ -1635,18 +1922,41 @@ void writeParagraphNode(pugi::xml_node parent, const Paragraph& para, const BinR
                     }
                     activeMarkpen = item.markpen;
                 }
-                if (item.type == InlineItem::Type::Text) {
-                    writeTextWithSpecials(runNode, item.text);
+                const InlineItem* prev = flatAt > 0 ? flat[flatAt - 1] : nullptr;
+                const InlineItem* next = flatAt + 1 < flat.size() ? flat[flatAt + 1] : nullptr;
+                ++flatAt;
+                const bool opens = item.track != 0 && !sameTrack(prev, &item);
+                const bool closes = item.track != 0 && !sameTrack(&item, next);
+                if (item.type == InlineItem::Type::Text && !item.text.empty()) {
+                    writeTextWithSpecials(runNode, item.text, item.charStyleId, opens ? &item : nullptr,
+                                          closes ? &item : nullptr);
                 } else {
+                    if (opens) appendTrackMark(runNode.append_child("hp:t"), item.track, item.trackChange, item.trackMark, true);
                     writeControlInRun(runNode, item.control, bins, firstParaSec, masterPageBaseIdx);
                     if (item.control.kind == ControlKind::SectionDef) {
                         secPrWritten = true;
                     }
+                    if (closes) appendTrackMark(runNode.append_child("hp:t"), item.track, item.trackChange, item.trackMark, false);
                 }
             }
             if (!activeMarkpen.empty()) {
                 runNode.append_child("hp:markpenEnd");
             }
+        }
+        // 문단 끝의 빈 쌍(넣거나 지운 문단 나누기).
+        if (para.endTrack.track != 0 && pNode.last_child()) {
+            pugi::xml_node lastRun = pNode.last_child();
+            // 한글처럼 마지막 hp:t 끝에 둔다. 따로 둔 hp:t 의 빈 쌍은 한글이 버린다.
+            pugi::xml_node tNode;
+            for (pugi::xml_node c = lastRun.last_child(); c; c = c.previous_sibling()) {
+                if (std::string_view(c.name()) == "hp:t") {
+                    tNode = c;
+                    break;
+                }
+            }
+            if (!tNode) tNode = lastRun.append_child("hp:t");
+            appendTrackMark(tNode, para.endTrack.track, para.endTrack.change, para.endTrack.mark, true);
+            appendTrackMark(tNode, para.endTrack.track, para.endTrack.change, para.endTrack.mark, false);
         }
     }
 
@@ -1774,7 +2084,7 @@ std::string writeContentHpfXml(const Document& doc, const BinRegistry& bins,
         addItem(mpId, "Contents/" + mpId + ".xml", "application/xml");
     }
     for (const auto& b : bins.entries) {
-        addItem(b.id, b.zipPath, b.mediaType, b.embedded);
+        addItem(b.id, b.zipPath, b.mediaType, b.embedded && !b.storage);
     }
     for (std::size_t i = 0; i < sectionCount; ++i) {
         const std::string secId = "section" + std::to_string(i);
@@ -1842,10 +2152,88 @@ std::string writeContainerXml() {
     return serializeXml(xml);
 }
 
-std::string writeManifestXml() {
+// 문서 암호로 잠근 항목 하나(manifest 의 file-entry).
+struct LockedEntry {
+    std::string path;
+    std::string mediaType;
+    std::size_t size = 0;
+    std::string checksum;  // base64
+};
+
+// 문서 암호가 있으면 한글 2024 처럼 본문 항목을 잠근다. 암호 UTF-8 의 SHA-256 을 PBKDF2-HMAC-SHA1(1024 번)로 늘린
+// 32 바이트 열쇠, 항목은 raw deflate 한 뒤 0 으로 16 바이트까지 채워 AES-256-CBC 로 감싸고 압축 없이 담는다.
+// 초기 벡터와 소금은 같은 16 바이트이고(한글), 검사합은 원문 앞 1 KiB 의 SHA-256 이다.
+struct Locker {
+    bool on = false;
+    Bytes key;
+    Bytes iv;
+    std::vector<LockedEntry> entries;
+
+    explicit Locker(const std::string& password) {
+        if (password.empty()) return;
+        std::random_device rd;
+        iv.resize(16);
+        for (auto& b : iv) b = static_cast<std::uint8_t>(rd() & 0xFF);
+        const auto start = crypto::sha256(
+            ByteView(reinterpret_cast<const std::uint8_t*>(password.data()), password.size()));
+        key = crypto::pbkdf2Sha1(start, iv, 1024, 32);
+        on = true;
+    }
+
+    // 잠그는 항목인가. 꾸러미 정보(mimetype·version.xml·META-INF·content.hpf)는 한글도 그대로 둔다.
+    static bool locks(std::string_view path) {
+        return path != "mimetype" && path != "version.xml" && path.rfind("META-INF/", 0) != 0 &&
+               path != "Contents/content.hpf";
+    }
+
+    bool add(zip::Writer& zw, const std::string& path, ByteView data, bool compress, const std::string& mediaType,
+             std::string* error) {
+        if (!on || !locks(path)) return zw.addFile(path, data, compress, error);
+        Bytes packed;
+        if (!zip::deflateRaw(data, packed)) {
+            if (error) *error = "failed to compress " + path;
+            return false;
+        }
+        packed.resize((packed.size() + 15) / 16 * 16, 0);
+        const crypto::Aes aes(key);
+        const Bytes sealed = crypto::aesCbcEncrypt(aes, iv, packed);
+        const auto sum = crypto::sha256(data.subspan(0, std::min<std::size_t>(data.size(), 1024)));
+        entries.push_back(LockedEntry{path, mediaType, data.size(), crypto::base64Encode(sum)});
+        return zw.addFile(path, sealed, false, error);
+    }
+
+    bool addText(zip::Writer& zw, const std::string& path, std::string_view text, const std::string& mediaType,
+                 std::string* error) {
+        return add(zw, path, ByteView(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()), true,
+                   mediaType, error);
+    }
+};
+
+std::string writeManifestXml(const Locker& locker) {
     pugi::xml_document xml;
     auto manifest = xml.append_child("odf:manifest");
     manifest.append_attribute("xmlns:odf") = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0";
+    const std::string iv = crypto::base64Encode(locker.iv);
+    for (const LockedEntry& e : locker.entries) {
+        auto entry = manifest.append_child("odf:file-entry");
+        entry.append_attribute("full-path") = e.path.c_str();
+        entry.append_attribute("media-type") = e.mediaType.c_str();
+        entry.append_attribute("size") = static_cast<unsigned long long>(e.size);
+        auto data = entry.append_child("odf:encryption-data");
+        data.append_attribute("checksum-type") = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#sha256-1k";
+        data.append_attribute("checksum") = e.checksum.c_str();
+        auto alg = data.append_child("odf:algorithm");
+        alg.append_attribute("algorithm-name") = "http://www.w3.org/2001/04/xmlenc#aes256-cbc";
+        alg.append_attribute("initialisation-vector") = iv.c_str();
+        auto kd = data.append_child("odf:key-derivation");
+        kd.append_attribute("key-derivation-name") = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#pbkdf2";
+        kd.append_attribute("key-size") = 32;
+        kd.append_attribute("iteration-count") = 1024;
+        kd.append_attribute("salt") = iv.c_str();
+        auto sk = data.append_child("odf:start-key-generation");
+        sk.append_attribute("start-key-generation-name") = "http://www.w3.org/2000/09/xmldsig#sha256";
+        sk.append_attribute("key-size") = 32;
+    }
     return serializeXml(xml);
 }
 
@@ -1876,7 +2264,14 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
     }
     gFieldIds.next = std::max<std::uint32_t>(nextMemoId, 1);
     out.clear();
+    if (doc.format.distribution) {
+        // 배포용 문서는 HWP 로만 배포용을 지킬 수 있다. HWPX 로 쓰면 복사·인쇄 막기와 잠금이 풀린다.
+        if (error) *error = "배포용 문서는 HWP 로만 저장할 수 있습니다.";
+        return false;
+    }
     zip::Writer zw;
+    Locker locker(doc.format.password);
+    gKeptParts.clear();
 
     // 1. mimetype 은 ZIP 첫 번째 엔트리로 비압축(STORED) 저장
     if (!zw.addText("mimetype", "application/hwp+zip", false, error)) return false;
@@ -1885,12 +2280,11 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
 
     // 2. version.xml, settings.xml, META-INF/*
     if (!zw.addText("version.xml", writeVersionXml(), true, error)) return false;
-    if (!zw.addText("settings.xml", writeSettingsXml(), true, error)) return false;
+    if (!locker.addText(zw, "settings.xml", writeSettingsXml(), "text/xml", error)) return false;
     if (!zw.addText("META-INF/container.xml", writeContainerXml(), true, error)) return false;
-    if (!zw.addText("META-INF/manifest.xml", writeManifestXml(), true, error)) return false;
 
     // 3. Contents/header.xml
-    if (!zw.addText("Contents/header.xml", writeHeaderXml(doc, bins), true, error)) return false;
+    if (!locker.addText(zw, "Contents/header.xml", writeHeaderXml(doc, bins), "application/xml", error)) return false;
 
     // 4. Contents/sectionN.xml 및 masterpageN.xml
     std::vector<Section> fallbackSections;
@@ -1904,13 +2298,13 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
     for (std::size_t i = 0; i < sectionsPtr->size(); ++i) {
         const auto& sec = (*sectionsPtr)[i];
         const std::string secPath = "Contents/section" + std::to_string(i) + ".xml";
-        if (!zw.addText(secPath, writeSectionXml(sec, bins, masterPageIdx), true, error)) {
+        if (!locker.addText(zw, secPath, writeSectionXml(sec, bins, masterPageIdx), "application/xml", error)) {
             return false;
         }
         for (const auto& mp : sec.masterPages) {
             const std::string mpPath =
                 "Contents/masterpage" + std::to_string(masterPageIdx) + ".xml";
-            if (!zw.addText(mpPath, writeMasterPageXml(mp, masterPageIdx, bins), true, error)) {
+            if (!locker.addText(zw, mpPath, writeMasterPageXml(mp, masterPageIdx, bins), "application/xml", error)) {
                 return false;
             }
             ++masterPageIdx;
@@ -1920,7 +2314,7 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
     // 5. BinData/*
     for (const auto& b : bins.entries) {
         if (!b.data.empty()) {
-            if (!zw.addFile(b.zipPath, b.data, true, error)) return false;
+            if (!locker.add(zw, b.zipPath, b.data, true, b.mediaType, error)) return false;
         }
     }
 
@@ -1937,8 +2331,16 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
             e.append_attribute("parentId") = m->memoParentId;
             replies = true;
         }
-        if (replies && !zw.addText("Contents/memoExtended.xml", serializeXml(extended), true, error)) return false;
+        if (replies && !locker.addText(zw, "Contents/memoExtended.xml", serializeXml(extended), "application/xml", error)) {
+            return false;
+        }
     }
+
+    // 보관한 개체의 딸린 항목(차트 XML). 한글은 이것을 manifest 에 적지 않고 개체가 경로로 가리킨다.
+    for (const auto& [path, bytes] : gKeptParts) {
+        if (!locker.add(zw, path, bytes, true, "application/xml", error)) return false;
+    }
+    gKeptParts.clear();
 
     // 6. Contents/content.hpf
     if (!zw.addText("Contents/content.hpf",
@@ -1948,7 +2350,10 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
     }
 
     // 7. Preview/PrvText.txt
-    if (!zw.addText("Preview/PrvText.txt", buildPreviewText(doc), true, error)) return false;
+    if (!locker.addText(zw, "Preview/PrvText.txt", buildPreviewText(doc), "text/xml", error)) return false;
+
+    // 8. META-INF/manifest.xml(잠근 항목의 암호 정보). 잠근 항목을 다 쓴 뒤에 만든다.
+    if (!zw.addText("META-INF/manifest.xml", writeManifestXml(locker), true, error)) return false;
 
     return zw.finalize(out, error);
 }

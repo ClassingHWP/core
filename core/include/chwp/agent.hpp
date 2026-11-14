@@ -427,6 +427,9 @@ public:
     // 지금 문서를 HWP 또는 HWPX 로 쓴다. 문서는 바뀌지 않는다.
     // 실패: BadArgument(형식이 Unknown), SaveFailed.
     Result<Bytes> save(model::SourceFormat format) const;
+    // 지금 문서를 PDF 로(편집기 인쇄·PDF 로 저장과 같다). 쪽마다 dpi(72~600, 기본 200)로 그린 그림을 종이 크기에 채운다.
+    // 실패: SaveFailed(쪽이 없거나 그리지 못함).
+    Result<Bytes> exportPdf(int dpi = 200);
 
     model::SourceFormat sourceFormat() const;
     // 저장할 형식. format 이 "hwp"/"hwpx" 면 그것, 비었으면 경로 끝(.hwp/.hwpx), 그것도 없으면 원래 형식(편집기 저장과 같다).

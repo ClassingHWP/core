@@ -326,13 +326,20 @@ bool sameSide(const model::BorderSide& a, const model::BorderSide& b) {
     return a.type == b.type && a.color == b.color && a.width == b.width;
 }
 
+// Empty and "none" both mean no face fill (Hangul writes "none", the format fields read it back as empty).
+bool sameFaceColor(const std::string& a, const std::string& b) {
+    const bool noA = a.empty() || a == "none";
+    const bool noB = b.empty() || b == "none";
+    return noA || noB ? noA == noB : a == b;
+}
+
 bool sameBorderFill(const model::BorderFill& a, const model::BorderFill& b) {
     return sameSide(a.left, b.left) && sameSide(a.right, b.right) && sameSide(a.top, b.top) &&
            sameSide(a.bottom, b.bottom) && sameSide(a.diagonal, b.diagonal) && a.slash.type == b.slash.type &&
            a.slash.crooked == b.slash.crooked && a.slash.counter == b.slash.counter &&
            a.backSlash.type == b.backSlash.type && a.backSlash.crooked == b.backSlash.crooked &&
            a.backSlash.counter == b.backSlash.counter && a.centerLine == b.centerLine &&
-           a.breakCellSeparateLine == b.breakCellSeparateLine && a.faceColor == b.faceColor &&
+           a.breakCellSeparateLine == b.breakCellSeparateLine && sameFaceColor(a.faceColor, b.faceColor) &&
            a.hatchStyle == b.hatchStyle && (a.hatchStyle.empty() || a.hatchColor == b.hatchColor) &&
            a.gradColor == b.gradColor && a.gradAngle == b.gradAngle && a.imageId == b.imageId &&
            a.imageMode == b.imageMode;
@@ -369,7 +376,10 @@ std::uint32_t applyFillFields(model::Document& doc, std::uint32_t current, const
             touched = true;
         }
     }
-    return touched ? internBorderFill(doc, fill) : current;
+    if (!touched) return current;
+    // 바뀐 것이 없으면 그 테두리/배경 그대로다(같은 모양의 다른 번호로 옮기지 않는다).
+    if (const model::BorderFill* have = borderFillById(doc, current); have && sameBorderFill(*have, fill)) return current;
+    return internBorderFill(doc, fill);
 }
 
 // 탭 목록 글. "위치,종류,채움;..." 이고 위치는 HWPUNIT 이다. 셸은 이 글을 나눠 목록으로 보인다.

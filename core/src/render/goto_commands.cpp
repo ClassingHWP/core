@@ -75,7 +75,7 @@ std::vector<BodyLine> bodyLines(const model::Document& doc, const std::vector<No
     return out;
 }
 
-// 한글 조판 부호 이름(한글 2024 찾아가기의 조판 부호 목록 글).
+// 한글 조판 부호 이름(Hwp.String 의 찾아가기·조판 부호 목록 글).
 const char* const kAllMarks = "[모든 조판 부호-탭,줄,문단 등 제외]";
 bool autoNumberOf(const model::Control& c, const char* numType) {
     return c.kind == model::ControlKind::AutoNumber && c.numType == numType;

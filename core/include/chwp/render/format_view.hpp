@@ -48,14 +48,15 @@ inline constexpr int kTableMaxCols = 64;
 inline constexpr int kTableStartRows = 5;
 inline constexpr int kTableStartCols = 5;
 
+// base 를 주면 글자·문단 값은 캐럿 대신 그 모양(스타일 대화 상자가 고치는 스타일 모양)에서 읽는다.
 // 대화 상자 칸 패치를 문서 값 이름으로 푼다. 칸 이름이 아닌 것은 버린다.
 FormatFields resolveFormatView(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                               const FormatFields& viewPatch);
+                               const FormatFields& viewPatch, const CaretPlace* base = nullptr);
 // 패치를 적용했을 때 대화 상자가 보일 값. 문서는 바꾸지 않는다.
 FormatView formatView(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                      const FormatFields& viewPatch);
+                      const FormatFields& viewPatch, const CaretPlace* base = nullptr);
 // 글자·문단 모양 미리보기. 패치를 적용한 글자·문단 모양으로 견본 글을 그린다.
 PageBitmap renderFormatPreview(const model::Document& doc, const std::vector<Node>& pages, FormatViewKind kind,
-                               const FormatFields& viewPatch, int width, int height);
+                               const FormatFields& viewPatch, int width, int height, const CaretPlace* base = nullptr);
 
 }  // namespace chwp::render

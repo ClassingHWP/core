@@ -3667,12 +3667,23 @@ EquationLayout finishLayout(Parser& parser) {
     return out;
 }
 
+// 이름별 수식 글꼴 폭 표. 글꼴이 아직 오지 않았으면 metricsFor 가 대체 글꼴 폭을 내므로 그 값이 이 이름으로 남는다.
+// 글꼴이 들어오면(clearGlyphWarm) 비운다.
+std::mutex& equationFontGate() {
+    static std::mutex gate;
+    return gate;
+}
+
+std::unordered_map<std::string, std::shared_ptr<EquationFont>>& equationFonts() {
+    static std::unordered_map<std::string, std::shared_ptr<EquationFont>> fonts;
+    return fonts;
+}
+
 std::shared_ptr<const EquationFont> cachedEquationFont(const std::string& face) {
     static const std::shared_ptr<const EquationFont> empty = std::make_shared<EquationFont>();
     if (face.empty()) return empty;
-    static std::mutex gate;
-    static std::unordered_map<std::string, std::shared_ptr<EquationFont>> fonts;
-    std::lock_guard lock(gate);
+    std::lock_guard lock(equationFontGate());
+    auto& fonts = equationFonts();
     if (const auto found = fonts.find(face); found != fonts.end()) return found->second;
     auto font = std::make_shared<EquationFont>();
     std::uint16_t units = 0;
@@ -3692,6 +3703,11 @@ std::shared_ptr<const EquationFont> cachedEquationFont(const std::string& face) 
 }
 
 }  // namespace
+
+void clearEquationFontCache() {
+    std::lock_guard lock(equationFontGate());
+    equationFonts().clear();
+}
 
 EquationSize measureHangulEquation(std::string_view script, std::int32_t baseUnit, const EquationFont& symbol,
                                    const EquationFont& roman) {

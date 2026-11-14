@@ -34,5 +34,7 @@ std::vector<std::string> lineMarkLabels(const model::Document& doc, const Node& 
 int transparentBorderPieces(const model::Document& doc, const Node& table);
 // 줄의 교정 부호 몫: "이름 x0 x1 머리 꼬리" 글(줄 x 기준 HU). 교정 부호 보기가 꺼져 있으면 비어 있다.
 std::vector<std::string> lineProofSpans(const model::Document& doc, const Node& line);
+// 줄의 메모 범위 상자: "x0 x1 top bottom 머리 꼬리 채우기 선" 글(줄 x·y 0 기준 HU). 메모 보이기를 끄면 비어 있다.
+std::vector<std::string> lineMemoSpans(const model::Document& doc, const Node& line);
 
 }  // namespace chwp::render

@@ -120,4 +120,33 @@ std::string ctrlIdToString(std::uint32_t id);
 // 스트림 압축 해제 (raw deflate)
 bool decompressStream(ByteView input, Bytes& out);
 
+// 배포용 문서(한글 문서 파일 형식 - 배포용 문서 1.2). 본문 스트림(ViewText/Section*)은 "배포용 문서 데이터"
+// 레코드(태그 28, 256 바이트, 암호화하지 않음)로 시작하고, 그 뒤는 (압축한) 레코드들을 AES-128 ECB 로 암호화한 것이다.
+// 데이터의 첫 4 바이트가 씨앗(seed)이고, MS Visual C rand() 로 만든 256 바이트 배열과 XOR 하면
+// (seed & 0x0F) + 4 자리에 80 바이트 해시 코드(첫 16 바이트가 열쇠)와 2 바이트 옵션(복사·인쇄 막기)이 나온다.
+inline constexpr std::uint16_t kDistributeNoCopy = 0x01;
+inline constexpr std::uint16_t kDistributeNoPrint = 0x02;
+struct DistributeInfo {
+    bool ok = false;
+    std::uint8_t key[16] = {};
+    std::uint16_t options = 0;
+};
+DistributeInfo decodeDistributeData(ByteView data256);
+// 스트림 하나를 푼다. head 를 주면 256 바이트 배포용 문서 데이터를 담는다.
+bool decryptDistributedStream(ByteView raw, bool compressed, Bytes& out, Bytes* head = nullptr,
+                              DistributeInfo* info = nullptr);
+// 레코드 바이트를 배포용 스트림으로 만든다(head 는 읽을 때 받은 256 바이트).
+bool encryptDistributedStream(ByteView records, bool compressed, ByteView head, Bytes& out);
+
+// 문서 암호(FileHeader 1 번 비트). 한글 2024 가 쓰는 방식이다: 암호를 UTF-16LE 로 바꾼 바이트를 7 바이트에 차례로
+// XOR 하고 왼쪽으로 1 비트 돌려 접은 뒤, 56 비트를 8 바이트 DES 열쇠(각 바이트 맨 아래 비트는 비움)로 편다.
+// 잠긴 스트림 = DES-ECB(평문) + 서명 38 A4 CE 59 + 평문의 CRC32(LE). 평문은 원래 내용을 raw deflate 해 0 으로 8 바이트까지
+// 채우고, 원래 내용의 CRC32 와 길이를 u64(LE)로 하나씩 붙인 것이다.
+// FileHeader·HwpSummaryInformation·DocOptions/_LinkDoc 는 잠그지 않는다. CRC 가 맞지 않으면 틀린 암호다.
+Bytes passwordKey(std::string_view password);
+bool isPasswordStream(ByteView raw);
+// 잠긴 스트림을 풀어 원래(압축 풀린) 내용을 준다. 틀린 암호면 거짓이다.
+bool decryptPasswordStream(ByteView raw, ByteView key, Bytes& out);
+bool encryptPasswordStream(ByteView content, ByteView key, Bytes& out);
+
 }  // namespace chwp::hwp

@@ -1,10 +1,12 @@
 set(_chwp_core_sources
     src/common/bytes.cpp
+    src/common/crypto.cpp
     src/common/unicode.cpp
     src/common/unit.cpp
     src/container/cfb.cpp
     src/container/zip.cpp
     src/model/document.cpp
+    src/model/default_header.cpp
     src/model/table_edit.cpp
     src/model/table_fill.cpp
     src/model/table_sort.cpp
@@ -24,6 +26,7 @@ set(_chwp_core_sources
     src/writer.cpp
     src/export/json.cpp
     src/export/text.cpp
+    src/export/pdf.cpp
     src/export/layout.cpp
     src/render/scene.cpp
     src/render/line_breaker.cpp
@@ -31,16 +34,23 @@ set(_chwp_core_sources
     src/render/table_commands.cpp
     src/render/page_commands.cpp
     src/render/note_commands.cpp
+    src/render/click_here_commands.cpp
     src/render/column_commands.cpp
     src/render/section_commands.cpp
+    src/render/style_commands.cpp
+    src/render/toc_commands.cpp
+    src/render/link_commands.cpp
+    src/render/track_commands.cpp
     src/render/table_props.cpp
     src/render/object_commands.cpp
+    src/render/equation_commands.cpp
     src/render/glyph_group.cpp
     src/render/glyph_group_commands.cpp
     src/render/text_convert.cpp
     src/render/goto_commands.cpp
     src/render/guides.cpp
     src/render/table_text.cpp
+    src/render/textart_layout.cpp
     src/render/sort_commands.cpp
     src/render/formula_commands.cpp
     src/render/edit_events.cpp
@@ -57,6 +67,7 @@ set(_chwp_core_sources
     src/render/painter_draw.cpp
     src/render/painter_proof.cpp
     src/render/picture.cpp
+    src/render/metafile_preview.cpp
     src/render/picture_upload.cpp
     src/render/border_mesh.cpp
     src/render/border_mesh_check.cpp

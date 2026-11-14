@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <ctime>
 
 namespace chwp::model {
 
@@ -193,6 +195,114 @@ void forEachParagraph(Document& doc, const std::function<void(Paragraph&)>& fn) 
         for (auto& master : section.masterPages) visitParagraphs(master.content.paragraphs, fn);
         visitParagraphs(section.paragraphs, fn);
     }
+}
+
+std::string trackDateFromLocal(int year, int month, int day, int hour, int minute) {
+    std::tm local{};
+    local.tm_year = year - 1900;
+    local.tm_mon = month - 1;
+    local.tm_mday = day;
+    local.tm_hour = hour;
+    local.tm_min = minute;
+    local.tm_isdst = -1;
+    const std::time_t t = std::mktime(&local);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &t);
+#else
+    gmtime_r(&t, &utc);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:00Z", utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                  utc.tm_hour, utc.tm_min);
+    return buf;
+}
+
+void trackDateToLocal(const std::string& iso, int& year, int& month, int& day, int& hour, int& minute) {
+    std::tm utc{};
+    int sec = 0;
+    if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &utc.tm_year, &utc.tm_mon, &utc.tm_mday, &utc.tm_hour, &utc.tm_min,
+                    &sec) < 5) {
+        year = month = day = hour = minute = 0;
+        return;
+    }
+    utc.tm_year -= 1900;
+    utc.tm_mon -= 1;
+#if defined(_WIN32)
+    const std::time_t t = _mkgmtime(&utc);
+    std::tm local{};
+    localtime_s(&local, &t);
+#else
+    const std::time_t t = timegm(&utc);
+    std::tm local{};
+    localtime_r(&t, &local);
+#endif
+    year = local.tm_year + 1900;
+    month = local.tm_mon + 1;
+    day = local.tm_mday;
+    hour = local.tm_hour;
+    minute = local.tm_min;
+}
+
+int objectNumber(const Document& doc, const Control* target) {
+    if (!target) return 1;
+    const bool autoNumber = target->kind == ControlKind::AutoNumber;
+    const std::string type = autoNumber ? target->numType
+                                        : std::string(objectNumberingType(
+                                              target->kind, target->placement ? target->placement->numberingType : ""));
+    if (type != "TABLE" && type != "PICTURE" && type != "EQUATION") return 1;
+    int value = 0;
+    int result = 0;
+    bool found = false;
+    // owner: 이 문단들이 type 범주 개체의 캡션이면 그 개체 번호, 아니면 -1.
+    std::function<void(const std::vector<Paragraph>&, int)> walk = [&](const std::vector<Paragraph>& paras, int owner) {
+        for (const Paragraph& para : paras) {
+            for (const Run& run : para.runs) {
+                for (const InlineItem& item : run.items) {
+                    if (found) return;
+                    if (item.type != InlineItem::Type::Control) continue;
+                    const Control& c = item.control;
+                    if (c.kind == ControlKind::AutoNumber && c.numType == type) {
+                        const int number = owner >= 0 ? owner : ++value;
+                        if (&c == target) {
+                            found = true;
+                            result = number;
+                            return;
+                        }
+                    } else if (c.kind == ControlKind::NewNumber && c.numType == type && c.number > 0) {
+                        value = static_cast<int>(c.number) - 1;
+                    }
+                    int mine = -1;
+                    if (c.placement && objectNumberingType(c.kind, c.placement->numberingType) == type) {
+                        mine = ++value;
+                        if (&c == target) {
+                            found = true;
+                            result = mine;
+                            return;
+                        }
+                    }
+                    if (c.caption) walk(c.caption->content.paragraphs, mine);
+                    if (c.table) {
+                        for (const auto& cell : c.table->cells) walk(cell.content.paragraphs, -1);
+                    }
+                    for (const auto& sub : c.subLists) walk(sub.paragraphs, -1);
+                    for (const auto& child : c.children) {
+                        for (const auto& sub : child.subLists) walk(sub.paragraphs, -1);
+                    }
+                }
+            }
+        }
+    };
+    for (const auto& section : doc.sections) {
+        if (found) break;
+        // 구역 설정의 개체 시작 번호(0 은 이어서).
+        const std::uint16_t start = type == "PICTURE" ? section.pictureStart
+                                    : type == "TABLE" ? section.tableStart
+                                                      : section.equationStart;
+        if (start > 0) value = static_cast<int>(start) - 1;
+        walk(section.paragraphs, -1);
+    }
+    return found ? std::max(1, result) : std::max<int>(1, static_cast<int>(target->number));
 }
 
 int ensureParagraphIds(Document& doc) {
@@ -471,6 +581,83 @@ int StoryMap::rootSectionParagraph(int story) const {
     return -1;
 }
 
+namespace {
+
+template <std::size_t N>
+const char* nameAt(const char* const (&names)[N], int code) {
+    return code >= 0 && code < static_cast<int>(N) ? names[code] : "";
+}
+
+template <std::size_t N>
+int codeOf(const char* const (&names)[N], const std::string& name, int fallback) {
+    for (std::size_t i = 0; i < N; ++i) {
+        if (name == names[i]) return static_cast<int>(i);
+    }
+    return fallback;
+}
+
+constexpr const char* kTextArtAligns[] = {"LEFT", "RIGHT", "CENTER", "FULL", "TABLE"};
+// 글맵시 그림자 종류. 한글 2024 는 HWP 번호를 그리기 개체 그림자 이름으로 HWPX 에 쓴다(1 이 PARELLEL_LEFTTOP).
+constexpr const char* kTextArtShadows[] = {"NONE",          "PARELLEL_LEFTTOP",  "PARELLEL_RIGHTTOP",
+                                           "PARELLEL_LEFTBOTTOM", "PARELLEL_RIGHTBOTTOM", "SHEAR_LEFTTOP",
+                                           "SHEAR_RIGHTTOP", "SHEAR_LEFTBOTTOM", "SHEAR_RIGHTBOTTOM"};
+constexpr const char* kOleTypes[] = {"UNKNOWN", "EMBEDDED", "LINK", "STATIC", "EQUATION"};
+
+}  // namespace
+
+const char* textArtAlignName(int code) {
+    const char* name = nameAt(kTextArtAligns, code);
+    return *name ? name : "LEFT";
+}
+int textArtAlignCode(const std::string& name) { return codeOf(kTextArtAligns, name, 0); }
+const char* textArtShadowName(int code) {
+    const char* name = nameAt(kTextArtShadows, code);
+    return *name ? name : "NONE";
+}
+int textArtShadowCode(const std::string& name) {
+    // 한글은 DROP(비연속)·CONTINUOUS(연속) 도 읽는다(1·2). 모르는 이름(ENLARGE 등)은 없음이다.
+    if (name == "DROP") return 1;
+    if (name == "CONTINUOUS") return 2;
+    return codeOf(kTextArtShadows, name, 0);
+}
+const char* oleObjectTypeName(int code) {
+    const char* name = nameAt(kOleTypes, code);
+    return *name ? name : "UNKNOWN";
+}
+int oleObjectTypeCode(const std::string& name) { return codeOf(kOleTypes, name, 0); }
+// 보이는 면(DVASPECT): 1 CONTENT, 2 THUMB_NAIL, 4 ICON, 8 DOC_PRINT.
+const char* oleAspectName(int code) {
+    switch (code) {
+        case 2: return "THUMB_NAIL";
+        case 4: return "ICON";
+        case 8: return "DOC_PRINT";
+        default: return "CONTENT";
+    }
+}
+int oleAspectCode(const std::string& name) {
+    if (name == "THUMB_NAIL") return 2;
+    if (name == "ICON") return 4;
+    if (name == "DOC_PRINT") return 8;
+    return 1;
+}
+
+// 글맵시 모양 번호 → textShape 이름. 번호가 자리다(한글 2024 로 HWPX 를 열어 HWP 로 저장해 쟀다).
+constexpr const char* kTextArtShapes[] = {
+    "PARALLELOGRAM", "INVERTED_PARALLELOGRAM", "INVERTED_UPWARD_CASCADE", "INVERTED_DOWNWARD_CASCADE",
+    "UPWARD_CASCADE", "DOWNWARD_CASCADE", "REDUCE_RIGHT", "REDUCE_LEFT", "ISOSCELES_TRAPEZOID",
+    "INVERTED_ISOSCELES_TRAPEZOID", "TOP_RIBBON_RECTANGLE", "BOTTOM_RIBBON_RECTANGLE", "CHEVRON_DOWN", "CHEVRON",
+    "BOW_TIE", "HEXAGON", "WAVE1", "WAVE2", "WAVE3", "WAVE4", "LEFT_TILT_CYLINDER", "RIGHT_TILT_CYLINDER",
+    "BOTTOM_WIDE_CYLINDER", "TOP_WIDE_CYLINDER", "THIN_CURVE_UP1", "THIN_CURVE_UP2", "THIN_CURVE_DOWN1",
+    "THIN_CURVE_DOWN2", "INVERSED_FINGERNAIL", "FINGERNAIL", "GINKO_LEAF1", "GINKO_LEAF2", "INFLATE_RIGHT",
+    "INFLATE_LEFT", "INFLATE_UP_CONVEX", "INFLATE_BOTTOM_CONVEX", "DEFLATE_TOP", "DEFLATE_BOTTOM", "DEFLATE",
+    "INFLATE", "INFLATE_TOP", "INFLATE_BOTTOM", "RECTANGLE", "LEFT_CYLINDER", "CYLINDER", "RIGHT_CYLINDER",
+    "CIRCLE", "CURVE_DOWN", "ARCH_UP", "ARCH_DOWN", "SINGLE_LINE_CIRCLE1", "SINGLE_LINE_CIRCLE2",
+    "TRIPLE_LINE_CIRCLE1", "TRIPLE_LINE_CIRCLE2", "DOUBLE_LINE_CIRCLE",
+};
+
+const char* textArtShapeName(int code) { return nameAt(kTextArtShapes, code); }
+int textArtShapeCode(const std::string& name) { return name.empty() ? -1 : codeOf(kTextArtShapes, name, -1); }
+
 Document blankDocument() {
     Document doc;
     doc.format.format = SourceFormat::Hwpx;
@@ -501,30 +688,7 @@ Document blankDocument() {
         doc.header.fonts[lang].push_back(std::move(batang));
     }
 
-    BorderFill emptyFill;
-    emptyFill.id = 1;
-    emptyFill.left.type = emptyFill.right.type = emptyFill.top.type = emptyFill.bottom.type = "NONE";
-    doc.header.borderFills.push_back(emptyFill);
-
-    CharShape shape;
-    shape.id = 0;
-    shape.height = 1000;
-    shape.fontRef.fill(1);
-    shape.textColor = 0x000000u;
-    doc.header.charShapes.push_back(shape);
-
-    ParaShape para;
-    para.id = 0;
-    para.align = "JUSTIFY";
-    para.lineSpacingType = "PERCENT";
-    para.lineSpacing = 160;
-    para.snapToGrid = true;
-    doc.header.paraShapes.push_back(para);
-
-    Style style;
-    style.id = 0;
-    style.name = "바탕글";
-    doc.header.styles.push_back(style);
+    addDefaultStyleHeader(doc);
 
     Section section;
     section.page = page;

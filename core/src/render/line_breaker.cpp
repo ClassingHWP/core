@@ -309,7 +309,7 @@ void BreakClassifier::classify(Atom& atom, const std::vector<Atom>& atoms) {
 void RunBuilder::add(const Atom& atom) {
     if (open_ && (size_ != atom.fontSize || shape_ != atom.charShapeId || font_ != atom.font || ratio_ != atom.ratio ||
                   spacing_ != atom.spacing || offset_ != atom.charOffset || rel_ != atom.relSize ||
-                  markpen_ != atom.markpen || synthetic_ != atom.synthetic)) {
+                  markpen_ != atom.markpen || track_ != atom.track || synthetic_ != atom.synthetic)) {
         flush();
     }
     if (!open_) {
@@ -323,6 +323,7 @@ void RunBuilder::add(const Atom& atom) {
         offset_ = atom.charOffset;
         spacing_ = atom.spacing;
         markpen_ = atom.markpen;
+        track_ = atom.track;
         synthetic_ = atom.synthetic;
     }
     if (keepAdvances_) {
@@ -343,7 +344,7 @@ void RunBuilder::flush() {
     run.textEnd = static_cast<std::uint16_t>(text_.size());
     for (const std::int32_t width : widths_) run.width += width;
     run.charShapeId = shape_;
-    run.style = runStyleOf(size_, font_, markpen_, std::string{}, ratio_, rel_, spacing_, offset_);
+    run.style = runStyleOf(size_, font_, markpen_, std::string{}, ratio_, rel_, spacing_, offset_, track_);
     appendLineRun(line_.glyphsMut(), run, widths_.data(), widths_.size(), inks_.data(), inks_.size());
     widths_.clear();
     inks_.clear();
@@ -357,7 +358,7 @@ void appendGlyphRun(Node& line, const Atom& atom, std::size_t textBegin, std::si
     run.width = atom.width;
     run.charShapeId = atom.charShapeId;
     run.style = runStyleOf(atom.fontSize, atom.font, atom.markpen, atom.tabLeader, atom.ratio, atom.relSize,
-                           atom.spacing, atom.charOffset);
+                           atom.spacing, atom.charOffset, atom.track);
     const std::int32_t ink = atom.width - atom.trail;
     appendLineRun(line.glyphsMut(), run, nullptr, 0, &ink, 1);
 }
@@ -851,7 +852,8 @@ Node singleAtomLine(const Document& doc, const Atom& atom, Node object) {
     run.kind = atom.cp == '\t' ? RunKind::Tab : RunKind::Text;
     run.textEnd = static_cast<std::uint16_t>(line.text().size());
     run.charShapeId = atom.charShapeId;
-    run.style = runStyleOf(line.fontSize, std::string{}, atom.markpen, atom.tabLeader, 100, 100, 0, atom.charOffset);
+    run.style = runStyleOf(line.fontSize, std::string{}, atom.markpen, atom.tabLeader, 100, 100, 0, atom.charOffset,
+                           atom.track);
     appendLineRun(line.glyphsMut(), run);
     line.width = atom.width;
     trimLineGlyphs(line.glyphsMut());

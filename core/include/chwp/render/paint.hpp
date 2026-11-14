@@ -297,6 +297,10 @@ BandVeil bandVeil(int page);
 bool masterView();
 int masterViewEpoch();
 
+// 화면 칸에 모아 둔 글자(GPU 글자 조각)를 지울 때마다 오른다(글꼴이 들어와 글자를 다시 고를 때 등).
+// 세션은 그 값이 바뀌면 들고 있는 칸을 모두 다시 굽는다. 칸 그림만 남고 글자가 빠지면 글이 보이지 않는다.
+int screenGlyphEpoch();
+
 // 블록으로 칠할 칸. 좌표는 그 쪽의 종이 왼쪽 위 기준이다.
 // 세로는 글자 상자에 그 줄의 줄 간격을 더한 값이다. 다음 줄 글자는 이 칸에 넣지 않는다.
 // back 은 그 칸의 배경색이다. 형광펜, 글자 배경, 칸 채우기, 종이 순으로 고른다.
@@ -343,6 +347,7 @@ struct PointerView {
 struct PointerSample {
     int id = 0;
     int device = 0;
+    bool shift = false;  // Shift 를 누른 채인지. 개체를 누르면 여러 개체 고르기에 더하거나 뺀다
     double time = 0;
     double dpr = 1;
     double viewX = 0;
@@ -507,6 +512,17 @@ EditResult editCommitComposition(model::Document& doc, std::vector<Node>& pages,
 // 키보드 편집/이동 키(Backspace, Delete, Enter, Shift+Enter, 방향키, Home, End, Tab)를 처리한다.
 EditResult editKeyDown(model::Document& doc, std::vector<Node>& pages, EditKey key, bool shift = false,
                        bool ctrl = false, bool alt = false, bool useStoredLineHeight = false);
+
+// 화면에 보이는 쪽 하나의 세로 범위(쪽 HU). 셸 화면이 아니라 코어 카메라에서 셈한다.
+struct ViewBand {
+    int page = 0;
+    std::int32_t top = 0;
+    std::int32_t bottom = 0;
+};
+// 한글 MoveViewBegin·MoveViewEnd(Ctrl+Home·Ctrl+End): 캐럿 글 묶음에서 화면에 온전히 보이는 첫(end 면 마지막) 줄로
+// 캐럿을 옮긴다. 가로 자리는 위아래 이동처럼 지킨다. 화면은 움직이지 않는다. shift 면 블록을 넓힌다.
+EditResult editMoveToView(model::Document& doc, std::vector<Node>& pages, const std::vector<ViewBand>& bands, bool end,
+                          bool shift);
 
 // 현재 커서/선택 영역에 적용할 스타일·문단 속성·글자 모양 변경 패치.
 // 글자 모양·문단 모양 대화 상자의 값 하나. 숫자는 double 로 오가고, 색은 #rrggbb(빈 문자열은 색 없음)다.
@@ -835,6 +851,24 @@ FormatFields tableFormulaView(const model::Document& doc, const std::vector<Node
 // fields(fields 의 구분 기호로 가장 많이 나뉜 필드 수).
 FormatFields sortView(const model::Document& doc, const std::vector<Node>& pages, const FormatFields& fields);
 // 하이퍼링크 넣기(한글 InsertHyperlink). text 가 비면 주소를 보인다. 고른 글은 바꾼다. 되돌리기 한 칸이다.
+// 누름틀 넣기(한글 입력 탭 누름틀). 안내문이 비면 한글 기본 안내문이다. 되돌리기 한 칸이다.
+EditResult editInsertClickHere(model::Document& doc, std::vector<Node>& pages, const std::string& direction,
+                               const std::string& memo, const std::string& name, bool useStoredLineHeight,
+                               std::string* error = nullptr);
+// 누름틀 고치기(한글 필드 입력 고치기의 누름틀 탭). 값: direction, memo, name, editable. 되돌리기 한 칸이다.
+EditResult editModifyClickHere(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
+                               bool useStoredLineHeight, std::string* error = nullptr);
+FormatFields clickHereFields(model::Document& doc, const std::vector<Node>& pages);
+// 누름틀 안내문 숨기기(한글 2024): 블록 없는 캐럿이 손대지 않은 누름틀 안에 있는 동안 안내문을 감추고 뒤 글을 당기며,
+// 캐럿이 나가면 다시 보인다. 편집이 아니라 보기 상태라 되돌리기 기록·고친 표시를 남기지 않는다.
+// 캐럿에 맞춰야 하는지(가벼운 판단). 맞추기는 문단을 다시 놓는다.
+bool clickHereGuideNeedsSync(const model::Document& doc, const std::vector<Node>& pages);
+// 캐럿에 맞춘다. 바꿨으면 documentChanged 이고 다시 놓은 쪽이 든다.
+EditResult editSyncClickHereGuide(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 지금 숨긴 안내문이 있는지.
+bool clickHereGuideHidden();
+// 숨긴 안내문을 되돌린다(편집·이동·저장을 안내문이 보이는 문서에서 하도록 그 앞에). 캐럿은 같은 논리 자리다.
+EditResult editRevealClickHereGuide(model::Document& doc, std::vector<Node>& pages);
 EditResult editInsertHyperlink(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                                const std::string& url, bool useStoredLineHeight = false, std::string* error = nullptr);
 
@@ -988,8 +1022,10 @@ EditResult editInsertBreak(model::Document& doc, std::vector<Node>& pages, Break
 EditResult editInsertPicture(model::Document& doc, std::vector<Node>& pages, const Bytes& image,
                              bool useStoredLineHeight = false, std::int32_t width = 0, std::int32_t height = 0);
 
-// 도형 그리기. tool: 0 끔, 1 직사각형, 2 타원, 3 직선, 4 글상자, 5 세로 글상자.
-// 켜면 다음 끌기 한 번이 그 도형 상자가 된다(한글처럼 한 번 그리면 꺼진다). Esc 로 끈다.
+// 도형 그리기(한글 2024 도형 갤러리). tool: 0 끔, 1 직사각형, 2 타원, 3 직선, 4 글상자, 5 세로 글상자, 6 호,
+// 7 다각형, 8 곡선, 9 자유선. 1~6 은 다음 끌기 한 번이 그 도형 상자이고, 9 는 끈 자취다. 7·8 은 누를 때마다 점을
+// 더하고, 마지막 점에서 두 번 누르면(다각형은 첫 점을 누르면) 끝난다. 한 번 그리면 꺼진다. Esc 로 끈다.
+inline constexpr int kLastDrawTool = 9;
 void setDrawTool(int tool);
 int drawTool();
 // 끌기를 마친 도형을 문서에 넣는다. 포인터를 뗀 뒤 부른다. 그릴 것이 없으면 handled 가 거짓이다.
@@ -1000,6 +1036,9 @@ void dropPendingInsert();
 // page 쪽 종이 좌표 (x0, y0)에서 (x1, y1)까지 끈 도형을 넣는다. 한글이 마우스로 그린 도형과 같은 값이다.
 EditResult editInsertShape(model::Document& doc, std::vector<Node>& pages, int tool, int page, std::int32_t x0,
                            std::int32_t y0, std::int32_t x1, std::int32_t y1, bool useStoredLineHeight = false);
+// page 쪽 종이 좌표 점들로 다각형(7)·곡선(8)·자유선(9)을 넣는다. 다각형은 점 3개, 곡선·자유선은 2개 이상이다.
+EditResult editInsertShapePoints(model::Document& doc, std::vector<Node>& pages, int tool, int page,
+                                 const std::vector<model::ShapePoint>& points, bool useStoredLineHeight = false);
 
 // 캐럿 자리에 맞춰 머리말·꼬리말·바탕쪽 편집 상태를 맞춘다(캐럿이 머리말 글이면 그 편집, 본문이면 나옴).
 // 캐럿을 화면 밖에서 옮긴 뒤(agent) 부른다. 바뀌었으면 참.
@@ -1022,6 +1061,29 @@ EditResult editObjectProperties(model::Document& doc, std::vector<Node>& pages, 
 // 개체를 지운다(표면 칸 글까지). 캐럿은 개체가 있던 자리로 간다. 되돌리기 한 칸이다.
 EditResult editDeleteObject(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
                             bool useStoredLineHeight = false, std::string* error = nullptr);
+
+// 수식(equation_commands.cpp). 한글 2024 수식 넣기(Ctrl+N,M)·고치기와 같다.
+// 수식 편집기에 채울 값: editing(고른 수식을 고치는지), script, baseUnit(1000 = 10pt).
+FormatFields equationView(const model::Document& doc);
+// 고른 개체가 수식이면 그 자리(글 묶음·문단·항목 순번).
+bool selectedEquationAt(const model::Document& doc, int& story, int& paragraph, int& item);
+// 수식 미리 보기 그림(SVG, viewBox 는 HWPUNIT 수식 상자). 스크립트가 비었거나 잴 수 없으면 빈 글이다.
+// 수식 글꼴 윤곽이 아직 없으면 ready 가 거짓이다(글꼴이 오면 다시 묻는다).
+std::string equationSvg(const std::string& script, std::int32_t baseUnit, bool* ready = nullptr);
+// 수식 글꼴을 받는 중에 잰 수식(measurePending) 중 이제 글꼴이 다 온 것을 다시 잰다. 그 문단의 lineSeg 는 버린다.
+// 다시 잰 수식 수를 돌려준다(0 이 아니면 쪽을 다시 놓아야 한다).
+int remeasurePendingEquations(model::Document& doc);
+// 캐럿 자리(블록이면 블록을 지운 자리)에 수식을 글자처럼 넣는다. 상자 크기·기준선은 스크립트를 잰 값이다.
+// 캐럿은 수식 뒤로 간다. 되돌리기 한 칸이다.
+EditResult editInsertEquation(model::Document& doc, std::vector<Node>& pages, const std::string& script,
+                              std::int32_t baseUnit = 1000, bool useStoredLineHeight = false,
+                              std::string* error = nullptr);
+// 고른 수식(또는 이름으로 가리킨 수식)의 스크립트·글자 크기(0 이면 그대로)를 바꾸고 크기를 다시 잰다.
+EditResult editEquation(model::Document& doc, std::vector<Node>& pages, const std::string& script,
+                        std::int32_t baseUnit = 0, bool useStoredLineHeight = false, std::string* error = nullptr);
+EditResult editEquationAt(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                          const std::string& script, std::int32_t baseUnit = 0, bool useStoredLineHeight = false,
+                          std::string* error = nullptr);
 
 // 고른 띄운 개체를 끌어 옮겼으면 그 위치를 문서에 반영한다. 포인터를 뗀 뒤 부른다. 없으면 handled 가 거짓이다.
 EditResult editMoveObject(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
@@ -1122,6 +1184,8 @@ PipelineTally pipelineTally();
 void clearDrawnPipelines();
 void dropScreenSprite(int id);
 bool frameHasGlyphs(int id);
+// 화면 글자를 들고 있는 칸 수. 글자를 지운 뒤 칸을 다시 구웠는지 시험이 본다.
+int framesHoldingGlyphs();
 // 칸이 들고 있는 화면 글자의 문단 위치(이야기, 문단, 글자). 블록 판단이 쓰는 값이다.
 struct FrameGlyphSpot {
     int story = -1;

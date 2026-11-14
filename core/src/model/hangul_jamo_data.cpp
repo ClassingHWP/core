@@ -1,5 +1,5 @@
-// 만들어 넣은 표 파일이다. 손으로 고치지 않는다.
-// 한글 2024 와 같은 옛한글 낱자 변환표(사용자 영역 음절 → 사용자 영역 낱자, 사용자 영역 낱자 ↔ 유니코드 낱자).
+// tools/collate/gen_hangul_jamo.py 로 만든 파일이다. 손으로 고치지 않는다.
+// 한글 2024 의 낱자 변환표.
 #include <cstdint>
 
 namespace chwp::model::collate_detail {

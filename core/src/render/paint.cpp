@@ -2730,6 +2730,7 @@ std::uint64_t mixLineGlyphs(std::uint64_t h, const Node& line, const model::Docu
         h = fnvMixStr64(h, run.style->font ? *run.style->font : std::string{});
         h = fnvMixStr64(h, run.style->markpen ? *run.style->markpen : std::string{});
         h = fnvMixStr64(h, run.style->tabLeader ? *run.style->tabLeader : std::string{});
+        h = fnvMix64(h, run.style->track);
         for (std::uint32_t i = 0; i < run.advanceCount; ++i) {
             h = fnvMix64(h, static_cast<std::uint64_t>(glyphs.advances[run.advanceAt + i]));
         }
@@ -2893,6 +2894,20 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
             }
         }
         h = mixLineGlyphs(h, node, doc);
+        // 메모 범위 상자는 글자 밖 모델(필드)에서 온다. 글자가 같아도 메모를 넣고 지우면 다른 그림이다.
+        if (doc && paint_detail::lineHasMemoRange(node, doc)) {
+            Painter painter;
+            painter.doc = doc;
+            const std::vector<Painter::Mark> marks = painter.collectMarks(node);
+            const Painter::LinePlacement place = painter.placeLine(node, marks);
+            for (const Painter::MemoRange& range : painter.lineMemoRanges(node, 0, 0, marks, place)) {
+                h = fnvMix64(h, static_cast<std::uint64_t>(range.x0));
+                h = fnvMix64(h, static_cast<std::uint64_t>(range.x1));
+                h = fnvMix64(h, static_cast<std::uint64_t>((range.head ? 1 : 0) | (range.tail ? 2 : 0)));
+                h = fnvMixStr64(h, range.fill);
+                h = fnvMixStr64(h, range.line);
+            }
+        }
         node.contentHash = node.spansLater ? 0ULL : (h == 0ULL ? 1ULL : h);
         node.huBoundsReady = true;
         return;
@@ -2923,6 +2938,17 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().imageFillMode));
         h = fnvMixStr64(h, node.ext().obj().binItemId);
         h = fnvMixStr64(h, node.ext().obj().script);
+        // 글맵시: 글·글꼴·모양·간격·정렬·그림자가 바뀌면 다시 그린다.
+        h = fnvMixStr64(h, node.ext().obj().artText);
+        h = fnvMixStr64(h, node.ext().obj().artFont);
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().artShape));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().artLineSpacing));
+        h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().obj().artCharSpacing));
+        h = fnvMixStr64(h, node.ext().obj().artAlign);
+        h = fnvMix64(h, node.ext().obj().artShadow ? 1ULL : 0ULL);
+        h = fnvMixStr64(h, node.ext().obj().artShadowColor);
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(node.ext().obj().artShadowX)));
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(node.ext().obj().artShadowY)));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().cellSpacing));
         h = fnvMix64(h, static_cast<std::uint64_t>((node.flipHorizontal ? 1 : 0) | (node.flipVertical ? 2 : 0)));
         h = fnvMixEdge64(h, node.ext().borderLeft);
@@ -3611,10 +3637,12 @@ bool lineHasGlyphSource(const Node& line) {
 bool lineHasBitmapInk(const Node& line, const model::Document* doc) {
     if (line.lineData().auditLine) return true;
     if (paint_detail::lineHasProofInk(line, doc)) return true;
+    if (paint_detail::lineHasMemoRange(line, doc)) return true;
     const auto set = [](const std::string* name, const char* none) { return name && *name != none; };
     for (const LineRun& run : lineGlyphs(line).runs) {
         if (run.kind == RunKind::Object) continue;
         if (set(run.style->markpen, "none")) return true;
+        if (run.style->track != 0) return true;  // 변경 추적 밑줄·취소선
         if (run.kind == RunKind::Tab && (line.lineData().deferTabs || set(run.style->tabLeader, "NONE"))) return true;
         if (!doc) continue;
         const detail::CharPaint paint = detail::charPaint(*doc, run.charShapeId);
@@ -4040,6 +4068,9 @@ void noteDocumentGlyphs(const model::Document& doc) { gatherDocumentGlyphs(doc);
 void clearGlyphWarm() {
     clearDocumentGlyphs();
     clearHangulOutlineCache();
+    // 수식 폭 표와 그린 수식도 글꼴 없을 때의 대체 폭을 품었을 수 있다.
+    clearEquationFontCache();
+    clearEquationInkCache();
     clearScreenGlyphs();
     // 그사이 들어온 글꼴이 있을 수 있다. 없어서 대체로 열어 둔 글꼴과 굵기 판단을 다시 본다.
     {
@@ -4803,7 +4834,44 @@ double CursorStyle::fontSizeIn(const std::string& unit) const {
     return huToLength(fontSize, lengthUnitOf(unit), 2);
 }
 
+namespace {
+
+CursorStyle paragraphCursorStyle(const model::Document& doc, const std::vector<Node>& pages);
+
+}  // namespace
+
+// 캐럿(블록이면 블록 처음) 글에 글자 스타일이 걸려 있으면 그 스타일을 보인다(숨긴 한글: 글자 스타일 글 안·끝의 캐럿
+// 스타일은 그 글자 스타일이다). 블록 없는 캐럿에 걸어 둔 글자 스타일도 같다.
 CursorStyle cursorStyle(const model::Document& doc, const std::vector<Node>& pages) {
+    CursorStyle st = paragraphCursorStyle(doc, pages);
+    const PointerHold& hold = pointerHold();
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0) return st;
+    const int paragraph = cur.hasSelection ? cur.startParagraph : cur.paragraph;
+    const int offset = cur.hasSelection ? cur.startOffset : cur.offset;
+    const model::Paragraph* para = storyParagraph(doc, cur.story, paragraph);
+    if (!para) return st;
+    std::uint32_t charStyle = model::kNoCharStyle;
+    if (!cur.hasSelection && hold.hasPendingCharShape && hold.pendingCharStory == cur.story &&
+        hold.pendingCharPara == paragraph && hold.pendingCharOffset == offset) {
+        charStyle = hold.pendingCharStyleId;
+    } else {
+        const int charIndex = offsetToCharIndex(doc, pages, cur.story, paragraph, offset);
+        charStyle = charStyleAtParagraphChar(*para, charIndex, cur.hasSelection || charIndex == 0);
+    }
+    const model::Style* style = charStyle != model::kNoCharStyle ? Painter::findStyle(doc, charStyle) : nullptr;
+    if (style && style->type == "CHAR") {
+        st.styleId = style->id;
+        st.styleName = style->name;
+        st.styleEngName = style->engName;
+        st.styleType = "CHAR";
+    }
+    return st;
+}
+
+namespace {
+
+CursorStyle paragraphCursorStyle(const model::Document& doc, const std::vector<Node>& pages) {
     const PointerHold& hold = pointerHold();
     const PointerCursor cur = pointerCursor();
     if (cur.active && cur.hasSelection && cur.story > 0 && cur.startParagraph >= 0) {
@@ -4841,6 +4909,8 @@ CursorStyle cursorStyle(const model::Document& doc, const std::vector<Node>& pag
     }
     return cursorStyleForCaret(doc, fallback);
 }
+
+}  // namespace
 
 namespace {
 
@@ -6152,8 +6222,16 @@ int rasterQueuedMasks(int budget, int targetMaskZoom) {
 
 }  // namespace
 
+namespace {
+std::atomic<int> gScreenGlyphEpoch{0};
+}  // namespace
+
+int screenGlyphEpoch() { return gScreenGlyphEpoch.load(std::memory_order_relaxed); }
+
 // 선언은 앞쪽 paint_detail 에 있다. 이름 공간이 같아야 같은 함수다.
 void paint_detail::clearScreenGlyphs() {
+    // 칸마다 모아 둔 글자를 지운다. 세션이 들고 있는 칸은 이 값이 바뀐 것을 보고 다시 굽는다.
+    gScreenGlyphEpoch.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(glyphAtlasMutex());
         ++maskCacheGen();
@@ -6189,6 +6267,15 @@ bool glyphMasksPending() {
 }
 
 // 화면이 칸 비트맵 말고 따로 그릴 것(글자, 그림)이 있는지. 있으면 빈 비트맵 칸도 쓴다.
+int framesHoldingGlyphs() {
+    std::lock_guard lock(frameGlyphMutex());
+    int count = 0;
+    for (const auto& [id, held] : frameGlyphs()) {
+        if (!held.glyphs.empty()) ++count;
+    }
+    return count;
+}
+
 bool frameHasGlyphs(int id) {
     {
         std::lock_guard lock(frameGlyphMutex());
@@ -6867,7 +6954,44 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
             veil.setAntiAlias(false);
             veil.setColor(SkColorSetARGB(170, 255, 255, 255));
             canvas->drawRect(from, veil);
-            if (hold.dragSnapshot && hold.dragSnapshot->width > 0) {
+            // 글이 든 개체(글상자·표)는 크기를 바꿀 때 글을 늘려 보이지 않는다(한글: 글은 놓은 뒤 다시 나뉜다).
+            // 떼어 둔 모습을 원래 크기 그대로 새 상자 왼쪽 위에 두고 새 상자 안만 보이며, 새 상자는 점선으로 둘러 보인다.
+            bool holdsText = false;
+            if (reshaping && hold.selectedObject) {
+                const auto hasLine = [](const auto& self, const Node& node) -> bool {
+                    if (node.kind == NodeKind::Line || node.kind == NodeKind::Cell) return true;
+                    for (const Node& child : node.children) {
+                        if (self(self, child)) return true;
+                    }
+                    return false;
+                };
+                holdsText = hold.selectedObject->role == "table" || hasLine(hasLine, *hold.selectedObject);
+            }
+            if (holdsText && hold.dragSnapshot && hold.dragSnapshot->width > 0) {
+                SkRect src = SkRect::MakeWH(static_cast<float>(hold.dragSnapshot->width),
+                                            static_cast<float>(hold.dragSnapshot->height));
+                const SkRect natural = SkRect::MakeXYWH(to.left(), to.top(), from.width(), from.height());
+                const PictureTextureView texture =
+                    pictureTexture(recorder, hold.dragSnapshotId, hold.dragSnapshot, natural.width(), natural.height(), src);
+                if (texture.image) {
+                    src = SkRect::MakeLTRB(src.fLeft * texture.scaleX, src.fTop * texture.scaleY,
+                                           src.fRight * texture.scaleX, src.fBottom * texture.scaleY);
+                    canvas->save();
+                    canvas->clipRect(to);
+                    canvas->drawImageRect(texture.image.get(), src, natural,
+                                          SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear), nullptr,
+                                          SkCanvas::kFast_SrcRectConstraint);
+                    canvas->restore();
+                }
+                SkPaint outline;
+                outline.setAntiAlias(true);
+                outline.setStyle(SkPaint::kStroke_Style);
+                outline.setStrokeWidth(1.f);
+                outline.setColor(SK_ColorBLACK);
+                const SkScalar dashes[2] = {4.f, 3.f};
+                outline.setPathEffect(SkDashPathEffect::Make(dashes, 0));
+                canvas->drawRect(to, outline);
+            } else if (hold.dragSnapshot && hold.dragSnapshot->width > 0) {
                 SkRect src = SkRect::MakeWH(static_cast<float>(hold.dragSnapshot->width),
                                             static_cast<float>(hold.dragSnapshot->height));
                 const PictureTextureView texture =
@@ -6962,6 +7086,42 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
                 canvas->drawCircle(pt[0], pt[1], rad, edge);
             }
         }
+        // 여러 개체 고르기로 더한 개체에도 손잡이를 둔다. 끄는 동안은 끈 만큼 옮긴 자리에 테두리만 보인다.
+        for (const PointerHold::PickedObject& picked : hold.multiPicked) {
+            const ViewPage* other = sheetOf(pages, picked.page);
+            if (!other || other->w <= 0 || other->h <= 0 || other->widthHu <= 0 || other->heightHu <= 0) continue;
+            const float ox = static_cast<float>(other->w) / static_cast<float>(other->widthHu);
+            const float oy = static_cast<float>(other->h) / static_cast<float>(other->heightHu);
+            const std::int32_t dx = hold.moving ? hold.moveDX : 0;
+            const std::int32_t dy = hold.moving ? hold.moveDY : 0;
+            const float x0 = static_cast<float>(other->x - scrollX) + static_cast<float>(picked.x + dx) * ox;
+            const float y0 = static_cast<float>(other->y - scrollY) + static_cast<float>(picked.y + dy) * oy;
+            const float x1 = x0 + static_cast<float>(picked.width) * ox;
+            const float y1 = y0 + static_cast<float>(picked.height) * oy;
+            SkPaint outline;
+            outline.setAntiAlias(true);
+            outline.setStyle(SkPaint::kStroke_Style);
+            outline.setStrokeWidth(1.f);
+            outline.setColor(SkColorSetARGB(255, 60, 110, 220));
+            canvas->drawRect(SkRect::MakeLTRB(x0, y0, x1, y1), outline);
+            if (hold.moving) continue;
+            const float xm = (x0 + x1) * 0.5f;
+            const float ym = (y0 + y1) * 0.5f;
+            const float corners[8][2] = {{x0, y0}, {xm, y0}, {x1, y0}, {x0, ym}, {x1, ym}, {x0, y1}, {xm, y1}, {x1, y1}};
+            SkPaint fillDot;
+            fillDot.setAntiAlias(true);
+            fillDot.setColor(SK_ColorWHITE);
+            SkPaint edgeDot;
+            edgeDot.setAntiAlias(true);
+            edgeDot.setStyle(SkPaint::kStroke_Style);
+            edgeDot.setStrokeWidth(1.f);
+            edgeDot.setColor(SK_ColorBLACK);
+            const float rad = std::max(3.f, 3.5f * ox);
+            for (const auto& pt : corners) {
+                canvas->drawCircle(pt[0], pt[1], rad, fillDot);
+                canvas->drawCircle(pt[0], pt[1], rad, edgeDot);
+            }
+        }
     }
     // 도형을 끄는 동안 새로 생길 모양 그대로 보인다. 넣을 때와 같이 검은 실선 33 HU 에 흰 채움이고, 선은 채움이 없다
     // (insertShapeNow).
@@ -6985,7 +7145,40 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
             face.setAntiAlias(true);
             face.setColor(SK_ColorWHITE);
             const SkRect box = SkRect::MakeLTRB(std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::max(y0, y1));
-            if (hold.drawTool == 3) {
+            if (hold.drawTool == 7 || hold.drawTool == 8 || hold.drawTool == 9) {
+                // 다각형·곡선·자유선: 지금까지의 점을 잇는다. 점마다 작은 네모를 둔다(자유선은 두지 않는다).
+                SkPathBuilder trail;
+                for (std::size_t i = 0; i < hold.drawPoints.size(); ++i) {
+                    const float px = left + static_cast<float>(hold.drawPoints[i].x) * sx;
+                    const float py = top + static_cast<float>(hold.drawPoints[i].y) * sy;
+                    if (i == 0) trail.moveTo(px, py);
+                    else trail.lineTo(px, py);
+                }
+                canvas->drawPath(trail.detach(), pen);
+                if (hold.drawTool != 9) {
+                    SkPaint dot;
+                    dot.setColor(SK_ColorBLACK);
+                    for (const model::ShapePoint& pt : hold.drawPoints) {
+                        const float px = left + static_cast<float>(pt.x) * sx;
+                        const float py = top + static_cast<float>(pt.y) * sy;
+                        canvas->drawRect(SkRect::MakeXYWH(px - 2.5f, py - 2.5f, 5.f, 5.f), dot);
+                    }
+                }
+            } else if (hold.drawTool == 6) {
+                // 호: 중심이 끈 상자 왼쪽 위인 사분 호(insertShapeNow).
+                const float w = box.width();
+                const float h = box.height();
+                const SkRect oval = SkRect::MakeLTRB(box.left() - w, box.top() - h, box.left() + w, box.top() + h);
+                SkPathBuilder arc;
+                arc.moveTo(box.left(), box.top());
+                arc.arcTo(oval, 0.f, 90.f, false);
+                arc.close();
+                const SkPath wedge = arc.detach();
+                canvas->drawPath(wedge, face);
+                SkPathBuilder rim;
+                rim.arcTo(oval, 0.f, 90.f, true);
+                canvas->drawPath(rim.detach(), pen);
+            } else if (hold.drawTool == 3) {
                 canvas->drawLine(x0, y0, x1, y1, pen);
             } else if (hold.drawTool == 2) {
                 canvas->drawOval(box, face);
