@@ -115,98 +115,33 @@ void Painter::drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLa
     drawPoints(node, node.ext().obj().points, x, y, place);
 }
 
+// 선·다각형·곡선·호·자유선. 채우기와 테두리를 같은 float 경로로 그린다. 점은 픽셀로 반올림하지 않는다.
+// 테두리는 한글처럼 윤곽 가운데에 긋는다(한글 2024 PDF: 굵기 1000 의 다각형·선 모두 윤곽이 선 가운데).
+// 채우기는 점을 이어 닫은 면이고, 테두리는 적힌 점만 잇는다(닫힌 도형은 파일이 첫 점을 끝에 한 번 더 적는다).
 void Painter::drawPoints(const Node& node, const std::vector<model::ShapePoint>& points, std::int32_t x, std::int32_t y,
                          PaintLayer place) {
     if (points.size() < 2) return;
-    std::uint8_t r, g, b;
-    const bool stroke = !node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE";
-    parseHex(node.ext().borderLeft.color.empty() ? "#000000" : node.ext().borderLeft.color, r, g, b);
-    const int thick = std::max(1, px(node.ext().borderLeft.width > 0 ? node.ext().borderLeft.width : 28));
+    SkCanvas* canvas = this->canvas();
+    if (!canvas) return;
+    SkPathBuilder builder;
+    builder.moveTo(glyphPx(x + points[0].x), glyphPx(y + points[0].y));
+    for (std::size_t i = 1; i < points.size(); ++i) builder.lineTo(glyphPx(x + points[i].x), glyphPx(y + points[i].y));
+    const SkPath path = builder.detach();
     const bool close = !node.ext().fillColor.empty() && node.ext().fillColor != "none";
     if (show(place) && close) {
-        std::uint8_t fr, fg, fb;
-        parseHex(node.ext().fillColor, fr, fg, fb);
-        int minY = px(y + points[0].y);
-        int maxY = minY;
-        for (const auto& point : points) {
-            const int py = px(y + point.y);
-            minY = std::min(minY, py);
-            maxY = std::max(maxY, py);
-        }
-        const std::size_t count = points.size();
-        for (int scan = minY; scan <= maxY; ++scan) {
-            std::vector<int> hits;
-            for (std::size_t i = 0; i < count; ++i) {
-                const int x0 = px(x + points[i].x);
-                const int y0 = px(y + points[i].y);
-                const auto& next = points[(i + 1) % count];
-                const int x1 = px(x + next.x);
-                const int y1 = px(y + next.y);
-                if (y0 == y1 || scan < std::min(y0, y1) || scan >= std::max(y0, y1)) continue;
-                hits.push_back(x0 + (x1 - x0) * (scan - y0) / (y1 - y0));
-            }
-            std::sort(hits.begin(), hits.end());
-            for (std::size_t i = 0; i + 1 < hits.size(); i += 2) {
-                fillRect(bitmap, hits[i], scan, std::max(1, hits[i + 1] - hits[i]), 1, fr, fg, fb);
-            }
-        }
+        std::uint8_t r, g, b;
+        parseHex(node.ext().fillColor, r, g, b);
+        SkPaint paint;
+        paint.setAntiAlias(true);
+        paint.setStyle(SkPaint::kFill_Style);
+        paint.setColor(SkColorSetARGB(255, r, g, b));
+        canvas->drawPath(path, paint);
     }
-    if (!show(frameStroke()) || !stroke) return;
-    float intervals[8];
-    const int dashes = gdiDash(node.ext().borderLeft, intervals);
-    if (dashes >= 2) {
-        if (SkCanvas* canvas = this->canvas()) {
-            SkPathBuilder path;
-            path.moveTo(static_cast<float>(px(x + points[0].x)), static_cast<float>(px(y + points[0].y)));
-            for (std::size_t i = 1; i < points.size(); ++i) {
-                path.lineTo(static_cast<float>(px(x + points[i].x)), static_cast<float>(px(y + points[i].y)));
-            }
-            SkPaint paint;
-            paint.setAntiAlias(true);
-            paint.setStyle(SkPaint::kStroke_Style);
-            paint.setStrokeWidth(penPx(node.ext().borderLeft));
-            const bool round = node.ext().borderLeft.end == 0 || node.ext().borderLeft.type == "CIRCLE";
-            paint.setStrokeCap(round ? SkPaint::kRound_Cap : SkPaint::kButt_Cap);
-            paint.setStrokeJoin(round ? SkPaint::kRound_Join : SkPaint::kMiter_Join);
-            paint.setColor(SkColorSetARGB(255, r, g, b));
-            paint.setPathEffect(SkDashPathEffect::Make(
-                SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(dashes)), 0));
-            canvas->drawPath(path.detach(), paint);
-            return;
-        }
-    }
-    const ClipSuspend open(bitmap);
-    auto segment = [&](int x0, int y0, int x1, int y1) {
-        if (dashes < 2) {
-            thickLine(x0, y0, x1, y1, thick, r, g, b);
-            return;
-        }
-        const int dx = x1 - x0;
-        const int dy = y1 - y0;
-        const int steps = std::max(std::abs(dx), std::abs(dy));
-        if (steps <= 0) return;
-        int pattern[8];
-        for (int i = 0; i < dashes; ++i) pattern[i] = std::max(1, static_cast<int>(std::lround(intervals[i])));
-        int cursor = 0;
-        int slot = 0;
-        while (cursor < steps) {
-            const int n = pattern[slot % dashes];
-            const int draw = std::min(n, steps - cursor);
-            if (slot % 2 == 0) {
-                const int ax = x0 + dx * cursor / steps;
-                const int ay = y0 + dy * cursor / steps;
-                const int bx = x0 + dx * (cursor + draw) / steps;
-                const int by = y0 + dy * (cursor + draw) / steps;
-                thickLine(ax, ay, bx, by, thick, r, g, b);
-            }
-            cursor += draw;
-            ++slot;
-        }
-    };
-    for (std::size_t i = 0; i + 1 < points.size(); ++i) {
-        segment(px(x + points[i].x), px(y + points[i].y), px(x + points[i + 1].x),
-                px(y + points[i + 1].y));
-    }
+    const BorderEdge& edge = node.ext().borderLeft;
+    if (!show(frameStroke()) || edge.type.empty() || edge.type == "NONE") return;
+    SkPaint paint;
+    strokePaint(edge, paint);
+    canvas->drawPath(path, paint);
 }
 
 void Painter::equation(const Node& node, std::int32_t x, std::int32_t y, PaintLayer) {
@@ -267,6 +202,24 @@ void Painter::fillRoundRect(int x, int y, int w, int h, int rad, std::uint8_t r,
                 run = -1;
             }
         }
+    }
+}
+
+void Painter::strokePaint(const BorderEdge& edge, SkPaint& paint) const {
+    std::uint8_t r, g, b;
+    parseHex(edge.color.empty() ? "#000000" : edge.color, r, g, b);
+    paint.setAntiAlias(true);
+    paint.setStyle(SkPaint::kStroke_Style);
+    paint.setStrokeWidth(penPx(edge));
+    const bool round = edge.end == 0 || edge.type == "CIRCLE";
+    paint.setStrokeCap(round ? SkPaint::kRound_Cap : SkPaint::kButt_Cap);
+    paint.setStrokeJoin(round ? SkPaint::kRound_Join : SkPaint::kMiter_Join);
+    paint.setStrokeMiter(10.f);  // GDI·PDF 기본 꺾임 한도. 한글 PDF 의 뾰족한 꼭짓점이 잘리지 않는다
+    paint.setColor(SkColorSetARGB(255, r, g, b));
+    float intervals[8];
+    const int count = gdiDash(edge, intervals);
+    if (count >= 2) {
+        paint.setPathEffect(SkDashPathEffect::Make(SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(count)), 0));
     }
 }
 
@@ -347,23 +300,8 @@ void Painter::roundBox(std::int32_t x, std::int32_t y, std::int32_t w, std::int3
             canvas->drawRRect(rrect, paint);
         }
         if (show(frameStroke()) && !edge.type.empty() && edge.type != "NONE") {
-            std::uint8_t r, g, b;
-            parseHex(edge.color.empty() ? "#000000" : edge.color, r, g, b);
-            const float widthPx = penPx(edge);
             SkPaint paint;
-            paint.setAntiAlias(true);
-            paint.setStyle(SkPaint::kStroke_Style);
-            paint.setStrokeWidth(widthPx);
-            const bool round = edge.end == 0 || edge.type == "CIRCLE";
-            paint.setStrokeJoin(round ? SkPaint::kRound_Join : SkPaint::kMiter_Join);
-            paint.setStrokeCap(round ? SkPaint::kRound_Cap : SkPaint::kButt_Cap);
-            paint.setColor(SkColorSetARGB(255, r, g, b));
-            float intervals[8];
-            const int count = gdiDash(edge, intervals);
-            if (count >= 2) {
-                paint.setPathEffect(
-                    SkDashPathEffect::Make(SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(count)), 0));
-            }
+            strokePaint(edge, paint);
             canvas->drawRRect(rrect, paint);
         }
         return;
@@ -442,9 +380,7 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
             SkPaint paint;
             paint.setAntiAlias(true);
             paint.setColor(SkColorSetARGB(255, r, g, b));
-            canvas->drawOval(SkRect::MakeXYWH(static_cast<float>(x0), static_cast<float>(y0),
-                                               static_cast<float>(pw), static_cast<float>(ph)),
-                              paint);
+            canvas->drawOval(SkRect::MakeLTRB(glyphPx(x), glyphPx(y), glyphPx(x + w), glyphPx(y + h)), paint);
         } else
             fillOval(x0, y0, pw, ph, r, g, b);
     }
@@ -453,22 +389,10 @@ void Painter::ellipseBox(std::int32_t x, std::int32_t y, std::int32_t w, std::in
     parseHex(edge.color.empty() ? "#000000" : edge.color, r, g, b);
     const int thick = std::max(1, px(edge.width > 0 ? edge.width : 28));
     if (SkCanvas* canvas = this->canvas()) {
+        // 한글은 타원 테두리도 윤곽 가운데에 긋는다(한글 2024 PDF). 안쪽으로 들이지 않는다.
         SkPaint paint;
-        paint.setAntiAlias(true);
-        paint.setStyle(SkPaint::kStroke_Style);
-        paint.setStrokeWidth(penPx(edge));
-        const bool round = edge.end == 0 || edge.type == "CIRCLE";
-        paint.setStrokeCap(round ? SkPaint::kRound_Cap : SkPaint::kButt_Cap);
-        paint.setStrokeJoin(round ? SkPaint::kRound_Join : SkPaint::kMiter_Join);
-        paint.setColor(SkColorSetARGB(255, r, g, b));
-        float intervals[8];
-        const int count = gdiDash(edge, intervals);
-        if (count >= 2) {
-            paint.setPathEffect(
-                SkDashPathEffect::Make(SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(count)), 0));
-        }
-        const float inset = thick * 0.5f;
-        canvas->drawOval(SkRect::MakeLTRB(x0 + inset, y0 + inset, x0 + pw - inset, y0 + ph - inset), paint);
+        strokePaint(edge, paint);
+        canvas->drawOval(SkRect::MakeLTRB(glyphPx(x), glyphPx(y), glyphPx(x + w), glyphPx(y + h)), paint);
         return;
     }
     const int grow = thick / 2;
@@ -621,7 +545,10 @@ void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
         return;
     }
     if (node.role == "picture" && !node.ext().obj().binItemId.empty()) {
-        if (show(place)) picture(node, x, y);
+        if (show(place)) {
+            pictureEffects(node, x, y);
+            picture(node, x, y);
+        }
         if (!node.ext().borderLeft.type.empty() && node.ext().borderLeft.type != "NONE" && node.ext().borderLeft.width > 0) {
             box(x, y, node.width, node.height, "", node.ext().borderLeft, node.role, place);
         }

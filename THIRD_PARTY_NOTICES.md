@@ -30,6 +30,7 @@ FreeType 의 FTL 은 문서에 위 출처 문장을 적도록 요구한다.
 | 바탕·바탕체·굴림·굴림체·돋움·돋움체·궁서·궁서체 | SIL OFL 1.1 | Google Fonts 의 [googlefonts/batang](https://github.com/googlefonts/batang), [googlefonts/gulim](https://github.com/googlefonts/gulim). 어센트·디센트 같은 세로 값만 바꿨다. |
 | 대체 글꼴 ClassingHWP Fallback 001~130 | SIL OFL 1.1 | 라이선스 때문에 내줄 수 없는 글꼴을 비슷하게 보여 주려고 OFL 글꼴 하나의 곡선으로 만든 읽기용 글꼴이다. 원래 글꼴과는 다른 글꼴이다. |
 | ClassingHWP Bullet | SIL OFL 1.1 | 글머리표 원 하나만 직접 그린 글꼴 |
+| 함초롬바탕(에이전트 스킬 ZIP 의 `bin/fonts/HANBatang.woff2`) | 한글과컴퓨터 함초롬체 라이선스(사용·배포 제한 없음) | Copyright 한글과컴퓨터. 글꼴을 받지 못하는 환경에서 글자를 그리는 마지막 대체 글꼴로 실행 파일과 함께 배포한다. 저장소에는 넣지 않고 패키징할 때 글꼴 서버의 같은 파일을 묶는다. |
 | 그 밖의 글꼴 | 글꼴마다 다르다(OFL, Apache-2.0, 공공누리 등) | 정보 창의 글꼴 탭 |
 
 ## 한글 문서 형식

@@ -24,6 +24,7 @@ namespace chwp::render::paint_detail {
 // 테두리 한 조각. 좌표는 칸 비트맵의 HU 다(픽셀 = HU × 구운 배율).
 // 선분은 (x0,y0)-(x1,y1) 중심선이고 inside 가 안쪽 방향이다.
 // 모서리 잇기는 (x0,y0) 가 교점이고 inside 는 가로선, vInside 는 세로선 안쪽이다.
+// 기운 선(slant, 칸 대각선)은 (x0,y0)-(x1,y1) 을 그 배율에서 안티앨리어싱해 긋는다. 두 줄 선 종류도 한 줄이다.
 struct BorderPiece {
     std::int32_t x0 = 0;
     std::int32_t y0 = 0;
@@ -34,6 +35,7 @@ struct BorderPiece {
     std::int8_t inside = 1;
     std::int8_t vInside = 1;
     bool corner = false;
+    bool slant = false;
     std::uint8_t r = 0;
     std::uint8_t g = 0;
     std::uint8_t b = 0;

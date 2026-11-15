@@ -1239,7 +1239,7 @@ void Painter::line(const Node& node, std::int32_t x, std::int32_t y, bool inObje
             const CoverScope cover(*this, coversText(*mark.object));
             const bool clipBox = clipsOwnBox(*mark.object);
             if (clipBox) {
-                const std::int32_t bleed = tableBorderBleed(*mark.object);
+                const std::int32_t bleed = objectInkBleed(*mark.object);
                 pushClip(ox - bleed, oy - bleed, mark.object->width + bleed * 2,
                          mark.object->height + bleed * 2);
             }
@@ -1628,7 +1628,7 @@ void Painter::walk(const Node& node, std::int32_t ox, std::int32_t oy, bool inOb
     // 칸·표·묶음은 적힌 높이로 테두리를 두고, 넘치는 글과 그림은 잘라내지 않는다.
     // 묶음 너비는 자식보다 좁게 적혀 있을 수 있다. 그릴 개체는 자식의 위치와 너비다.
     if (boxed && clipsOwnBox(node)) {
-        const std::int32_t bleed = node.kind == NodeKind::Object ? tableBorderBleed(node) : 0;
+        const std::int32_t bleed = node.kind == NodeKind::Object ? objectInkBleed(node) : 0;
         pushClip(x - bleed, y - bleed, node.width + bleed * 2, node.height + bleed * 2);
     }
     // 개체 안 글은 그 개체와 같은 층이다. 그림이 글 층 위로 올라와 묶음 글씨를 덮지 않는다.

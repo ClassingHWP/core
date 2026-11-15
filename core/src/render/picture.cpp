@@ -558,6 +558,8 @@ bool drawFramePictures(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
             }
             canvas->restore();
         };
+        const float soft = item.softEdge * (sx + sy) / 2.f;
+        if (soft > 0.f) canvas->saveLayer(&clip, nullptr);
         drawIn(clip, paint);
         for (const SkRect& back : backs) {
             SkRect overlap = clip;
@@ -575,6 +577,16 @@ bool drawFramePictures(SkCanvas* canvas, skgpu::graphite::Recorder* recorder,
             flipped.setColorFilter(paint.getColorFilter() ? SkColorFilters::Compose(inverted, paint.refColorFilter())
                                                           : inverted);
             drawIn(overlap, flipped);
+        }
+        if (item.innerShadow.argb != 0) {
+            canvas->save();
+            canvas->clipRect(clip);
+            drawInnerShadow(canvas, dst, item.innerShadow, sx, sy);
+            canvas->restore();
+        }
+        if (soft > 0.f) {
+            softEdgeMask(canvas, dst, soft);
+            canvas->restore();
         }
     }
     return all;

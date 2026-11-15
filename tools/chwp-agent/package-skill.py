@@ -4,16 +4,29 @@
 Linux x86_64 정적 실행 파일을 Docker(alpine) 안에서 빌드하고, 스킬 폴더의 bin/ 에 넣어
 chwp-agent.zip 으로 묶는다. ZIP 안 맨 위는 chwp-agent/ 폴더이고, 실행 파일에는 실행 권한을 붙인다.
 
+같은 자리에 실행 파일 없이 글(SKILL.md·reference.md·scripts)만 묶은 chwp-agent-skill.zip 도 만든다. 실행 파일을
+받지 않는 곳(텍스트 파일만 받는 스킬 업로드)에 올리는 것이다. 그 안의 scripts/release.json 이 위 ZIP 의 GitHub
+릴리스 주소와 SHA-256 을 적고, chwp_agent.py 가 처음 실행할 때 그 ZIP 을 받아 실행 파일만 꺼내 쓴다.
+그래서 위 ZIP 은 이름 그대로 core 릴리스(v<버전>)에 올려야 한다. 버전은 CMakeLists.txt 의 VERSION 이다.
+
+이미 만든(올린) 실행 파일 ZIP 으로 글 스킬만 다시 묶으려면 --from <실행 파일 ZIP> 을 준다. Docker 를 쓰지 않는다.
+버전을 그 ZIP 이름에서 읽지 못하면 --version 으로 준다.
+
 core 는 Skia 로 그리므로 같은 alpine 에서 GPU 없는 Skia 정적 라이브러리(build/skia/out/chwp-linux-musl)를 먼저 만든다.
 한 번 만들면 다시 쓰고, --skia 를 주면 다시 만든다.
 
-  python tools/chwp-agent/package-skill.py [출력.zip] [--skia]  (기본: tmp/chwp-agent-skill/chwp-agent.zip)
+  python tools/chwp-agent/package-skill.py [출력.zip] [--skia]  (기본: tmp/chwp-agent-skill/chwp-agent-<버전>.zip)
+  python tools/chwp-agent/package-skill.py --from chwp-agent-0.3.5.zip [--version 0.3.5] [출력 폴더]
 
-Docker 는 지금 docker context 의 엔진을 쓴다. 글꼴은 넣지 않는다(스킬이 글꼴 서버에서 받는다).
+Docker 는 지금 docker context 의 엔진을 쓴다. 글꼴은 마지막 대체 글꼴 함초롬바탕(bin/fonts/HANBatang.woff2)만 넣고,
+나머지는 스킬이 글꼴 서버에서 받는다.
 """
 
+import hashlib
 import io
+import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -21,8 +34,34 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_URL = "https://github.com/ClassingHWP/core/releases/download/v{version}/{name}"
+BINARY_MEMBER = "chwp-agent/bin/chwp-agent"
+# 마지막 대체 글꼴. 실행 파일 옆 fonts/ 에 두면 실행 파일이 시작할 때 넣는다(글꼴을 못 받는 환경에서도 글자가 보인다).
+# 함초롬은 한컴 자체 라이선스로 배포 제한이 없다(docs/font-license.md). 글꼴 서버의 것과 같은 파일을 쓴다.
+FALLBACK_FONT_URL = "https://ede.kr/hwp/fonts/full/HANBatang.woff2"
+FALLBACK_FONT_MEMBER = "chwp-agent/bin/fonts/HANBatang.woff2"
+
+
+def fallback_font() -> bytes:
+    """함초롬바탕 woff2. CHWP_FALLBACK_FONT 로 파일을 줄 수 있고, 없으면 글꼴 서버에서 받아 tmp 에 둔다."""
+    given = os.environ.get("CHWP_FALLBACK_FONT")
+    if given:
+        return Path(given).read_bytes()
+    cached = ROOT / "tmp" / "chwp-agent-skill" / "HANBatang.woff2"
+    if not cached.is_file():
+        import urllib.request
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(FALLBACK_FONT_URL, timeout=120) as response:
+            cached.write_bytes(response.read())
+    data = cached.read_bytes()
+    if not data.startswith(b"wOF2"):
+        sys.exit(f"대체 글꼴이 woff2 가 아닙니다: {cached}")
+    return data
 SKILL = ROOT / "skills" / "chwp-agent"
-SOURCES = ["CMakeLists.txt", "CMakePresets.json", "cmake", "core", "tools/chwp-agent", "tools/chwp-dump"]
+# skills/chwp-agent/reference.md 는 MCP 서버의 hwp_reference 설명서로 실행 파일에 들어간다(core/CMakeLists.txt).
+# 최상위 CMakeLists.txt 가 도구 폴더를 모두 넣으므로 구성에 필요하다(빌드하는 것은 chwp-agent 하나다).
+SOURCES = ["CMakeLists.txt", "CMakePresets.json", "cmake", "core", "tools/chwp-agent", "tools/chwp-dump",
+           "tools/chwp-font-grid", "skills/chwp-agent/reference.md"]
 SKIA = ROOT / "build" / "skia"
 SKIA_OUT = "out/chwp-linux-musl"
 # core 가 읽는 Skia·Dawn 헤더와 alpine 에서 만든 정적 라이브러리.
@@ -91,7 +130,9 @@ def build_linux() -> bytes:
     source = io.BytesIO()
     with tarfile.open(fileobj=source, mode="w") as tar:
         for name in SOURCES:
-            tar.add(ROOT / name, arcname=name)
+            # 공개 저장소에는 tools/chwp-font-grid 가 없다(최상위 CMakeLists.txt 도 그 줄이 없다).
+            if (ROOT / name).exists():
+                tar.add(ROOT / name, arcname=name)
         for name in SKIA_FOR_CORE:
             tar.add(SKIA / name, arcname="build/skia/" + name)
     run = subprocess.run(["docker", "run", "--rm", "-i", "alpine:3.20", "sh", "-c", BUILD],
@@ -108,23 +149,84 @@ def add(zf: zipfile.ZipFile, name: str, data: bytes, executable: bool = False) -
     zf.writestr(info, data)
 
 
+def project_version() -> str:
+    text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    found = re.search(r"project\([^)]*VERSION\s+([0-9.]+)", text)
+    if not found:
+        sys.exit("CMakeLists.txt 에서 VERSION 을 찾지 못했습니다.")
+    return found.group(1)
+
+
+def add_skill_text(zf: zipfile.ZipFile) -> None:
+    for path in sorted(SKILL.rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts and path.name != "release.json":
+            add(zf, "chwp-agent/" + path.relative_to(SKILL).as_posix(), path.read_bytes())
+
+
+def write_text_skill(full: Path, version: str, out: Path) -> None:
+    """실행 파일 없이 글만 묶은 스킬. release.json 이 full(릴리스에 올린 이름 그대로)을 가리킨다."""
+    data = full.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = set(archive.namelist())
+        if BINARY_MEMBER not in names:
+            sys.exit(f"{full.name} 에 {BINARY_MEMBER} 가 없습니다.")
+    # 실행 파일 옆에 함께 꺼낼 파일(ZIP 안 경로 → 실행 파일 폴더 기준 경로). 그 ZIP 에 있는 것만 적는다(옛 릴리스에는 없다).
+    extras = {member: relative for member, relative in {FALLBACK_FONT_MEMBER: "fonts/HANBatang.woff2"}.items()
+              if member in names}
+    release = {
+        "version": version,
+        "binaries": {
+            "linux-x86_64": {
+                "url": RELEASE_URL.format(version=version, name=full.name),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "member": BINARY_MEMBER,
+                "files": extras,
+            }
+        },
+    }
+    with zipfile.ZipFile(out, "w") as zf:
+        add_skill_text(zf)
+        add(zf, "chwp-agent/scripts/release.json", (json.dumps(release, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    print(f"{out} ({out.stat().st_size / 1024:.0f} KB, 실행 파일은 {release['binaries']['linux-x86_64']['url']})")
+
+
+def text_skill_path(full: Path) -> Path:
+    return full.with_name(full.name.replace("chwp-agent", "chwp-agent-skill", 1))
+
+
 def main() -> None:
-    args = [arg for arg in sys.argv[1:] if arg != "--skia"]
-    out = Path(args[0]) if args else ROOT / "tmp" / "chwp-agent-skill" / "chwp-agent.zip"
+    argv = sys.argv[1:]
+    take = lambda flag: argv[argv.index(flag) + 1] if flag in argv else None  # noqa: E731
+    given_from = take("--from")
+    given_version = take("--version")
+    args = [a for i, a in enumerate(argv)
+            if not a.startswith("--") and (i == 0 or argv[i - 1] not in ("--from", "--version"))]
+    if given_from:
+        full = Path(given_from)
+        found = re.search(r"chwp-agent-([0-9.]+)\.zip$", full.name)
+        version = given_version or (found.group(1) if found else None)
+        if not version:
+            sys.exit("--from ZIP 이름에서 버전을 읽지 못했습니다. --version 을 주세요.")
+        folder = Path(args[0]) if args else full.parent
+        folder.mkdir(parents=True, exist_ok=True)
+        write_text_skill(full, version, folder / text_skill_path(full).name)
+        return
+    version = given_version or project_version()
+    out = Path(args[0]) if args else ROOT / "tmp" / "chwp-agent-skill" / f"chwp-agent-{version}.zip"
     out.parent.mkdir(parents=True, exist_ok=True)
     if "--skia" in sys.argv or not (SKIA / SKIA_OUT / "libdawn_combined.a").is_file():
         build_skia()
     built = tarfile.open(fileobj=io.BytesIO(build_linux()))
     with zipfile.ZipFile(out, "w") as zf:
-        for path in sorted(SKILL.rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts:
-                add(zf, "chwp-agent/" + path.relative_to(SKILL).as_posix(), path.read_bytes())
+        add_skill_text(zf)
         for member in built.getmembers():
             if not member.isfile():
                 continue
             name = member.name.removeprefix("./")
             add(zf, "chwp-agent/bin/" + name, built.extractfile(member).read(), executable=name == "chwp-agent")
+        add(zf, FALLBACK_FONT_MEMBER, fallback_font())
     print(f"{out} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
+    write_text_skill(out, version, text_skill_path(out))
 
 
 if __name__ == "__main__":

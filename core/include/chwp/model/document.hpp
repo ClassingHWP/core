@@ -607,6 +607,60 @@ struct ShapePoint {
     std::int32_t y = 0;
 };
 
+// 그림 효과(한글 2010 이후 그림 탭 "그림 효과"): 그림자·네온·부드러운 가장자리·반사.
+// HWP 는 그림 기록 꼬리(플래그 u32 다음 켜진 효과가 이 차례), HWPX 는 hp:pic 의 hp:effects 다.
+// 길이·각은 파일 값 그대로(HWPUNIT·도), 투명도·위치·배율은 0~1 비율이다. HWP 가 float 로 담아 float 로 둔다.
+struct PictureEffects {
+    // 정렬(alignStyle): 0 TOP_LEFT, 1 TOP, 2 TOP_RIGHT, 3 LEFT, 4 CENTER, 5 RIGHT, 6 BOTTOM_LEFT, 7 BOTTOM, 8 BOTTOM_RIGHT.
+    struct Shadow {
+        int style = 0;  // 0 OUTSIDE, 1 INSIDE
+        float alpha = 0;
+        float radius = 0;     // 흐릿하게
+        float direction = 0;  // 도
+        float distance = 0;
+        int align = 0;
+        float skewX = 0;
+        float skewY = 0;
+        float scaleX = 1;
+        float scaleY = 1;
+        int rotateWithShape = 0;
+        std::uint32_t color = 0;  // 0x00rrggbb
+    };
+    struct Glow {
+        float alpha = 0;
+        float radius = 0;
+        std::uint32_t color = 0;
+    };
+    struct Reflection {
+        int align = 0;
+        float radius = 0;
+        float direction = 0;
+        float distance = 0;
+        float skewX = 0;
+        float skewY = 0;
+        float scaleX = 1;
+        float scaleY = 1;
+        int rotateWithShape = 0;
+        float startAlpha = 0;
+        float startPos = 0;
+        float endAlpha = 0;
+        float endPos = 0;
+        float fadeDirection = 0;
+    };
+    std::optional<Shadow> shadow;
+    std::optional<Glow> glow;
+    std::optional<float> softEdge;  // 반경
+    std::optional<Reflection> reflection;
+    // 색을 RGB 말고 다른 꼴(테마 색 등)이나 색 효과와 함께 적은 효과는 아직 풀지 않는다. 그 파일 원본을 두었다가 같은 형식으로
+    // 저장할 때 그대로 쓴다. hwpRaw 는 플래그부터 기록 끝까지(원래 크기·투명도 포함), hwpxRaw 는 hp:effects 째다.
+    Bytes hwpRaw;
+    std::string hwpxRaw;
+
+    [[nodiscard]] bool empty() const {
+        return !shadow && !glow && !softEdge && !reflection && hwpRaw.empty() && hwpxRaw.empty();
+    }
+};
+
 // 그림 자르기·색. 자르기 좌표는 최초 이미지 크기 안이다.
 // 자르기가 그 크기와 같거나 없으면 비트맵 전체를 상자에 넣는다.
 // rect 는 처음 넣은 그림 사각형(imgRect)이다. 0이면 원본 크기와 같다.
@@ -628,6 +682,7 @@ struct PictureView {
     int contrast = 0;       // -100..100
     int effect = 0;         // 0 원래, 1 회색조, 2 흑백
     int transparency = 0;   // 0 불투명, 255 완전 투명
+    PictureEffects effects;
 };
 
 // 구역의 각주·미주 모양. 번호 다시 시작과 미주를 모으는 곳은 파일 속성이다.

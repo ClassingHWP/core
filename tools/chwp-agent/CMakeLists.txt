@@ -6,3 +6,4 @@ if(WIN32)
 endif()
 
 target_link_libraries(chwp-agent PRIVATE chwp::core)
+target_compile_definitions(chwp-agent PRIVATE CHWP_VERSION="${PROJECT_VERSION}")

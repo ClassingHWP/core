@@ -24,8 +24,8 @@
 #include "include/core/SkPixmap.h"
 #include "include/core/SkRect.h"
 
-#if CHWP_HAS_GPU
 class SkCanvas;
+#if CHWP_HAS_GPU
 class SkColorFilter;
 namespace skgpu::graphite {
 class Recorder;
@@ -167,6 +167,17 @@ struct PictureRect {
 
 // 개체 칸을 구울 때 픽셀로 그리지 않고 남겨 두는 그림 한 장. 좌표는 칸 비트맵 픽셀(구운 배율)이다.
 // 화면은 칸 비트맵보다 먼저 이것을 텍스처로 그린다. 칸의 테두리는 비트맵에 남아 그림 위에 얹힌다.
+// 안쪽 그림자. 그림 위에 얹는다. 옮김과 시그마는 dst 와 같은 단위다.
+struct InnerShadow {
+    float dx = 0;
+    float dy = 0;
+    float sigma = 0;
+    std::uint32_t argb = 0;  // 0 이면 없다
+};
+
+// 그림 사각형 area 안쪽에 그림자를 얹는다. scale 은 옮김·시그마에 곱할 배율이다.
+void drawInnerShadow(SkCanvas* canvas, const SkRect& area, const InnerShadow& shadow, float scaleX, float scaleY);
+
 struct FramePicture {
     std::string id;
     std::shared_ptr<const CachedPicture> picture;
@@ -176,7 +187,12 @@ struct FramePicture {
     bool flipH = false;
     bool flipV = false;
     PictureTone tone;
+    float softEdge = 0;  // 부드러운 가장자리 반경(dst 와 같은 단위). 0 이면 없다
+    InnerShadow innerShadow;
 };
+
+// 그림을 그린 area 의 가장자리를 radius 만큼 흐리게 지운다. 그림만 든 층 위에서 부른다.
+void softEdgeMask(SkCanvas* canvas, const SkRect& area, float radius);
 
 // 칸 id 별로 남긴 그림. 칸을 구울 때마다 갈아 끼우고, 칸을 버리면 함께 버린다.
 void storeFramePictures(int id, std::vector<FramePicture> pictures);

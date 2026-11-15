@@ -70,6 +70,13 @@ std::uint32_t ByteReader::u32() {
     return v;
 }
 
+float ByteReader::f32() {
+    const std::uint32_t bits = u32();
+    float v = 0;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
 std::uint64_t ByteReader::u64() {
     const std::uint64_t lo = u32();
     const std::uint64_t hi = u32();
@@ -120,6 +127,12 @@ void ByteWriter::u32(std::uint32_t v) {
 void ByteWriter::u64(std::uint64_t v) {
     u32(static_cast<std::uint32_t>(v & 0xFFFFFFFFull));
     u32(static_cast<std::uint32_t>((v >> 32) & 0xFFFFFFFFull));
+}
+
+void ByteWriter::f32(float v) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    u32(bits);
 }
 
 void ByteWriter::f64(double v) {

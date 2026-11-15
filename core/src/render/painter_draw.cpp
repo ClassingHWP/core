@@ -159,7 +159,7 @@ bool Painter::seedAncestorClips(const Node& page, const std::vector<int>& path, 
                 clip = intersectClip(clip, x + child.x, y + child.y, child.width, child.height);
                 hasBoxClip = true;
             } else if (clipsOwnBox(*cur)) {
-                const std::int32_t bleed = tableBorderBleed(*cur);
+                const std::int32_t bleed = objectInkBleed(*cur);
                 clip = intersectClip(clip, x - bleed, y - bleed, cur->width + bleed * 2,
                                      cur->height + bleed * 2);
                 hasBoxClip = true;
@@ -708,6 +708,20 @@ bool Painter::skiaTile(const CachedPicture& image, int x, int y, int w, int h) {
 }
 
 void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
+    // 화면이 나중에 텍스처로 그리는 그림은 안쪽 그림자도 그때 얹는다(FramePicture::innerShadow).
+    if (pictureBody(node, x, y)) return;
+    const InnerShadow inner = innerShadowPx(node);
+    if (inner.argb == 0) return;
+    SkCanvas* canvas = this->canvas();
+    if (!canvas) return;
+    const float l = static_cast<float>(px(x));
+    const float t = static_cast<float>(px(y));
+    const SkRect area = SkRect::MakeLTRB(l, t, std::max(l + 1.0f, static_cast<float>(px(x + node.width))),
+                                         std::max(t + 1.0f, static_cast<float>(px(y + node.height))));
+    drawInnerShadow(canvas, area, inner, 1.0f, 1.0f);
+}
+
+bool Painter::pictureBody(const Node& node, std::int32_t x, std::int32_t y) {
     const std::shared_ptr<const CachedPicture> image = pictureFor(*doc, node.ext().obj().binItemId);
     const int dx = px(x);
     const int dy = px(y);
@@ -716,7 +730,7 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
     if (!image) {
         pictureMissed = true;
         fillRect(bitmap, dx, dy, dw, dh, 0xE7, 0xED, 0xF2);
-        return;
+        return false;
     }
     int x0 = dx;
     int y0 = dy;
@@ -728,14 +742,14 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
         const int iy0 = px(y + pic.padTop);
         const int ix1 = px(x + node.width - pic.padRight);
         const int iy1 = px(y + node.height - pic.padBottom);
-        if (ix1 <= ix0 || iy1 <= iy0) return;
+        if (ix1 <= ix0 || iy1 <= iy0) return false;
         x0 = ix0;
         y0 = iy0;
         x1 = ix1;
         y1 = iy1;
     }
     PictureSource source;
-    if (!cropSource(pictureCrop(pic), image->width, image->height, source)) return;
+    if (!cropSource(pictureCrop(pic), image->width, image->height, source)) return false;
     if (source.fracL != 0 || source.fracT != 0 || source.fracR != 1 || source.fracB != 1) {
         const int boxW = x1 - x0;
         const int boxH = y1 - y0;
@@ -746,7 +760,7 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
         const int top = along(source.fracT, boxH);
         const int right = along(source.fracR, boxW);
         const int bottom = along(source.fracB, boxH);
-        if (right <= left || bottom <= top) return;
+        if (right <= left || bottom <= top) return false;
         x0 += left;
         y0 += top;
         x1 = x0 + (right - left);
@@ -761,7 +775,7 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
     if (tone.on()) draw.tone = &tone;
     const int drawW = x1 - x0;
     const int drawH = y1 - y0;
-    if (drawW <= 0 || drawH <= 0) return;
+    if (drawW <= 0 || drawH <= 0) return false;
     if (pictureSink && !image->levelSizes.empty() && image->width <= kMaxPictureTexture &&
         image->height <= kMaxPictureTexture) {
         // 확대해도 다시 굽지 않으므로 자리는 픽셀로 반올림하지 않는다.
@@ -792,10 +806,16 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
         item.flipH = node.flipHorizontal;
         item.flipV = node.flipVertical;
         item.tone = tone;
+        item.softEdge = softEdgePx(node);
+        item.innerShadow = innerShadowPx(node);
         pictureSink->push_back(std::move(item));
-        return;
+        return true;
     }
-    if (skiaImage(*image, x0, y0, drawW, drawH, node.flipHorizontal, node.flipVertical, true, &draw)) return;
+    if (const float soft = softEdgePx(node); soft > 0.0f &&
+        softEdgeImage(*image, x0, y0, drawW, drawH, node.flipHorizontal, node.flipVertical, draw, soft)) {
+        return false;
+    }
+    if (skiaImage(*image, x0, y0, drawW, drawH, node.flipHorizontal, node.flipVertical, true, &draw)) return false;
     const double spanW = draw.srcR - draw.srcL;
     const double spanH = draw.srcB - draw.srcT;
     for (int row = 0; row < drawH; ++row) {
@@ -814,6 +834,7 @@ void Painter::picture(const Node& node, std::int32_t x, std::int32_t y) {
             blendPicture(bitmap, x0 + col, y0 + row, r, g, b, a);
         }
     }
+    return false;
 }
 
 }  // namespace chwp::render::paint_detail

@@ -1092,6 +1092,88 @@ bool isKeptObjectName(std::string_view name) {
 }
 
 // 보관한 원본 XML 의 개체 하나에 지금 위치·크기를 적는다.
+// 그림 효과 수. 한글은 printf "%f"(소수 6자리)로 쓰고 끝의 0 과 점을 지운다(0.39999998 → 0.4, 123.456001).
+std::string effectNumber(float v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%f", static_cast<double>(v));
+    std::string text(buf);
+    if (text.find('.') != std::string::npos) {
+        while (!text.empty() && text.back() == '0') text.pop_back();
+        if (!text.empty() && text.back() == '.') text.pop_back();
+    }
+    if (text == "-0") text = "0";
+    return text;
+}
+
+// hp:pic 의 hp:effects. 효과가 없으면 쓰지 않는다. 풀지 못한 원본이 있으면 그것을 그대로 쓴다.
+void writePictureEffects(pugi::xml_node pic, const PictureEffects& fx) {
+    static constexpr const char* aligns[] = {"TOP_LEFT", "TOP", "TOP_RIGHT", "LEFT", "CENTER",
+                                             "RIGHT", "BOTTOM_LEFT", "BOTTOM", "BOTTOM_RIGHT"};
+    if (!fx.hwpxRaw.empty()) {
+        pugi::xml_document kept;
+        if (kept.load_buffer(fx.hwpxRaw.data(), fx.hwpxRaw.size(), pugi::parse_default, pugi::encoding_utf8) &&
+            kept.document_element()) {
+            pic.append_copy(kept.document_element());
+            return;
+        }
+    }
+    if (!fx.shadow && !fx.glow && !fx.softEdge && !fx.reflection) return;
+    auto out = pic.append_child("hp:effects");
+    const auto num = [](pugi::xml_node n, const char* name, float v) {
+        n.append_attribute(name) = effectNumber(v).c_str();
+    };
+    const auto align = [](int i) { return i >= 0 && i < 9 ? aligns[i] : aligns[0]; };
+    const auto pair = [&](pugi::xml_node n, const char* name, const char* a, float x, const char* b, float y) {
+        auto e = n.append_child(name);
+        num(e, a, x);
+        num(e, b, y);
+    };
+    const auto color = [](pugi::xml_node n, std::uint32_t rgb) {
+        auto c = n.append_child("hp:effectsColor");
+        c.append_attribute("type") = "RGB";
+        c.append_attribute("schemeIdx") = -1;
+        c.append_attribute("systemIdx") = -1;
+        c.append_attribute("presetIdx") = -1;
+        auto v = c.append_child("hp:rgb");
+        v.append_attribute("r") = static_cast<int>((rgb >> 16) & 0xFFu);
+        v.append_attribute("g") = static_cast<int>((rgb >> 8) & 0xFFu);
+        v.append_attribute("b") = static_cast<int>(rgb & 0xFFu);
+    };
+    if (const auto& s = fx.shadow) {
+        auto e = out.append_child("hp:shadow");
+        e.append_attribute("style") = s->style == 1 ? "INSIDE" : "OUTSIDE";
+        num(e, "alpha", s->alpha);
+        num(e, "radius", s->radius);
+        num(e, "direction", s->direction);
+        num(e, "distance", s->distance);
+        e.append_attribute("alignStyle") = align(s->align);
+        e.append_attribute("rotationStyle") = s->rotateWithShape;
+        pair(e, "hp:skew", "x", s->skewX, "y", s->skewY);
+        pair(e, "hp:scale", "x", s->scaleX, "y", s->scaleY);
+        color(e, s->color);
+    }
+    if (const auto& g = fx.glow) {
+        auto e = out.append_child("hp:glow");
+        num(e, "alpha", g->alpha);
+        num(e, "radius", g->radius);
+        color(e, g->color);
+    }
+    if (fx.softEdge) num(out.append_child("hp:softEdge"), "radius", *fx.softEdge);
+    if (const auto& r = fx.reflection) {
+        auto e = out.append_child("hp:reflection");
+        e.append_attribute("alignStyle") = align(r->align);
+        num(e, "radius", r->radius);
+        num(e, "direction", r->direction);
+        num(e, "distance", r->distance);
+        e.append_attribute("rotationStyle") = r->rotateWithShape;
+        num(e, "fadeDirection", r->fadeDirection);
+        pair(e, "hp:skew", "x", r->skewX, "y", r->skewY);
+        pair(e, "hp:scale", "x", r->scaleX, "y", r->scaleY);
+        pair(e, "hp:alpha", "start", r->startAlpha, "end", r->endAlpha);
+        pair(e, "hp:pos", "start", r->startPos, "end", r->endPos);
+    }
+}
+
 void patchKeptPlacement(pugi::xml_node obj, const Control& ctrl, bool grouped) {
     if (!ctrl.placement) return;
     const Placement& p = *ctrl.placement;
@@ -1320,6 +1402,7 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
             dim.append_attribute("dimwidth") = ctrl.picture.originWidth;
             dim.append_attribute("dimheight") = ctrl.picture.originHeight;
         }
+        writePictureEffects(picNode, ctrl.picture.effects);
         return;
     }
 

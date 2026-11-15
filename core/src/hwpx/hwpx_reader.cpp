@@ -106,6 +106,104 @@ std::string str(const pugi::xml_node& node, const char* attr) {
     return node.attribute(attr).as_string();
 }
 
+float f32(const pugi::xml_node& node, const char* attr, float def = 0) {
+    return node.attribute(attr).as_float(def);
+}
+
+// 그림 효과의 투명도(그림자·네온 alpha, 반사 alpha start/end). 한글은 HWPX 의 이 값을 float 로 1-(1-x) 를 거쳐 담는다
+// (0.4 → 0x3ECCCCCC, 0.15 → 0x3E199998). 다른 수는 가장 가까운 float 다. 한글 2024 로 21 값을 저장해 확인했다.
+float effectAlpha(const pugi::xml_node& node, const char* attr) {
+    const float x = f32(node, attr);
+    const float inverse = 1.0f - x;
+    return 1.0f - inverse;
+}
+
+// 그림 효과 정렬 이름. 차례가 HWP 의 값이다(BOTTOM_LEFT 6, BOTTOM_RIGHT 8 을 한글 파일로 확인).
+constexpr const char* kEffectAligns[] = {"TOP_LEFT", "TOP", "TOP_RIGHT", "LEFT", "CENTER",
+                                         "RIGHT", "BOTTOM_LEFT", "BOTTOM", "BOTTOM_RIGHT"};
+
+int effectAlign(const pugi::xml_node& node) {
+    const std::string name = str(node, "alignStyle");
+    for (int i = 0; i < static_cast<int>(std::size(kEffectAligns)); ++i) {
+        if (name == kEffectAligns[i]) return i;
+    }
+    return 0;
+}
+
+// hp:effectsColor 의 RGB. RGB 말고 다른 꼴이거나 색 효과(hp:effect)가 붙으면 거짓이다.
+bool effectColor(const pugi::xml_node& node, std::uint32_t& rgb) {
+    auto color = child(node, "effectsColor");
+    if (!color) return true;
+    if (str(color, "type") != "RGB") return false;
+    bool known = true;
+    for (auto c : color.children()) {
+        if (c.type() != pugi::node_element) continue;
+        if (!is(c, "rgb")) {
+            known = false;
+            continue;
+        }
+        const auto part = [&](const char* a) { return static_cast<std::uint32_t>(std::clamp(i32(c, a), 0, 255)); };
+        rgb = (part("r") << 16) | (part("g") << 8) | part("b");
+    }
+    return known;
+}
+
+// hp:pic 의 hp:effects. 모르는 꼴이 있으면 hp:effects 원본을 두어 HWPX 로 저장할 때 그대로 쓴다.
+void readPictureEffects(const pugi::xml_node& node, PictureEffects& fx) {
+    bool known = true;
+    for (auto e : node.children()) {
+        if (e.type() != pugi::node_element) continue;
+        const auto skew = child(e, "skew");
+        const auto scale = child(e, "scale");
+        if (is(e, "shadow")) {
+            PictureEffects::Shadow s;
+            s.style = str(e, "style") == "INSIDE" ? 1 : 0;
+            s.alpha = effectAlpha(e, "alpha");
+            s.radius = f32(e, "radius");
+            s.direction = f32(e, "direction");
+            s.distance = f32(e, "distance");
+            s.align = effectAlign(e);
+            s.rotateWithShape = i32(e, "rotationStyle");
+            s.skewX = f32(skew, "x");
+            s.skewY = f32(skew, "y");
+            s.scaleX = f32(scale, "x", 1);
+            s.scaleY = f32(scale, "y", 1);
+            known = effectColor(e, s.color) && known;
+            fx.shadow = s;
+        } else if (is(e, "glow")) {
+            PictureEffects::Glow g;
+            g.alpha = effectAlpha(e, "alpha");
+            g.radius = f32(e, "radius");
+            known = effectColor(e, g.color) && known;
+            fx.glow = g;
+        } else if (is(e, "softEdge")) {
+            fx.softEdge = f32(e, "radius");
+        } else if (is(e, "reflection")) {
+            PictureEffects::Reflection r;
+            r.align = effectAlign(e);
+            r.radius = f32(e, "radius");
+            r.direction = f32(e, "direction");
+            r.distance = f32(e, "distance");
+            r.rotateWithShape = i32(e, "rotationStyle");
+            r.fadeDirection = f32(e, "fadeDirection");
+            r.skewX = f32(skew, "x");
+            r.skewY = f32(skew, "y");
+            r.scaleX = f32(scale, "x", 1);
+            r.scaleY = f32(scale, "y", 1);
+            const auto alpha = child(e, "alpha");
+            const auto pos = child(e, "pos");
+            r.startAlpha = effectAlpha(alpha, "start");
+            r.endAlpha = effectAlpha(alpha, "end");
+            r.startPos = f32(pos, "start");
+            r.endPos = f32(pos, "end");
+            fx.reflection = r;
+        } else {
+            known = false;
+        }
+    }
+    if (!known) fx.hwpxRaw = rawXml(node);
+}
+
 int pictureEffect(const std::string& name) {
     std::string key;
     for (unsigned char c : name) {
@@ -1957,6 +2055,7 @@ Control Parser::parseObject(const pugi::xml_node& node) {
             c.picture.originWidth = i32(dim, "dimwidth");
             c.picture.originHeight = i32(dim, "dimheight");
         }
+        if (auto fx = child(node, "effects")) readPictureEffects(fx, c.picture.effects);
         if (auto rect = child(node, "imgRect")) {
             bool any = false;
             std::int32_t minX = 0;

@@ -45,6 +45,7 @@
 #include "render/page_texture_cache.hpp"
 #include "render/paint_detail.hpp"
 #include "render/painter.hpp"
+#include "render/picture_effects.hpp"
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
@@ -996,14 +997,24 @@ std::vector<std::uint8_t> glyphAlpha(const std::vector<GlyphCommand>& commands, 
     return alpha;
 }
 
-// 칸 선은 경계 한가운데라 바깥 절반이 표 상자 밖에 있다. 픽셀로 반올림해도 잘리지 않게 선 굵기만큼 여유를 둔다.
-std::int32_t tableBorderBleed(const Node& node) {
+// 개체 상자 밖으로 나가는 선의 여유. 칸 선과 도형 테두리는 경계 한가운데라 바깥 절반이 상자 밖에 있다.
+// 픽셀로 반올림해도 잘리지 않게 선 굵기만큼 둔다. 점을 잇는 도형(다각형·선·곡선)의 뾰족한 꼭짓점은
+// 꺾임 한도(10, Painter::strokePaint)까지 나가므로 반 굵기의 10 배다.
+std::int32_t objectInkBleed(const Node& node) {
     std::int32_t bleed = 0;
     auto take = [&](const BorderEdge& edge) {
         if (edge.type.empty() || edge.type == "NONE") return;
         const std::int32_t width = edge.width > 0 ? edge.width : 28;
         if (width > bleed) bleed = width;
     };
+    if (node.kind == NodeKind::Object && node.role != "table") {
+        const BorderEdge& edge = node.ext().borderLeft;
+        if (!edge.type.empty() && edge.type != "NONE") {
+            const std::int32_t width = edge.width > 0 ? edge.width : 28;
+            const bool pointed = node.ext().obj().points.size() >= 2 && edge.end != 0 && edge.type != "CIRCLE";
+            bleed = std::max(bleed, pointed ? width * 5 : width);
+        }
+    }
     for (const Node& child : node.children) {
         if (child.kind != NodeKind::Cell) continue;
         take(child.ext().borderLeft);
@@ -2666,6 +2677,42 @@ inline std::uint64_t fnvMixEdge64(std::uint64_t h, const BorderEdge& e) {
     return fnvMix64(h, static_cast<std::uint64_t>(e.end));
 }
 
+inline std::uint64_t fnvMixFloat64(std::uint64_t h, float v) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof bits);
+    return fnvMix64(h, bits);
+}
+
+// 그림 효과의 모든 값. 하나라도 바뀌면 다시 그린다.
+inline std::uint64_t fnvMixEffects64(std::uint64_t h, const model::PictureEffects& fx) {
+    h = fnvMix64(h, (fx.shadow ? 1ULL : 0ULL) | (fx.glow ? 2ULL : 0ULL) | (fx.softEdge ? 4ULL : 0ULL) |
+                        (fx.reflection ? 8ULL : 0ULL));
+    if (fx.shadow) {
+        const auto& s = *fx.shadow;
+        for (float v : {s.alpha, s.radius, s.direction, s.distance, s.skewX, s.skewY, s.scaleX, s.scaleY}) {
+            h = fnvMixFloat64(h, v);
+        }
+        h = fnvMix64(h, static_cast<std::uint64_t>(s.style) | (static_cast<std::uint64_t>(s.align) << 8) |
+                            (static_cast<std::uint64_t>(s.rotateWithShape) << 16) |
+                            (static_cast<std::uint64_t>(s.color) << 24));
+    }
+    if (fx.glow) {
+        h = fnvMixFloat64(h, fx.glow->alpha);
+        h = fnvMixFloat64(h, fx.glow->radius);
+        h = fnvMix64(h, fx.glow->color);
+    }
+    if (fx.softEdge) h = fnvMixFloat64(h, *fx.softEdge);
+    if (fx.reflection) {
+        const auto& r = *fx.reflection;
+        for (float v : {r.radius, r.direction, r.distance, r.skewX, r.skewY, r.scaleX, r.scaleY, r.startAlpha,
+                        r.startPos, r.endAlpha, r.endPos, r.fadeDirection}) {
+            h = fnvMixFloat64(h, v);
+        }
+        h = fnvMix64(h, static_cast<std::uint64_t>(r.align) | (static_cast<std::uint64_t>(r.rotateWithShape) << 8));
+    }
+    return h;
+}
+
 inline void unionHuBox(std::int32_t& x, std::int32_t& y, std::int32_t& w, std::int32_t& h,
                        std::int32_t bx, std::int32_t by, std::int32_t bw, std::int32_t bh) {
     if (bw <= 0 || bh <= 0) return;
@@ -2919,11 +2966,19 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         } else {
             node.extMut().objMut().objectPageSerial = -1;
         }
-        const std::int32_t bleed = tableBorderBleed(node);
+        const std::int32_t bleed = objectInkBleed(node);
         node.huX = x - bleed;
         node.huY = y - bleed;
         node.huW = std::max<std::int32_t>(0, node.width + bleed * 2);
         node.huH = std::max<std::int32_t>(0, node.height + bleed * 2);
+        // 그림 효과는 그림 사각형 밖에 그려진다. 조판 상자와 같은 범위다(흐림도 그 안에서 끝난다).
+        if (node.role == "picture") {
+            const EffectBox fx = pictureEffectBox(node.ext().obj().picture.effects, node.width, node.height);
+            node.huX -= fx.left;
+            node.huY -= fx.top;
+            node.huW += fx.left + fx.right;
+            node.huH += fx.top + fx.bottom;
+        }
 
         std::uint64_t h = 14695981039346656037ULL;
         h = fnvMix64(h, 2002ULL);
@@ -2950,6 +3005,7 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(node.ext().obj().artShadowX)));
         h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(node.ext().obj().artShadowY)));
         h = fnvMix64(h, static_cast<std::uint64_t>(node.ext().cellSpacing));
+        h = fnvMixEffects64(h, node.ext().obj().picture.effects);
         h = fnvMix64(h, static_cast<std::uint64_t>((node.flipHorizontal ? 1 : 0) | (node.flipVertical ? 2 : 0)));
         h = fnvMixEdge64(h, node.ext().borderLeft);
         h = fnvMixEdge64(h, node.ext().borderRight);
@@ -3475,7 +3531,7 @@ struct FrameWalk {
                 }
                 return;
             }
-            const std::int32_t bleed = tableBorderBleed(node);
+            const std::int32_t bleed = objectInkBleed(node);
             if (!force && !node.huBoundsReady &&
                 misses(x - bleed, y - bleed, node.width + bleed * 2, node.height + bleed * 2)) {
                 return;
@@ -3494,8 +3550,18 @@ struct FrameWalk {
             }
             nextLayer = (bandDepth > 0 || frameBehind(node)) ? 0 : 2;
             if (node.role != "table" || tableBoxHasInk(node)) {
-                if (force || !misses(x - bleed, y - bleed, node.width + bleed * 2, node.height + bleed * 2)) {
-                    emit(node, 1, x, y, node.width, node.height, x, y, nextLayer, myZ, path, inObject,
+                // 그림 효과는 그림 사각형 밖까지 그린다. 칸도 효과 상자만큼 넓힌다.
+                const EffectBox fx = node.role == "picture"
+                                         ? pictureEffectBox(node.ext().obj().picture.effects, node.width, node.height)
+                                         : EffectBox{};
+                // 표 칸 선은 화면 셰이더가 그리므로 칸에 여유를 두지 않는다. 다른 개체는 테두리가 상자 밖으로 나간 몫도 칸에 든다.
+                const std::int32_t pad = node.role == "table" ? 0 : bleed;
+                const std::int32_t inkX = x - fx.left - pad;
+                const std::int32_t inkY = y - fx.top - pad;
+                const std::int32_t inkW = node.width + fx.left + fx.right + pad * 2;
+                const std::int32_t inkH = node.height + fx.top + fx.bottom + pad * 2;
+                if (force || !misses(inkX - bleed, inkY - bleed, inkW + bleed * 2, inkH + bleed * 2)) {
+                    emit(node, 1, inkX, inkY, inkW, inkH, x, y, nextLayer, myZ, path, inObject,
                          pictureFitsBaseFrame(node, baseScale) || pictureDrawsOnScreen(node));
                 }
             }
@@ -3818,7 +3884,7 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
         std::int32_t stripX0 = 0;
         std::int32_t stripX1 = -1;
         if (frame.kind >= 3 && node->role == "table") {
-            const std::int32_t bleed = tableBorderBleed(*node);
+            const std::int32_t bleed = objectInkBleed(*node);
             stripY0 = std::max<std::int32_t>(0, (frame.drawHuY - frame.originY) + bleed);
             stripY1 = stripY0 + std::max<std::int32_t>(0, frame.drawHuH - bleed * 2);
             stripX0 = std::max<std::int32_t>(0, (frame.drawHuX - frame.originX) + bleed);

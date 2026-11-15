@@ -2016,6 +2016,65 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
 
 // 그림 개체 속성. 효과 플래그가 0일 때만 그 뒤 9바이트(최초 크기, 투명도)를 읽는다.
 // 플래그 비트 배정이 없어 효과 덩어리 길이를 알 수 없다.
+// 그림 효과의 색: 종류 i32, 값, 색 효과 수 u32, 색 효과(종류 i32, 값 float)×수.
+// 한글 2024 가 쓴 RGB(종류 0, 0x00rrggbb) 에 색 효과가 없는 꼴만 푼다. 다른 꼴은 길이를 확인하지 않아 거짓을 돌려준다.
+bool readEffectColor(ByteReader& r, std::uint32_t& rgb) {
+    if (r.i32() != 0) return false;
+    rgb = r.u32() & 0xFFFFFFu;
+    return r.u32() == 0 && r.ok();
+}
+
+// 그림 기록 꼬리의 효과. 플래그 1 그림자, 2 네온, 4 부드러운 가장자리, 8 반사이고 켜진 것만 이 차례로 온다.
+// 수는 모두 float 이다. 반사는 56바이트다(형식 문서의 53 이 아니다).
+bool readPictureEffects(ByteReader& r, std::uint32_t flags, PictureEffects& fx) {
+    if ((flags & ~0xFu) != 0) return false;
+    if (flags & 0x1u) {
+        PictureEffects::Shadow s;
+        s.style = r.i32();
+        s.alpha = r.f32();
+        s.radius = r.f32();
+        s.direction = r.f32();
+        s.distance = r.f32();
+        s.align = r.i32();
+        s.skewX = r.f32();
+        s.skewY = r.f32();
+        s.scaleX = r.f32();
+        s.scaleY = r.f32();
+        s.rotateWithShape = r.i32();
+        const bool color = readEffectColor(r, s.color);
+        fx.shadow = s;
+        if (!color) return false;
+    }
+    if (flags & 0x2u) {
+        PictureEffects::Glow g;
+        g.alpha = r.f32();
+        g.radius = r.f32();
+        const bool color = readEffectColor(r, g.color);
+        fx.glow = g;
+        if (!color) return false;
+    }
+    if (flags & 0x4u) fx.softEdge = r.f32();
+    if (flags & 0x8u) {
+        PictureEffects::Reflection e;
+        e.align = r.i32();
+        e.radius = r.f32();
+        e.direction = r.f32();
+        e.distance = r.f32();
+        e.skewX = r.f32();
+        e.skewY = r.f32();
+        e.scaleX = r.f32();
+        e.scaleY = r.f32();
+        e.rotateWithShape = r.i32();
+        e.startAlpha = r.f32();
+        e.startPos = r.f32();
+        e.endAlpha = r.f32();
+        e.endPos = r.f32();
+        e.fadeDirection = r.f32();
+        fx.reflection = e;
+    }
+    return r.ok();
+}
+
 void readPicture(ByteView data, Control& control) {
     ByteReader p(data);
     if (p.remaining() < 73) {
@@ -2063,8 +2122,13 @@ void readPicture(ByteView data, Control& control) {
     p.u8();  // 테두리 투명도
     p.u32();  // instance ID
     if (p.remaining() < 4) return;
+    const std::size_t effectStart = p.position();
     const std::uint32_t effectFlags = p.u32();
-    if (effectFlags == 0 && p.remaining() >= 8) {
+    const bool effectsRead = readPictureEffects(p, effectFlags, control.picture.effects);
+    if (!effectsRead) {
+        // 풀지 못한 효과 뒤로는 자리를 모른다. 원본 꼬리를 그대로 두고 원래 크기는 아래에서 사각형 크기로 둔다.
+        control.picture.effects.hwpRaw.assign(data.begin() + static_cast<std::ptrdiff_t>(effectStart), data.end());
+    } else if (p.remaining() >= 8) {
         control.picture.originWidth = p.i32();
         control.picture.originHeight = p.i32();
         if (p.remaining() >= 1) {

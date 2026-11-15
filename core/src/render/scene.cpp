@@ -4,6 +4,7 @@
 
 #include "render/column_geom.hpp"
 #include "render/line_breaker.hpp"
+#include "render/picture_effects.hpp"
 #include "render/scene_detail.hpp"
 
 #include <algorithm>
@@ -678,11 +679,30 @@ Placement turnedPlacement(const Placement& p) {
     return out;
 }
 
+// 그림 효과가 차지하는 자리(render/picture_effects.hpp). 한글은 효과까지 든 상자를 개체 크기로 쓰고 바깥 여백은
+// 그 바깥에 더하므로, 흐름에서는 효과가 넘는 길이를 바깥 여백 안쪽에 더한 것과 같다. 그림은 그만큼 들어가 놓인다.
+EffectBox objectEffectBox(const Control& control) {
+    if (control.kind != ControlKind::Picture || !control.placement || control.picture.effects.empty()) return {};
+    return pictureEffectBox(control.picture.effects, static_cast<std::int32_t>(control.placement->width),
+                            static_cast<std::int32_t>(control.placement->height));
+}
+
+// 개체가 흐를 때 쓰는 배치. 효과가 없으면 파일 값과 같다.
+Placement flowPlacement(const Control& control) {
+    Placement out = *control.placement;
+    const EffectBox box = objectEffectBox(control);
+    out.marginLeft += box.left;
+    out.marginRight += box.right;
+    out.marginTop += box.top;
+    out.marginBottom += box.bottom;
+    return out;
+}
+
 void verticalAtom(const Document& doc, Atom& atom, int direction) {
     if (direction == 0 || atom.vertical) return;
     // 글자처럼 넣은 개체는 세운 그대로라 줄 방향으로는 높이와 위·아래 여백을 차지한다.
     if (atom.control && atom.control->placement && visualObject(*atom.control)) {
-        const Placement turned = turnedPlacement(*atom.control->placement);
+        const Placement turned = turnedPlacement(flowPlacement(*atom.control));
         atom.width = static_cast<std::int32_t>(turned.width) + turned.marginLeft + turned.marginRight;
         atom.vertical = true;
         return;
@@ -1196,10 +1216,11 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
     node.extMut().objMut().baseLine = control.baseLine;
     node.flipHorizontal = control.placement->flipHorizontal;
     node.flipVertical = control.placement->flipVertical;
-    node.marginLeft = control.placement->marginLeft;
-    node.marginRight = control.placement->marginRight;
-    node.marginTop = control.placement->marginTop;
-    node.marginBottom = control.placement->marginBottom;
+    const EffectBox effectBox = objectEffectBox(control);
+    node.marginLeft = control.placement->marginLeft + effectBox.left;
+    node.marginRight = control.placement->marginRight + effectBox.right;
+    node.marginTop = control.placement->marginTop + effectBox.top;
+    node.marginBottom = control.placement->marginBottom + effectBox.bottom;
     node.extMut().objMut().binItemId = control.binItemId;
     node.extMut().objMut().picture = control.picture;
     node.extMut().objMut().zOrder = control.placement->zOrder;
@@ -2395,7 +2416,9 @@ std::int32_t lineTextBox(const Node& line) {
 std::int32_t scanAtomHeight(const Atom& atom) {
     if (atom.control && atom.control->placement) {
         const Placement& placement = *atom.control->placement;
-        return static_cast<std::int32_t>(placement.height) + placement.marginTop + placement.marginBottom;
+        const EffectBox box = objectEffectBox(*atom.control);
+        return static_cast<std::int32_t>(placement.height) + placement.marginTop + placement.marginBottom + box.top +
+               box.bottom;
     }
     return atom.fontSize;
 }
@@ -2762,8 +2785,9 @@ std::vector<Atom> buildAtoms(const Document& doc, const Paragraph& para, const P
                 atom.charShapeId = run.charShapeId;
                 if (!options.deferText) atom.font = glyphFace(doc, *shape, U' ', !useLines, true).font;
                 const Placement& placement = *item.control.placement;
+                const EffectBox effectBox = objectEffectBox(item.control);
                 atom.width = static_cast<std::int32_t>(placement.width) + placement.marginLeft +
-                             placement.marginRight;
+                             placement.marginRight + effectBox.left + effectBox.right;
                 // 왼쪽 캡션은 개체 왼쪽이 아니라 캡션 왼쪽이 글자 자리다. 다음 글자는 밀린 개체 뒤에서 시작한다.
                 if (item.control.caption && item.control.caption->side == "LEFT" && !placement.groupInRoot) {
                     const Caption& cap = *item.control.caption;
@@ -2894,12 +2918,13 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
     std::int32_t y = 0;
     ColumnResume resume;
     // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 흘린다(turnedPlacement, uprightObject).
-    std::map<const Control*, Placement> turnedPlacements;
+    std::map<const Control*, Placement> turnedPlacements;  // 세로쓰기·그림 효과가 바꾼 배치
     auto placeOf = [&](const Control& control) -> const Placement& {
-        if (frame.textDirection == 0) return *control.placement;
+        if (frame.textDirection == 0 && objectEffectBox(control).empty()) return *control.placement;
         auto found = turnedPlacements.find(&control);
         if (found == turnedPlacements.end()) {
-            found = turnedPlacements.emplace(&control, turnedPlacement(*control.placement)).first;
+            const Placement flow = flowPlacement(control);
+            found = turnedPlacements.emplace(&control, frame.textDirection != 0 ? turnedPlacement(flow) : flow).first;
         }
         return found->second;
     };
@@ -3922,9 +3947,11 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                 }
                 if (only ? &item.control != only : alreadyPlaced(&item.control)) continue;
                 // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 놓는다.
-                const Placement turnedOwn =
-                    frame.textDirection != 0 ? turnedPlacement(*item.control.placement) : Placement{};
-                const Placement& placement = frame.textDirection != 0 ? turnedOwn : *item.control.placement;
+                const bool ownCopy = frame.textDirection != 0 || !objectEffectBox(item.control).empty();
+                const Placement own = !ownCopy               ? Placement{}
+                                      : frame.textDirection != 0 ? turnedPlacement(flowPlacement(item.control))
+                                                                 : flowPlacement(item.control);
+                const Placement& placement = ownCopy ? own : *item.control.placement;
                 if (placement.vertRelTo == "PARA" || placement.horzRelTo == "PARA") continue;
                 const bool paperRel = placement.vertRelTo == "PAPER" || placement.horzRelTo == "PAPER";
                 const std::int32_t originX = paperRel && frame.page ? 0 : column.x + (body ? body->x : 0);

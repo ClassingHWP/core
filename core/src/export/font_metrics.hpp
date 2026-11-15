@@ -16,6 +16,8 @@ namespace chwp::layout {
 
 // TTF/OTF 바이트를 글꼴 이름에 묶는다. 같은 프로세스에서 레이아웃이 이 폭을 쓴다.
 void registerFontFace(std::string face, std::vector<std::uint8_t> bytes);
+// 글꼴 파일 하나(TTF/OTF/WOFF2)를 그 안의 이름표에 적힌 이름(한글·영문)으로 넣는다. 넣은 이름들을 돌려준다.
+std::vector<std::string> registerFontFile(std::vector<std::uint8_t> bytes);
 // 들고 있는 글꼴 파일 바이트(같은 파일은 한 번)와 글자 표 바이트. 메모리 보고용.
 void fontMemory(std::size_t& fileBytes, std::size_t& tableBytes, int& faces);
 

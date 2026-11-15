@@ -11,9 +11,21 @@
 // 이 프로그램은 파일을 읽고 쓰기만 한다. 무엇을 받을지, 무엇을 할지는 모두 core 가 정한다.
 //
 // 끝 코드: 0 모두 성공, 1 실패한 요청이 있음, 2 사용법이 틀렸거나 문서를 열지 못함.
+//
+// 실행 파일 옆 fonts/ 폴더의 글꼴(.woff2·.ttf·.otf)은 시작할 때 core 에 넣는다(chwp::agent::addBundledFont).
+// 스킬 ZIP 은 마지막 대체 글꼴 함초롬바탕을 여기에 둔다. 글꼴을 받지 못한 환경에서도 글자가 보이게 하려는 것이다.
+//
+//   chwp-agent --mcp [--font-dir 글꼴캐시] [--out-dir 폴더] [--font-relay] [--verbose]
+//
+// MCP 서버(stdio). 한 줄에 JSON-RPC 메시지 하나를 읽고 응답을 한 줄씩 쓴다. 판단은 core(chwp::agent::McpServer)가 한다.
+// --font-relay 는 감싼 스크립트(skills/chwp-agent/scripts/chwp_agent.py --mcp)가 줄 때만 쓴다. 캐시에 없는 글꼴을
+// chwp/fetchFonts 요청으로 스크립트에 받아 달라고 하고, 그 응답이 올 때까지 들어온 다른 줄은 모아 두었다가 뒤에 처리한다.
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,12 +37,17 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <unistd.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
 #include "chwp/agent.hpp"
+#include "chwp/agent_mcp.hpp"
 
 namespace {
 
@@ -138,6 +155,105 @@ std::vector<std::string> loadFonts(chwp::agent::AgentDocument& doc, const std::s
     return absent;
 }
 
+bool readLine(std::string& line) {
+    if (!std::getline(std::cin, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return true;
+}
+
+int runMcp(int argc, char** argv, FILE* out) {
+    std::string fontDir;
+    std::string outDir;
+    bool relay = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--font-dir" && i + 1 < argc) fontDir = argv[++i];
+        else if (arg == "--out-dir" && i + 1 < argc) outDir = argv[++i];
+        else if (arg == "--font-relay") relay = true;
+    }
+    if (outDir.empty()) {
+        std::error_code error;
+        outDir = (std::filesystem::temp_directory_path(error) / "chwp-mcp").string();
+    }
+    chwp::agent::McpHost host;
+    host.readFile = [](const std::string& path, chwp::Bytes& bytes) { return readFile(path, bytes); };
+    host.writeFile = [](const std::string& path, const chwp::Bytes& bytes) { return writeFile(path, bytes); };
+    host.outDir = outDir;
+    host.version = CHWP_VERSION;
+    if (!fontDir.empty()) {
+        host.readFont = [fontDir](const std::string& path, chwp::Bytes& bytes) {
+            return readFile(fontDir + "/" + path, bytes);
+        };
+        host.readFontCatalog = [fontDir](std::string& index, std::string& licenseSwap, std::string& replace) {
+            index = readText(fontDir + "/index.json");
+            licenseSwap = readText(fontDir + "/license-swap.json");
+            replace = readText(fontDir + "/replace.json");
+        };
+    }
+    std::deque<std::string> waiting;
+    chwp::agent::McpServer* server = nullptr;
+    if (relay) {
+        // 글꼴을 받아 달라는 요청을 쓰고 그 응답까지 기다린다. 사이에 온 다른 메시지는 뒤에 처리한다.
+        host.fetchFonts = [&](const std::vector<std::string>& paths) {
+            reply(out, server->fontRequest(paths));
+            std::string line;
+            while (readLine(line)) {
+                if (server->answersFontRequest(line)) return;
+                waiting.push_back(std::move(line));
+            }
+        };
+    }
+    chwp::agent::McpServer mcp(std::move(host));
+    server = &mcp;
+    for (;;) {
+        std::string line;
+        if (!waiting.empty()) {
+            line = std::move(waiting.front());
+            waiting.pop_front();
+        } else if (!readLine(line)) {
+            break;
+        }
+        if (line.find_first_not_of(" \t") == std::string::npos) continue;
+        const std::string answer = mcp.handle(line);
+        if (!answer.empty()) reply(out, answer);
+    }
+    return 0;
+}
+
+// 실행 파일이 있는 폴더(플랫폼 호출). 모르면 빈 경로.
+std::filesystem::path executableDir() {
+#ifdef _WIN32
+    wchar_t buffer[32768];
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, 32768);
+    if (length == 0 || length >= 32768) return {};
+    return std::filesystem::path(std::wstring(buffer, length)).parent_path();
+#elif defined(__APPLE__)
+    char buffer[4096];
+    std::uint32_t size = sizeof buffer;
+    if (_NSGetExecutablePath(buffer, &size) != 0) return {};
+    std::error_code error;
+    return std::filesystem::canonical(buffer, error).parent_path();
+#else
+    std::error_code error;
+    return std::filesystem::read_symlink("/proc/self/exe", error).parent_path();
+#endif
+}
+
+// 실행 파일 옆 fonts/ 의 글꼴을 넣는다. 무엇을 어디에 쓸지는 core 가 정한다.
+void loadBundledFonts() {
+    const std::filesystem::path dir = executableDir() / "fonts";
+    std::error_code error;
+    if (dir.empty() || !std::filesystem::is_directory(dir, error)) return;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != ".woff2" && ext != ".ttf" && ext != ".otf") continue;
+        std::ifstream file(entry.path(), std::ios::binary);
+        chwp::Bytes bytes(std::istreambuf_iterator<char>(file), {});
+        if (!bytes.empty()) chwp::agent::addBundledFont(std::move(bytes));
+    }
+}
+
 int usage() {
     std::cerr << "사용법: chwp-agent <문서.hwp|.hwpx> [요청.jsonl | -] [-c JSON]... [--save 경로] [--out-dir 폴더]\n"
                  "                  [--font-dir 글꼴캐시] [--font-plan] [--verbose]\n";
@@ -154,6 +270,10 @@ int main(int argc, char** argv) {
         std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::string(arg) == "--verbose"; });
     FILE* const out = takeStdoutForReplies(verbose);
     if (!out) return 2;
+    loadBundledFonts();
+    if (std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::string(arg) == "--mcp"; })) {
+        return runMcp(argc, argv, out);
+    }
     std::string document;
     std::string outDir = ".";
     std::vector<std::string> requests;

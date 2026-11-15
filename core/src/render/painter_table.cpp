@@ -532,52 +532,41 @@ bool Painter::edgeWins(const BorderEdge& cand, bool candPrimary, const BorderEdg
     return false;
 }
 
-void Painter::drawDiagonalSegment(const BorderEdge& edge, int x0, int y0, int x1, int y1) {
-    if (edge.type.empty() || edge.type == "NONE") return;
+// 칸 대각선 한 줄. 끝점은 칸 비트맵의 HU 다. 화면 셰이더가 테두리를 그리는 칸이면 기운 선 조각으로 적어
+// 화면 배율에서 바로 긋는다(확대해도 다시 굽지 않는다). 아니면 같은 끝점을 반올림 없이 Skia 로 긋는다.
+// 두 줄 선 종류도 한 줄로 긋는다.
+void Painter::drawDiagonalSegment(const BorderEdge& edge, std::int32_t hx0, std::int32_t hy0, std::int32_t hx1,
+                                  std::int32_t hy1) {
+    if (edge.type.empty() || edge.type == "NONE" || (hx0 == hx1 && hy0 == hy1)) return;
+    if (sinksBorder()) {
+        BorderPiece piece;
+        piece.x0 = hx0;
+        piece.y0 = hy0;
+        piece.x1 = hx1;
+        piece.y1 = hy1;
+        piece.widthHu = edge.width > 0 ? edge.width : 28;
+        piece.kind = static_cast<std::uint8_t>(tableLineKind(edge.type));
+        piece.slant = true;
+        parseHex(edge.color.empty() ? "#000000" : edge.color, piece.r, piece.g, piece.b);
+        borderSink->push_back(piece);
+        return;
+    }
+    SkCanvas* canvas = this->canvas();
+    if (!canvas) return;
     std::uint8_t r, g, b;
     parseHex(edge.color.empty() ? "#000000" : edge.color, r, g, b);
-    const int thick = edgeThickPx(edge);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setStyle(SkPaint::kStroke_Style);
+    paint.setStrokeWidth(penPx(edge));
+    paint.setColor(SkColorSetARGB(255, r, g, b));
     float intervals[8];
     const int dashes = gdiDash(edge, intervals);
-    if (SkCanvas* canvas = this->canvas()) {
-        SkPaint paint;
-        paint.setAntiAlias(true);
-        paint.setStyle(SkPaint::kStroke_Style);
-        paint.setStrokeWidth(penPx(edge));
-        paint.setColor(SkColorSetARGB(255, r, g, b));
-        if (dashes >= 2) {
-            paint.setPathEffect(SkDashPathEffect::Make(
-                SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(dashes)), 0));
-        }
-        canvas->drawLine(static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1),
-                         static_cast<float>(y1), paint);
-        return;
+    if (dashes >= 2) {
+        paint.setPathEffect(SkDashPathEffect::Make(SkSpan<const SkScalar>(intervals, static_cast<std::size_t>(dashes)), 0));
     }
-    if (dashes < 2) {
-        thickLine(x0, y0, x1, y1, thick, r, g, b);
-        return;
-    }
-    const int dx = x1 - x0;
-    const int dy = y1 - y0;
-    const int steps = std::max(std::abs(dx), std::abs(dy));
-    if (steps <= 0) return;
-    int pattern[8];
-    for (int i = 0; i < dashes; ++i) pattern[i] = std::max(1, static_cast<int>(std::lround(intervals[i])));
-    int cursor = 0;
-    int slot = 0;
-    while (cursor < steps) {
-        const int n = pattern[slot % dashes];
-        const int draw = std::min(n, steps - cursor);
-        if (slot % 2 == 0) {
-            const int ax = x0 + dx * cursor / steps;
-            const int ay = y0 + dy * cursor / steps;
-            const int bx = x0 + dx * (cursor + draw) / steps;
-            const int by = y0 + dy * (cursor + draw) / steps;
-            thickLine(ax, ay, bx, by, thick, r, g, b);
-        }
-        cursor += draw;
-        ++slot;
-    }
+    canvas->drawLine(static_cast<float>(hx0) * scale, static_cast<float>(hy0) * scale, static_cast<float>(hx1) * scale,
+                     static_cast<float>(hy1) * scale, paint);
 }
 
 void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
@@ -588,13 +577,14 @@ void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
     const bool hasCenter = !node.ext().centerLine.empty() && node.ext().centerLine != "NONE";
     if (!hasSlash && !hasBackSlash && !hasCenter) return;
 
-    const int x0 = px(x);
-    const int y0 = px(y);
-    const int x1 = px(x + node.width);
-    const int y1 = px(y + node.height);
+    // 끝점은 HU 다. 픽셀로 반올림하지 않는다.
+    const std::int32_t x0 = x;
+    const std::int32_t y0 = y;
+    const std::int32_t x1 = x + node.width;
+    const std::int32_t y1 = y + node.height;
     if (x1 <= x0 || y1 <= y0) return;
-    const int xm = (x0 + x1) / 2;
-    const int ym = (y0 + y1) / 2;
+    const std::int32_t xm = (x0 + x1) / 2;
+    const std::int32_t ym = (y0 + y1) / 2;
     const ClipSuspend open(bitmap);
 
     auto paintSpec = [&](const model::DiagonalSpec& spec, bool isSlash) {
@@ -630,30 +620,30 @@ void Painter::cellDiagonals(const Node& node, std::int32_t x, std::int32_t y) {
         }
 
         if (below || above) {
-            std::vector<int> rSplits;
-            std::vector<int> cSplits;
-            for (std::int32_t dy : node.ext().obj().spanRowSplits) rSplits.push_back(px(y + dy));
-            for (std::int32_t dx : node.ext().obj().spanColSplits) cSplits.push_back(px(x + dx));
+            std::vector<std::int32_t> rSplits;
+            std::vector<std::int32_t> cSplits;
+            for (std::int32_t dy : node.ext().obj().spanRowSplits) rSplits.push_back(y + dy);
+            for (std::int32_t dx : node.ext().obj().spanColSplits) cSplits.push_back(x + dx);
             if (rSplits.empty()) rSplits.push_back(ym);
             if (cSplits.empty()) cSplits.push_back(xm);
 
             if (isSlash) {
                 if (above) {
-                    for (int sy : rSplits) drawDiagonalSegment(edge, x0, sy, x1, y0);
-                    for (int sx : cSplits) drawDiagonalSegment(edge, x0, y1, sx, y0);
+                    for (std::int32_t sy : rSplits) drawDiagonalSegment(edge, x0, sy, x1, y0);
+                    for (std::int32_t sx : cSplits) drawDiagonalSegment(edge, x0, y1, sx, y0);
                 }
                 if (below) {
-                    for (int sy : rSplits) drawDiagonalSegment(edge, x0, y1, x1, sy);
-                    for (int sx : cSplits) drawDiagonalSegment(edge, sx, y1, x1, y0);
+                    for (std::int32_t sy : rSplits) drawDiagonalSegment(edge, x0, y1, x1, sy);
+                    for (std::int32_t sx : cSplits) drawDiagonalSegment(edge, sx, y1, x1, y0);
                 }
             } else {
                 if (below) {
-                    for (int sy : rSplits) drawDiagonalSegment(edge, x0, sy, x1, y1);
-                    for (int sx : cSplits) drawDiagonalSegment(edge, x0, y0, sx, y1);
+                    for (std::int32_t sy : rSplits) drawDiagonalSegment(edge, x0, sy, x1, y1);
+                    for (std::int32_t sx : cSplits) drawDiagonalSegment(edge, x0, y0, sx, y1);
                 }
                 if (above) {
-                    for (int sy : rSplits) drawDiagonalSegment(edge, x0, y0, x1, sy);
-                    for (int sx : cSplits) drawDiagonalSegment(edge, sx, y0, x1, y1);
+                    for (std::int32_t sy : rSplits) drawDiagonalSegment(edge, x0, y0, x1, sy);
+                    for (std::int32_t sx : cSplits) drawDiagonalSegment(edge, sx, y0, x1, y1);
                 }
             }
         }

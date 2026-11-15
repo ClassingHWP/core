@@ -104,6 +104,7 @@ python skills/chwp-agent/scripts/chwp_agent.py 문서.hwp -c '{"call":"info"}'
 
 부르는 법과 요청 모양은 [skills/chwp-agent/SKILL.md](skills/chwp-agent/SKILL.md), [reference.md](skills/chwp-agent/reference.md) 에 있다.
 claude.ai 에 올릴 스킬 묶음(Linux 정적 실행 파일 포함)은 `tools/chwp-agent/package-skill.py` 가 Docker 로 만든다.
+`chwp-agent --mcp` 는 같은 기능을 MCP 서버(stdio)로 낸다. 설정은 [tools/chwp-agent/MCP.md](tools/chwp-agent/MCP.md) 에 있다.
 
 ### 웹 앱
 

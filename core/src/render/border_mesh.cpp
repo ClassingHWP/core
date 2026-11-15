@@ -84,7 +84,7 @@ namespace {
 
 // 정점마다 조각 전체를 싣는다. 정점 셰이더는 조각을 덮는 사각만 내고, 칠할 픽셀은 조각 셰이더가 정한다.
 //   seg   = 선분 양 끝 HU (모서리는 교점만)
-//   style = 굵기 HU, 선 번호, 안쪽(모서리는 가로선 안쪽), 꼭짓점 번호 + 4×모서리 + 8×세로선 안쪽이 양수
+//   style = 굵기 HU, 선 번호, 안쪽(모서리는 가로선 안쪽), 꼭짓점 번호 + 4×모서리 + 8×세로선 안쪽이 양수 + 16×기운 선
 struct Vertex {
     float seg[4];
     float style[4];
@@ -115,6 +115,7 @@ Varyings main(const Attributes a) {
     int W = imax(1, lr(a.style.x * wscale));
     float reach = float(imax(W, 6)) + 3.0;
     float code = a.style.w;
+    float slant = floor(code / 16.0);
     float vInside = floor(code / 8.0);
     float isCorner = floor((code - 8.0 * vInside) / 4.0);
     int corner = int(code - 8.0 * vInside - 4.0 * isCorner + 0.5);
@@ -122,6 +123,20 @@ Varyings main(const Attributes a) {
     float y0 = a.seg.y * scale.y;
     float x1 = a.seg.z * scale.x;
     float y1 = a.seg.w * scale.y;
+    if (slant > 0.5) {
+        // 기운 선: 선분을 따라 눕힌 사각. 반 굵기와 안티앨리어싱 몫만큼 넓힌다.
+        float2 d = float2(x1 - x0, y1 - y0);
+        float len = max(length(d), 0.001);
+        float2 dir = d / len;
+        float2 n = float2(-dir.y, dir.x);
+        float halfW = max(1.0, abs(a.style.x * wscale)) * 0.5 + 2.0;
+        float2 p0 = float2(x0, y0) - dir * 2.0;
+        float2 p1 = float2(x1, y1) + dir * 2.0;
+        float2 p = (corner == 1 || corner == 3) ? p1 : p0;
+        p += (corner >= 2 ? n : -n) * halfW;
+        v.position = p + origin;
+        return v;
+    }
     float l; float t; float r; float b;
     if (isCorner > 0.5) {
         l = x0 - reach; r = x0 + reach; t = y0 - reach; b = y0 + reach;
@@ -223,6 +238,40 @@ float2 main(const Varyings v, out half4 color) {
     float vInside = floor(code / 8.0) > 0.5 ? 1.0 : -1.0;
     bool isCorner = floor((code - 8.0 * floor(code / 8.0)) / 4.0) > 0.5;
     float2 local = v.position - origin;
+    if (floor(code / 16.0) > 0.5) {
+        // 기운 선(Painter::drawDiagonalSegment): 선분까지의 거리로 덮는 몫을 잰다. 끝은 각지게 자른다.
+        float2 a0 = float2(v.vSeg.x * scale.x, v.vSeg.y * scale.y);
+        float2 a1 = float2(v.vSeg.z * scale.x, v.vSeg.w * scale.y);
+        float2 d = a1 - a0;
+        float len = max(length(d), 0.001);
+        float2 dir = d / len;
+        float2 rel = local - a0;
+        float along = dot(rel, dir);
+        float off = abs(dot(rel, float2(-dir.y, dir.x)));
+        float pen = max(1.0, abs(widthHu * wscale));
+        float cover = clamp(pen * 0.5 + 0.5 - off, 0.0, 1.0);
+        cover *= clamp(along + 0.5, 0.0, 1.0) * clamp(len - along + 0.5, 0.0, 1.0);
+        // Painter::gdiDash
+        float on0 = 0.0; float off0 = 0.0; float on1 = 0.0; float off1 = 0.0; float on2 = 0.0; float off2 = 0.0;
+        if (kind == 2) { on0 = 7.5 * pen; off0 = 4.5 * pen; }
+        else if (kind == 6) { on0 = 15.0 * pen; off0 = 4.5 * pen; }
+        else if (kind == 3) { on0 = 1.5 * pen; off0 = 2.25 * pen; }
+        else if (kind == 7) { on0 = 1.0 * pen; off0 = 1.25 * pen; }
+        else if (kind == 4 || kind == 5) {
+            on0 = 15.0 * pen; off0 = 4.5 * pen; on1 = 1.5 * pen; off1 = 4.5 * pen;
+            if (kind == 5) { on2 = 1.5 * pen; off2 = 4.5 * pen; }
+        }
+        float period = on0 + off0 + on1 + off1 + on2 + off2;
+        if (period > 0.0) {
+            float phase = along - period * floor(along / period);
+            float b1 = on0 + off0;
+            float b2 = b1 + on1 + off1;
+            bool on = phase < on0 || (phase >= b1 && phase < b1 + on1) || (phase >= b2 && phase < b2 + on2);
+            if (!on) cover = 0.0;
+        }
+        color = v.vColor * half(cover);
+        return v.position;
+    }
     int px = int(floor(local.x));
     int py = int(floor(local.y));
     int W = imax(1, lr(widthHu * wscale));
@@ -372,7 +421,7 @@ BorderMesh makeBorderMesh(const std::vector<BorderPiece>& pieces) {
         vertices.reserve((end - start) * 4);
         for (std::size_t i = start; i < end; ++i) {
             const BorderPiece& piece = pieces[i];
-            const float flags = (piece.corner ? 4.f : 0.f) + (piece.vInside > 0 ? 8.f : 0.f);
+            const float flags = (piece.corner ? 4.f : 0.f) + (piece.vInside > 0 ? 8.f : 0.f) + (piece.slant ? 16.f : 0.f);
             for (int corner = 0; corner < 4; ++corner) {
                 Vertex v{};
                 v.seg[0] = static_cast<float>(piece.x0);

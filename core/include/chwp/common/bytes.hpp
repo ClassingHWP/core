@@ -33,6 +33,7 @@ public:
     std::int8_t i8() { return static_cast<std::int8_t>(u8()); }
     std::int16_t i16() { return static_cast<std::int16_t>(u16()); }
     std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
+    float f32();
 
     ByteView bytes(std::size_t count);
     std::u16string utf16(std::size_t codeUnits);
@@ -74,6 +75,7 @@ public:
     void i8(std::int8_t v) { u8(static_cast<std::uint8_t>(v)); }
     void i16(std::int16_t v) { u16(static_cast<std::uint16_t>(v)); }
     void i32(std::int32_t v) { u32(static_cast<std::uint32_t>(v)); }
+    void f32(float v);
     void f64(double v);
 
     void bytes(ByteView span);

@@ -8,6 +8,9 @@ core 가 달라고 한 글꼴 파일을 받아 캐시 폴더에 넣는 일만 �
   1. 환경 변수 CHWP_AGENT_BIN
   2. 스킬 폴더의 bin/chwp-agent(.exe)  (묶어서 배포할 때)
   3. 저장소 build/*/tools/chwp-agent/ 아래에서 가장 최근에 만든 것
+  4. 받아 둔 실행 파일(캐시의 bin/<버전>/). 없으면 scripts/release.json 이 가리키는 GitHub 릴리스 ZIP 을 받아
+     SHA-256 을 맞춰 본 뒤 그 안의 실행 파일만 꺼내 둔다. release.json 은 실행 파일 없이 묶은 스킬에만 있다.
+     캐시 폴더는 CHWP_AGENT_CACHE(없으면 ~/.cache/chwp-agent)다.
 
 글꼴:
   - 서버: 환경 변수 CHWP_FONT_BASE, 없으면 https://ede.kr/hwp/fonts/ (웹 뷰어와 같은 글꼴 서버)
@@ -19,21 +22,40 @@ core 가 달라고 한 글꼴 파일을 받아 캐시 폴더에 넣는 일만 �
   - --no-font-fetch 를 주면 받지 않고 캐시(와 파일 경로로 준 목록)만 쓴다. 받기가 실패해도 캐시로 이어 가므로
     에이전트는 이 옵션을 붙이지 않는다(미리 붙이면 받을 수 있던 글꼴이 빠진다). 시험·고장 찾기용이다.
   - 받지 못한 파일은 캐시에 "파일.missing" 표시를 남겨 같은 실행에서 다시 묻지 않는다.
+  - 글꼴 서버에 보내는 것은 목록 이름과 글꼴 파일 경로(예: full/HANBatang.woff2)뿐이다. 문서 내용·파일 이름은 보내지 않는다.
+  - 네트워크가 막혀(또는 환경이 바깥 접속을 막아) 받지 못하면 stderr 에 아래 한 줄을 남긴다. 에이전트는 이 줄을 보고
+    사용자에게 글꼴 받기를 허락받은 뒤 --fetch-fonts 로 다시 받는다(SKILL.md 의 글꼴 받기와 허락).
+      chwp-agent: fonts-blocked {"server":..., "lists":[...], "fonts":[...], "count":N, "sent":..., "retry":...}
+  - --fetch-fonts 는 문서를 고치거나 그리지 않고 그 문서에 필요한 글꼴만 받는다. 결과를 stdout 에 JSON 한 줄로 쓴다.
+      python chwp_agent.py --fetch-fonts <문서.hwp|.hwpx>
 
 사용법은 실행 파일과 같다:
   python chwp_agent.py <문서.hwp|.hwpx> [요청.jsonl | -] [-c JSON]... [--save 경로] [--out-dir 폴더]
+
+MCP 서버(stdio)로 쓰려면:
+  python chwp_agent.py --mcp
+실행 파일의 MCP 모드(chwp-agent --mcp --font-relay)를 띄워 클라이언트와 줄을 그대로 잇는다. 실행 파일이 캐시에
+없는 글꼴을 chwp/fetchFonts 요청으로 달라고 하면 이 스크립트가 글꼴 서버에서 받아 캐시에 넣고 답한다.
+그 요청과 답은 클라이언트에 보내지 않는다. 무엇을 할지(도구·판단)는 모두 실행 파일(core)이 정한다.
 """
 
+import hashlib
+import io
 import json
 import os
+import platform
 import subprocess
 import sys
+import threading
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 EXE = "chwp-agent.exe" if os.name == "nt" else "chwp-agent"
+CACHE = Path(os.environ.get("CHWP_AGENT_CACHE", Path.home() / ".cache" / "chwp-agent"))
+RELEASE = Path(__file__).resolve().parent / "release.json"
 FONT_BASE = os.environ.get("CHWP_FONT_BASE", "https://ede.kr/hwp/fonts/").rstrip("/") + "/"
 FONT_CACHE = Path(os.environ.get("CHWP_FONT_CACHE", Path.home() / ".cache" / "chwp-agent" / "fonts"))
 # 목록 파일과 그 목록을 대신할 파일 경로·주소를 주는 환경 변수.
@@ -58,19 +80,111 @@ def find_binary() -> Path | None:
         found = sorted(build.glob(f"*/tools/chwp-agent/**/{EXE}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if found:
             return found[0]
-    return None
+    return install_binary()
 
 
-def download(url: str, target: Path) -> bool:
+def platform_key() -> str:
+    system = "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else sys.platform)
+    if system.startswith("linux"):
+        system = "linux"
+    machine = platform.machine().lower()
+    machine = {"amd64": "x86_64", "x64": "x86_64", "aarch64": "arm64"}.get(machine, machine)
+    return f"{system}-{machine}"
+
+
+def install_binary() -> Path | None:
+    """release.json 이 가리키는 릴리스에서 이 환경의 실행 파일을 받아 캐시에 둔다. 이미 있으면 그것을 쓴다."""
+    if not RELEASE.is_file():
+        return None
+    release = json.loads(RELEASE.read_text(encoding="utf-8"))
+    key = platform_key()
+    entry = release.get("binaries", {}).get(key)
+    if not entry:
+        sys.stderr.write(f"이 환경({key})용 chwp-agent 실행 파일은 아직 배포하지 않습니다. "
+                         f"배포하는 환경: {', '.join(release.get('binaries', {})) or '없음'}\n")
+        return None
+    target = CACHE / "bin" / release["version"] / EXE
+    if target.is_file():
+        return target
+    sys.stderr.write(f"chwp-agent {release['version']} 실행 파일을 받습니다: {entry['url']}\n")
+    try:
+        with urllib.request.urlopen(entry["url"], timeout=120) as response:
+            data = response.read()
+    except Exception as error:  # 네트워크가 막혔거나 릴리스에 없는 파일
+        sys.stderr.write(f"chwp-agent 실행 파일을 받지 못했습니다: {error}\n"
+                         "인터넷이 막힌 환경이면 실행 파일을 함께 묶은 스킬 ZIP 을 쓰거나 CHWP_AGENT_BIN 을 주세요.\n")
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != entry["sha256"]:
+        sys.stderr.write(f"받은 파일의 SHA-256 이 맞지 않아 쓰지 않습니다: {digest} (기대 {entry['sha256']})\n")
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            binary = archive.read(entry["member"])
+            # 실행 파일 옆에 둘 파일(마지막 대체 글꼴 등). 실행 파일보다 먼저 둔다.
+            for member, relative in entry.get("files", {}).items():
+                extra = target.parent / relative
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_bytes(archive.read(member))
+    except (zipfile.BadZipFile, KeyError) as error:
+        sys.stderr.write(f"받은 릴리스 ZIP 에서 실행 파일을 꺼내지 못했습니다: {error}\n")
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + ".part")
+    partial.write_bytes(binary)
+    if os.name != "nt":
+        partial.chmod(0o755)
+    os.replace(partial, target)
+    return target
+
+
+SENT = "글꼴 서버에는 글꼴 목록 이름과 글꼴 파일 경로만 요청합니다. 문서 내용과 파일 이름은 보내지 않습니다."
+# 이 실행에서 글꼴을 받은 결과. 막힌 것(네트워크·바깥 접속 차단)과 서버에 없는 것을 나눈다.
+FETCH = {"fetched": [], "absent": [], "blocked": [], "lists_blocked": [], "errors": []}
+
+
+def blocked_error(error: Exception) -> bool:
+    """서버가 없다고 답한 것(404·410)이 아니면 막힌 것으로 본다(접속 실패, 시간 초과, 프록시·방화벽 거절)."""
+    return not (isinstance(error, urllib.error.HTTPError) and error.code in (404, 410))
+
+
+def download(url: str, target: Path, path: str = "") -> bool:
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = response.read()
     except Exception as error:  # 네트워크가 막혔거나 서버에 없는 파일
         sys.stderr.write(f"글꼴을 받지 못했습니다: {url} ({error})\n")
+        if blocked_error(error):
+            FETCH["blocked"].append(path or url)
+            if len(FETCH["errors"]) < 3:
+                FETCH["errors"].append(str(error))
+        else:
+            FETCH["absent"].append(path or url)
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
+    FETCH["fetched"].append(path or url)
     return True
+
+
+def fonts_blocked() -> bool:
+    return bool(FETCH["blocked"]) or (bool(FETCH["lists_blocked"]) and not (FONT_CACHE / "index.json").is_file())
+
+
+def report_blocked() -> None:
+    """글꼴 받기가 막혔으면 에이전트가 알아볼 한 줄을 stderr 에 남긴다."""
+    if not fonts_blocked():
+        return
+    notice = {
+        "server": FONT_BASE,
+        "lists": FETCH["lists_blocked"],
+        "fonts": FETCH["blocked"][:20],
+        "count": len(FETCH["blocked"]),
+        "errors": FETCH["errors"],
+        "sent": SENT,
+        "retry": "사용자에게 글꼴 받기를 허락받은 뒤 python chwp_agent.py --fetch-fonts <문서> 를 실행하고 다시 부르세요.",
+    }
+    sys.stderr.write("chwp-agent: fonts-blocked " + json.dumps(notice, ensure_ascii=False) + "\n")
 
 
 def json_object(data: bytes) -> bool:
@@ -94,9 +208,16 @@ def fetch_list(url: str, target: Path) -> bool:
         if error.code == 304:
             return True
         sys.stderr.write(f"글꼴 목록을 받지 못했습니다: {url} ({error})\n")
+        if blocked_error(error):
+            FETCH["lists_blocked"].append(target.name)
+            if len(FETCH["errors"]) < 3:
+                FETCH["errors"].append(str(error))
         return False
     except Exception as error:  # 네트워크가 막혔다
         sys.stderr.write(f"글꼴 목록을 받지 못했습니다: {url} ({error})\n")
+        FETCH["lists_blocked"].append(target.name)
+        if len(FETCH["errors"]) < 3:
+            FETCH["errors"].append(str(error))
         return False
     if not json_object(data):
         sys.stderr.write(f"글꼴 목록이 JSON 객체가 아닙니다: {url}\n")
@@ -157,7 +278,7 @@ def fetch_fonts(binary: Path, args: list[str], stdin: bytes | None) -> None:
         for path in need:
             folder, _, file = path.partition("/")
             target = FONT_CACHE / folder / file
-            if not download(FONT_BASE + folder + "/" + urllib.parse.quote(file), target):
+            if not download(FONT_BASE + folder + "/" + urllib.parse.quote(file), target, path):
                 missing = target.with_name(target.name + ".missing")
                 missing.parent.mkdir(parents=True, exist_ok=True)
                 missing.touch()
@@ -177,17 +298,128 @@ def first_positional(args: list[str]) -> str | None:
     return None
 
 
+def fetch_requested(paths: list[str]) -> None:
+    """실행 파일이 달라는 글꼴을 받아 캐시에 넣는다.
+
+    core 는 한 문서에서 같은 파일을 한 번만 달라고 한다. 그래서 못 받은 표시가 있어도 다시 받아 본다.
+    허락을 받거나 네트워크가 열린 뒤 문서를 다시 열면(hwp_open) 그때 받는다.
+    """
+    for path in paths:
+        folder, _, file = path.partition("/")
+        target = FONT_CACHE / folder / file
+        missing = target.with_name(target.name + ".missing")
+        if target.is_file():
+            continue
+        if not download(FONT_BASE + folder + "/" + urllib.parse.quote(file), target, path):
+            missing.parent.mkdir(parents=True, exist_ok=True)
+            missing.touch()
+
+
+def run_mcp(binary: Path, fetch: bool) -> int:
+    """클라이언트 ↔ 실행 파일(MCP 모드) 사이에서 줄을 잇고, 글꼴 요청만 가로채 받아 준다."""
+    if FONT_CACHE.is_dir():
+        for mark in FONT_CACHE.rglob("*.missing"):
+            mark.unlink(missing_ok=True)
+    prepare_lists(fetch)
+    report_blocked()
+    # 목록이 아직 없어도 캐시 폴더를 넘긴다. 실행 파일은 문서를 열 때마다 목록을 다시 읽는다.
+    FONT_CACHE.mkdir(parents=True, exist_ok=True)
+    command = [str(binary), "--mcp", "--font-dir", str(FONT_CACHE)]
+    if fetch:
+        command.append("--font-relay")
+    server = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    lock = threading.Lock()
+
+    def to_server(data: bytes) -> None:
+        with lock:
+            server.stdin.write(data)
+            server.stdin.flush()
+
+    def opens_document(line: bytes) -> bool:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            return False
+        return (isinstance(message, dict) and message.get("method") == "tools/call"
+                and isinstance(message.get("params"), dict) and message["params"].get("name") == "hwp_open")
+
+    def pump_client() -> None:
+        try:
+            for line in sys.stdin.buffer:
+                # 문서를 열기 전에 글꼴 목록을 다시 맞춘다. 앞에서 막혔다가 허락받은 뒤 다시 여는 경우를 받는다.
+                if fetch and opens_document(line):
+                    FETCH["lists_blocked"].clear()
+                    prepare_lists(fetch)
+                    if FETCH["lists_blocked"]:
+                        report_blocked()
+                to_server(line)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                server.stdin.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=pump_client, daemon=True).start()
+    for line in server.stdout:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            message = None
+        if isinstance(message, dict) and message.get("method") == "chwp/fetchFonts":
+            before = len(FETCH["blocked"])
+            fetch_requested(message.get("params", {}).get("paths", []))
+            blocked = FETCH["blocked"][before:]
+            if blocked:
+                report_blocked()
+            answer = {"jsonrpc": "2.0", "id": message.get("id"), "result": {"blocked": blocked}}
+            to_server((json.dumps(answer) + "\n").encode("utf-8"))
+            continue
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+    return server.wait()
+
+
+def fetch_only(args: list[str], binary: Path) -> int:
+    """문서에 필요한 글꼴만 받는다. 문서를 고치거나 그리지 않는다. 결과는 stdout 에 JSON 한 줄이다."""
+    document = first_positional(args)
+    if not document:
+        sys.stderr.write("사용법: python chwp_agent.py --fetch-fonts <문서.hwp|.hwpx>\n")
+        return 2
+    prepare_lists(True)
+    fetch_fonts(binary, [document], None)
+    blocked = fonts_blocked()
+    result = {
+        "ok": not blocked,
+        "server": FONT_BASE,
+        "fetched": len(FETCH["fetched"]),
+        "notOnServer": FETCH["absent"],
+        "blocked": FETCH["blocked"],
+        "listsBlocked": FETCH["lists_blocked"],
+        "errors": FETCH["errors"],
+        "sent": SENT,
+    }
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0 if not blocked else 1
+
+
 def main() -> int:
     binary = find_binary()
     if binary is None:
-        sys.stderr.write(
-            "chwp-agent 실행 파일을 찾지 못했습니다. 저장소에서 다음으로 빌드하거나 CHWP_AGENT_BIN 을 주세요:\n"
-            "  cmake --build build/windows-msvc --config Release --target chwp-agent\n"
-        )
+        if not RELEASE.is_file():
+            sys.stderr.write(
+                "chwp-agent 실행 파일을 찾지 못했습니다. 저장소에서 다음으로 빌드하거나 CHWP_AGENT_BIN 을 주세요:\n"
+                "  cmake --build build/windows-msvc --config Release --target chwp-agent\n"
+            )
         return 2
     args = sys.argv[1:]
     fetch = "--no-font-fetch" not in args
     args = [a for a in args if a != "--no-font-fetch"]
+    if "--mcp" in args:
+        return run_mcp(binary, fetch)
+    if "--fetch-fonts" in args:
+        return fetch_only([a for a in args if a != "--fetch-fonts"], binary)
     document = first_positional(args)
     # 요청을 표준 입력(-)으로 받으면 글꼴을 묻는 실행과 진짜 실행에 같은 요청을 주려고 먼저 다 읽는다.
     stdin = sys.stdin.buffer.read() if "-" in args else None
@@ -195,6 +427,7 @@ def main() -> int:
         prepare_lists(fetch)
     if document and fetch:
         fetch_fonts(binary, args, stdin)
+        report_blocked()
     if document and (FONT_CACHE / "index.json").is_file():
         args += ["--font-dir", str(FONT_CACHE)]
     return subprocess.run([str(binary), *args], input=stdin).returncode

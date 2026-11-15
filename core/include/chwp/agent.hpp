@@ -402,6 +402,11 @@ struct EditReport {
 // 목록에서 metrics/·standin/ 으로 적힌 글꼴은 라이선스로 막힌 글꼴이라, 편집하면 편집기처럼 대역 원본으로 바꾼다.
 void setFontCatalog(const std::string& index, const std::string& licenseSwap, const std::string& replace);
 
+// 셸과 함께 배포한 글꼴 파일 하나를 넣는다(TTF/OTF/WOFF2). 문서를 열기 전에 부른다. 넣은 글꼴 이름들을 돌려준다.
+// 글꼴을 받지 못한 환경에서도 글자가 보이게 하는 마지막 대체 글꼴(함초롬바탕)이 이것으로 들어온다. 구할 수 없는
+// 글꼴의 폭과 그리기는 core 가 함초롬바탕으로 대신한다. 프로세스 전체에 걸린다.
+std::vector<std::string> addBundledFont(Bytes bytes);
+
 // 받을 글꼴 파일 하나.
 struct FontFile {
     int id = 0;

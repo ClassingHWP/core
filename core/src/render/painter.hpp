@@ -221,8 +221,8 @@ inline void turnGlyphPoint(const GlyphTurn* turn, float& x, float& y) {
     y = ry + turn->dy;
 }
 
-// 칸 선은 경계 한가운데라 바깥 절반이 표 상자 밖에 있다. 픽셀로 반올림해도 잘리지 않게 선 굵기만큼 여유를 둔다.
-std::int32_t tableBorderBleed(const Node& node);
+// 개체 상자 밖으로 나가는 선(칸 선, 도형 테두리와 뾰족한 꼭짓점)의 여유(paint.cpp).
+std::int32_t objectInkBleed(const Node& node);
 
 // 글자처럼 넣은 개체의 문단 위치. 그 개체를 블록에 넣으면 안쪽 글자도 같은 선택이다.
 struct TextHost {
@@ -604,10 +604,24 @@ struct Painter {
     bool skiaTile(const CachedPicture& image, int x, int y, int w, int h);
 
     void picture(const Node& node, std::int32_t x, std::int32_t y);
+    // 그림을 그린다. 화면이 나중에 텍스처로 그리도록 넘겼으면 참이다.
+    bool pictureBody(const Node& node, std::int32_t x, std::int32_t y);
+
+    // 그림 효과(painter_effects.cpp). 반사·그림자·네온은 그림보다 먼저 그린다.
+    void pictureEffects(const Node& node, std::int32_t x, std::int32_t y);
+    // 부드러운 가장자리 반경(이 칸의 픽셀). 없으면 0 이다.
+    float softEdgePx(const Node& node) const;
+    // 안쪽 그림자(이 칸의 픽셀 단위). 없으면 argb 가 0 이다.
+    InnerShadow innerShadowPx(const Node& node) const;
+    bool softEdgeImage(const CachedPicture& image, int dx, int dy, int dw, int dh, bool flipH, bool flipV,
+                       const ImageDraw& draw, float radius);
 
     void stamp(int x, int y, int radius, std::uint8_t r, std::uint8_t g, std::uint8_t b);
 
     void thickLine(int x0, int y0, int x1, int y1, int thick, std::uint8_t r, std::uint8_t g, std::uint8_t b);
+
+    // 도형 테두리 붓: 굵기·색·끝 모양·꺾임·점선. 사각형·타원·점 도형이 같이 쓴다.
+    void strokePaint(const BorderEdge& edge, SkPaint& paint) const;
 
     void drawPath(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
     // 점들로 채우고 긋는다. 채움은 닫힌 모양, 선은 점을 차례로 잇기만 한다(한글 2024: 다각형·곡선·자유선의 선은 닫지 않는다).
@@ -685,7 +699,7 @@ struct Painter {
     // 번호가 같으면 굵기가 큰 쪽이 이긴다. 종류와 굵기가 같으면 아래가 위보다, 오른쪽이 왼쪽보다 우선이다.
     static bool edgeWins(const BorderEdge& cand, bool candPrimary, const BorderEdge& cur, bool curPrimary);
 
-    void drawDiagonalSegment(const BorderEdge& edge, int x0, int y0, int x1, int y1);
+    void drawDiagonalSegment(const BorderEdge& edge, std::int32_t hx0, std::int32_t hy0, std::int32_t hx1, std::int32_t hy1);
 
     void cellDiagonals(const Node& node, std::int32_t x, std::int32_t y);
 

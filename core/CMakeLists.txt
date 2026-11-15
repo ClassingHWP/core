@@ -65,8 +65,10 @@ set(_chwp_core_sources
     src/render/edit_state.cpp
     src/render/pointer_hold.cpp
     src/render/painter_draw.cpp
+    src/render/painter_effects.cpp
     src/render/painter_proof.cpp
     src/render/picture.cpp
+    src/render/picture_effects.cpp
     src/render/metafile_preview.cpp
     src/render/picture_upload.cpp
     src/render/border_mesh.cpp
@@ -100,6 +102,7 @@ set(_chwp_core_sources
     src/export/font_metrics.cpp
     src/agent/agent.cpp
     src/agent/agent_call.cpp
+    src/agent/mcp_server.cpp
     src/app/doc_session.cpp
     src/app/session.cpp
     src/app/frame_stats.cpp
@@ -164,3 +167,21 @@ if(EMSCRIPTEN)
         target_compile_options(chwp_core_single PRIVATE -fexceptions)
     endif()
 endif()
+
+# MCP 서버의 hwp_reference 도구가 돌려주는 설명서. skills/chwp-agent/reference.md 를 바이트 목록으로 넣는다.
+# 설명서를 고치면 다시 구성한다. 설명서가 없는 소스 묶음(일부 배포)에서는 빈 설명서로 빌드한다.
+set(_chwp_reference "${CMAKE_SOURCE_DIR}/skills/chwp-agent/reference.md")
+set(_chwp_generated "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(_chwp_reference_bytes "")
+if(EXISTS "${_chwp_reference}")
+    file(READ "${_chwp_reference}" _chwp_reference_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _chwp_reference_bytes "${_chwp_reference_hex}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_chwp_reference}")
+endif()
+file(WRITE "${_chwp_generated}/agent_reference.inc.new" "${_chwp_reference_bytes}\n")
+file(COPY_FILE "${_chwp_generated}/agent_reference.inc.new" "${_chwp_generated}/agent_reference.inc" ONLY_IF_DIFFERENT)
+foreach(_chwp_target chwp_core chwp_core_single)
+    if(TARGET ${_chwp_target})
+        target_include_directories(${_chwp_target} PRIVATE "${_chwp_generated}")
+    endif()
+endforeach()

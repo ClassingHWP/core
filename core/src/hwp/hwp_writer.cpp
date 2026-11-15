@@ -93,6 +93,54 @@ std::uint32_t hexToColorRef(std::string_view s, std::uint32_t defaultVal = 0x000
     return toColorRef(rgb, defaultVal);
 }
 
+// 그림 효과 꼬리: 플래그 u32 다음 켜진 효과를 그림자·네온·부드러운 가장자리·반사 차례로. 색은 RGB(종류 0, 값, 색 효과 0개).
+void writePictureEffects(ByteWriter& w, const model::PictureEffects& fx) {
+    const std::uint32_t flags = (fx.shadow ? 0x1u : 0u) | (fx.glow ? 0x2u : 0u) | (fx.softEdge ? 0x4u : 0u) |
+                                (fx.reflection ? 0x8u : 0u);
+    w.u32(flags);
+    const auto color = [&](std::uint32_t rgb) {
+        w.i32(0);
+        w.u32(rgb & 0xFFFFFFu);
+        w.u32(0);
+    };
+    if (const auto& s = fx.shadow) {
+        w.i32(s->style);
+        w.f32(s->alpha);
+        w.f32(s->radius);
+        w.f32(s->direction);
+        w.f32(s->distance);
+        w.i32(s->align);
+        w.f32(s->skewX);
+        w.f32(s->skewY);
+        w.f32(s->scaleX);
+        w.f32(s->scaleY);
+        w.i32(s->rotateWithShape);
+        color(s->color);
+    }
+    if (const auto& g = fx.glow) {
+        w.f32(g->alpha);
+        w.f32(g->radius);
+        color(g->color);
+    }
+    if (fx.softEdge) w.f32(*fx.softEdge);
+    if (const auto& e = fx.reflection) {
+        w.i32(e->align);
+        w.f32(e->radius);
+        w.f32(e->direction);
+        w.f32(e->distance);
+        w.f32(e->skewX);
+        w.f32(e->skewY);
+        w.f32(e->scaleX);
+        w.f32(e->scaleY);
+        w.i32(e->rotateWithShape);
+        w.f32(e->startAlpha);
+        w.f32(e->startPos);
+        w.f32(e->endAlpha);
+        w.f32(e->endPos);
+        w.f32(e->fadeDirection);
+    }
+}
+
 std::uint8_t toHwpBorderKind(std::string_view type) {
     if (type.empty() || type == "NONE") return 0;
     static constexpr std::pair<std::string_view, std::uint8_t> kKinds[] = {
@@ -1216,10 +1264,15 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         w.u16(bins.resolve(ctrl.binItemId));
         w.u8(0);  // border transparency
         w.u32(0x50000002u);
-        w.u32(0);  // effectFlags = 0
-        w.i32(dimW);
-        w.i32(dimH);
-        w.i8(static_cast<std::int8_t>(std::clamp(ctrl.picture.transparency, 0, 255)));
+        if (!ctrl.picture.effects.hwpRaw.empty()) {
+            // HWP 에서 읽었으나 풀지 못한 효과: 원본 꼬리(원래 크기·투명도 포함)를 그대로 쓴다.
+            w.bytes(ctrl.picture.effects.hwpRaw);
+        } else {
+            writePictureEffects(w, ctrl.picture.effects);
+            w.i32(dimW);
+            w.i32(dimH);
+            w.i8(static_cast<std::int8_t>(std::clamp(ctrl.picture.transparency, 0, 255)));
+        }
         appendRecord(stream, tag::ShapeComponentPicture, compLevel + 1, w.view());
     } else if (st == "rect") {
         ByteWriter w;

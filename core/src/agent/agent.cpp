@@ -1598,6 +1598,10 @@ bool AgentDocument::redo() {
     return true;
 }
 
+std::vector<std::string> addBundledFont(Bytes bytes) {
+    return layout::registerFontFile(std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
+}
+
 void setFontCatalog(const std::string& index, const std::string& licenseSwap, const std::string& replace) {
     layout::setFontCatalog(index.empty() ? "{}" : index);
     layout::setFontLicenseSwaps(licenseSwap.empty() ? "{}" : licenseSwap);

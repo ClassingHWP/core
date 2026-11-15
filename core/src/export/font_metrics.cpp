@@ -936,12 +936,27 @@ void ensureFileIndex() {
     // 한글이 같이 두는 트루타입. 윈도우에 설치되지 않은 글꼴(양재난초체 등)을 그릴 때 쓴다.
     dirs.push_back(std::filesystem::path(L"C:\\Program Files (x86)\\Hnc\\Office 2024\\HOffice130\\Shared\\TTF\\Hwp"));
     dirs.push_back(std::filesystem::path(L"C:\\Program Files (x86)\\Hnc\\Office 2024\\HOffice130\\Shared\\TTF\\All"));
+#elif defined(__APPLE__)
+    dirs.push_back("/System/Library/Fonts");
+    dirs.push_back("/Library/Fonts");
+    if (const char* home = std::getenv("HOME")) dirs.push_back(std::filesystem::path(home) / "Library" / "Fonts");
+#elif !defined(__EMSCRIPTEN__)
+    // 리눅스는 글꼴을 하위 폴더에 나눠 둔다(fontconfig 와 같은 자리).
+    dirs.push_back("/usr/share/fonts");
+    dirs.push_back("/usr/local/share/fonts");
+    if (const char* home = std::getenv("HOME")) {
+        dirs.push_back(std::filesystem::path(home) / ".local" / "share" / "fonts");
+        dirs.push_back(std::filesystem::path(home) / ".fonts");
+    }
 #endif
     for (const auto& dir : dirs) {
         std::error_code error;
         if (!std::filesystem::is_directory(dir, error)) continue;
-        for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
-            if (error) break;
+        const auto options = std::filesystem::directory_options::skip_permission_denied;
+        for (auto it = std::filesystem::recursive_directory_iterator(dir, options, error);
+             !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+            const auto& entry = *it;
+            if (!entry.is_regular_file(error)) continue;
             const auto ext = entry.path().extension().wstring();
             std::wstring lower = ext;
             std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
@@ -1103,6 +1118,26 @@ std::vector<std::uint8_t> sfntFromDelivered(std::vector<std::uint8_t> bytes) {
     std::vector<std::uint8_t> sfnt(outSize);
     if (!woff2::ConvertWOFF2ToTTF(sfnt.data(), sfnt.size(), bytes.data(), bytes.size())) return {};
     return sfnt;
+}
+
+
+std::vector<std::string> registerFontFile(std::vector<std::uint8_t> bytes) {
+    std::vector<std::string> faces;
+    const std::vector<std::uint8_t> sfnt = sfntFromDelivered(bytes);
+    if (sfnt.size() < 12 || std::memcmp(sfnt.data(), "ttcf", 4) == 0) return faces;
+    const std::uint16_t tables = u16(sfnt.data() + 4);
+    if (12u + tables * 16u > sfnt.size()) return faces;
+    const std::uint32_t nameOff = tableOffset(sfnt.data(), tables, "name");
+    const std::uint32_t nameLen = tableLength(sfnt.data(), tables, "name");
+    if (!nameOff || nameOff + nameLen > sfnt.size()) return faces;
+    collectNames(sfnt.data() + nameOff, nameLen, faces);
+    if (faces.empty()) return faces;
+    registerFontFace(faces.front(), std::move(bytes));
+    {
+        std::lock_guard lock(gMutex);
+        bindSiblingNames(faces.front(), faces);
+    }
+    return faces;
 }
 
 void fontMemory(std::size_t& fileBytes, std::size_t& tableBytes, int& faces) {
