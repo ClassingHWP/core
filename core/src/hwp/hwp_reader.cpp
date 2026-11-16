@@ -278,7 +278,10 @@ BorderFill readBorderFill(ByteReader r, std::uint32_t id) {
     if (r.remaining() < 4) return fill;
     const std::uint32_t type = r.u32();
     if ((type & 1u) != 0 && r.remaining() >= 16) {
-        fill.faceColor = hexColor(fromColorRef(r.u32()));
+        // 윗 바이트가 0xFF 인 면 색(0xFF000000 등)은 한글이 칠하지 않는다. 0xFFFFFFFF 처럼 색이 없는 것으로 읽는다.
+        // 가정통신문 서식의 문단 배경이 이 값이었고 한글 2024 PDF 에는 아무것도 그려지지 않았다.
+        const std::uint32_t face = r.u32();
+        fill.faceColor = hexColor((face >> 24) == 0xFFu ? Color{} : fromColorRef(face));
         const Color hatchColor = fromColorRef(r.u32());
         const std::int32_t hatch = r.i32();
         static const char* const hatches[] = {"HORIZONTAL", "VERTICAL", "SLASH", "BACK_SLASH", "CROSS", "CROSS_DIAGONAL"};
@@ -314,6 +317,16 @@ BorderFill readBorderFill(ByteReader r, std::uint32_t id) {
     if ((type & 1u) != 0 && r.remaining() >= 1) r.u8();
     return fill;
 }
+
+}  // namespace
+
+namespace detail {
+
+model::BorderFill readBorderFillRecord(ByteView data, std::uint32_t id) { return readBorderFill(ByteReader(data), id); }
+
+}  // namespace detail
+
+namespace {
 
 std::string numTypeName(std::uint32_t v) {
     static const char* names[] = {"PAGE", "FOOTNOTE", "ENDNOTE", "PICTURE", "TABLE", "EQUATION"};

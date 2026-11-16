@@ -16,10 +16,6 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
 
 스크립트는 이 스킬 폴더의 `scripts/chwp_agent.py` 다(`${CLAUDE_SKILL_DIR}` 가 바뀌지 않는 곳에서는 이 SKILL.md 가 있는
 폴더 기준 경로로 부른다). Windows 에서는 `python3` 대신 `python` 이다. 실행 파일은 `bin/chwp-agent`(Linux) 또는 저장소 빌드를 쓴다.
-실행 파일 없이 글만 묶은 스킬(`scripts/release.json` 이 있는 것)은 처음 실행할 때 스크립트가 GitHub 릴리스에서
-실행 파일을 받아 SHA-256 을 맞춰 본 뒤 캐시(`~/.cache/chwp-agent/bin/<버전>/`, `CHWP_AGENT_CACHE`)에 두고 쓴다.
-"실행 파일을 받습니다" 한 줄이 stderr 에 나오는 것은 정상이다. 인터넷이 막혀 받지 못하면 그 까닭을 stderr 에 쓰고
-끝 코드 2 로 멈추니, 사용자에게 실행 파일을 함께 묶은 스킬 ZIP 을 쓰거나 인터넷을 열어 달라고 알린다.
 
 - 한 번 실행이 한 세션이다. 요청은 파일 → 표준 입력(`-`) → `-c` 차례로 같은 문서에 이어서 부른다.
 - 응답은 요청마다 stdout 한 줄: `{"ok":true,...}` 또는 `{"ok":false,"error":{"code","message"}}`.
@@ -70,6 +66,14 @@ chwp-agent: fonts-blocked {"server":"https://ede.kr/hwp/fonts/","lists":[...],"f
    `ok` 가 참이면 원래 요청을 다시 부른다(받은 글꼴은 캐시에 남아 같은 환경에서는 다시 받지 않는다).
    `ok` 가 거짓이면 아직 막혀 있다는 뜻이니 그대로 알리고 대체 글꼴로 이어 간다.
 3. 허락하지 않으면 함초롬바탕으로 만든 결과를 그대로 쓰고, `info` 의 `missingFonts` 에 나온 글꼴이 함초롬바탕으로 대체되었다고 알린다.
+
+인터넷이 아예 없는 환경(글꼴 서버 주소조차 찾지 못함)이면 위 줄 대신 다음 줄이 나온다.
+
+```
+chwp-agent: fonts-offline {"server":"...","count":N,"errors":[...],"fallback":"함초롬바탕","ask":false}
+```
+
+이때는 허락을 받아도 받을 수 없으니 묻지 않는다. 결과를 주면서 구할 수 없는 글꼴은 함초롬바탕으로 그렸다고만 알린다.
 
 `notOnServer` 는 서버에 없는 글꼴이라 허락과 상관없이 대체 글꼴로 그린다. 새 대화나 환경이 초기화되면 캐시가 비어 다시 받아야 할 수 있다.
 

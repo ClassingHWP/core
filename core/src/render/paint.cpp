@@ -1689,6 +1689,13 @@ int fitPermille(std::int64_t numer, std::int64_t denom) {
     return static_cast<int>(value);
 }
 
+// 윤곽이 비어 있는 것이 맞는 글자: 제어 문자, 빈칸 계열(Zs), 폭 없는 이음·방향 표시, BOM.
+static bool blankCodePoint(char32_t cp) {
+    return cp <= 0x20 || (cp >= 0x7F && cp <= 0xA0) || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200F) ||
+           (cp >= 0x2028 && cp <= 0x202F) || (cp >= 0x205F && cp <= 0x206F) || cp == 0x3000 || cp == 0x3164 ||
+           cp == 0xFEFF || cp == 0xFFA0;
+}
+
 void fallbackFit(const std::string& asked, char32_t cp, int& fitX, int& fitY) {
     fitX = 1000;
     fitY = 1000;
@@ -1725,7 +1732,11 @@ GlyphMem* glyphMemory(const std::string& font, char32_t cp) {
         }
         if (!face || !reopenFaceLocked(*face)) return false;
         index = stbtt_FindGlyphIndex(&face->info, static_cast<int>(code));
-        return index != 0;
+        if (index == 0) return false;
+        // 글자 표에 있어도 윤곽이 비면 그릴 것이 없다. 막힌 글꼴의 대역(standin)은 원래 글꼴의 글자 표와 폭을 두고
+        // 곡선은 OFL 원본에서 가져와, 원본에 없는 글자(하다 라운드의 ▣ 등)는 빈 글리프로 남는다. 한글은 원래 글꼴로
+        // 그리므로 그 글자가 보인다. 빈칸 글자가 아니면 없는 글자로 보고 함초롬으로 그린다(폭은 그대로다).
+        return !stbtt_IsGlyphEmpty(&face->info, index) || blankCodePoint(code);
     };
     const layout::FontLoadScope fontWhy("그리기", cp, &font);
     const std::string resolved = layout::fontWithGlyph(font, cp);

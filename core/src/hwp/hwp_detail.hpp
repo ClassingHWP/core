@@ -24,6 +24,9 @@ std::optional<std::string> findParameterString(ByteView data,
 // 캡션 LIST_HEADER 레코드에서 캡션 속성을 읽는다 (내용 문단은 제외).
 model::Caption readCaptionHeader(ByteView data);
 
+// DocInfo 의 BORDER_FILL 레코드 하나를 읽는다.
+model::BorderFill readBorderFillRecord(ByteView data, std::uint32_t id);
+
 // 문단 텍스트의 확장 제어 문자를 CTRL_HEADER 레코드에 대응시킨다.
 // 제어 문자에 들어 있는 ctrlId 와 같은, 아직 쓰지 않은 컨트롤을 앞에서부터 고르고,
 // 같은 것이 없으면 남은 컨트롤 중 첫 번째를 쓴다.

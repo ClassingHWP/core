@@ -12,7 +12,7 @@ Antigravity, Codex 등)가 한글 문서(HWP·HWPX)를 도구로 읽고, 찾고,
 python3 <스킬 폴더>/scripts/chwp_agent.py --mcp
 ```
 
-- 실행 파일은 `chwp_agent.py` 가 찾는다(`CHWP_AGENT_BIN` → 스킬의 `bin/` → 저장소 빌드 → 글만 든 스킬이면 GitHub 릴리스에서 받기).
+- 실행 파일은 `chwp_agent.py` 가 찾는다(`CHWP_AGENT_BIN` → 스킬의 `bin/` → 저장소 빌드).
 - 문서에 필요한 글꼴은 서버가 달라고 할 때 스크립트가 글꼴 서버에서 받아 캐시(`~/.cache/chwp-agent/fonts`)에 넣는다.
 - 실행 파일을 바로 띄울 수도 있다: `chwp-agent --mcp [--font-dir 글꼴캐시]`. 이때는 글꼴을 받지 않고 캐시에 있는 것만 쓴다.
 - 글꼴 서버에는 글꼴 이름만 요청하고 문서 내용은 보내지 않는다. 글꼴을 받지 못하면 `hwp_open`·`hwp_apply` 결과에
