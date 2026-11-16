@@ -1,6 +1,7 @@
-# Skia M157 (5b1a7f7c) GN 설정. Linux 정적(alpine, musl). Graphite Dawn(Vulkan)과 CPU 래스터를 둔다.
-# GPU 장치가 없으면(정적 실행 파일은 Vulkan 드라이버를 열지 못한다) CPU 래스터로 그린다. 글꼴 관리자·이미지 코덱은 뺀다.
-# tools/chwp-agent/package-skill.py 가 Docker 안에서 이 파일로 build/skia/out/chwp-linux-musl 을 만든다.
+# Skia M157 (5b1a7f7c) GN 설정. Linux 정적(alpine, musl), CPU 래스터만. chwp-agent 패키지용이다.
+# 에이전트가 도는 곳(claude.ai·ChatGPT 샌드박스)에는 GPU 가 없어 Graphite Dawn 을 넣어도 CPU 로 그린다. 빼서 실행 파일을
+# 줄인다(Claude 스킬은 압축을 푼 크기가 30MB 를 넘으면 받지 않는다). 글꼴 관리자·이미지 코덱은 뺀다.
+# tools/chwp-agent/package-skill.py 가 Docker 안에서 이 파일로 build/skia/out/chwp-linux-musl-cpu 를 만든다.
 # partition_alloc 은 musl 에 없는 sys/cdefs.h 를 찾으므로 끈다(윈도우 MSVC 빌드도 쓰지 않는다).
 is_debug = false
 is_official_build = true
@@ -9,10 +10,9 @@ cc = "clang"
 cxx = "clang++"
 skia_enable_tools = false
 skia_enable_ganesh = false
-skia_enable_graphite = true
+skia_enable_graphite = false
 skia_use_gl = false
-skia_use_dawn = true
-dawn_enable_vulkan = true
+skia_use_dawn = false
 skia_use_vulkan = false
 skia_use_angle = false
 skia_use_expat = false

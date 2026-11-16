@@ -55,7 +55,7 @@ python tools/git-sync-deps
 | Windows (Debug, GPU) | `cmake/skia/chwp-win-dawn.gn` | `build/skia/out/chwp-win-dawn/skia.lib` |
 | Windows (Release, GPU) | `cmake/skia/chwp-win-dawn-release.gn` | `build/skia/out/chwp-win-dawn-release/skia.lib` |
 | Windows (GPU 없음) | `cmake/skia/chwp-win.gn`, `chwp-win-release.gn` | `build/skia/out/chwp-win/skia.lib` 등 |
-| Linux 정적(에이전트 패키지) | `cmake/skia/chwp-linux-musl.gn` | `build/skia/out/chwp-linux-musl/libskia.a` |
+| Linux 정적(에이전트 패키지, CPU 래스터만) | `cmake/skia/chwp-linux-musl-cpu.gn` | `build/skia/out/chwp-linux-musl-cpu/libskia.a` |
 
 ```bash
 mkdir -p out/chwp-wasm-pthread

@@ -6,7 +6,7 @@ chwp-agent.zip 으로 묶는다. ZIP 안 맨 위는 chwp-agent/ 폴더이고, �
 버전은 CMakeLists.txt 의 VERSION 이다. 이 ZIP 은 스킬로 올리거나(Claude·ChatGPT), 스킬 스크립트를 돌리지 않는
 채팅(Gemini)에서는 채팅에 첨부해 그 실행 환경에서 풀어 쓴다.
 
-core 는 Skia 로 그리므로 같은 alpine 에서 GPU 없는 Skia 정적 라이브러리(build/skia/out/chwp-linux-musl)를 먼저 만든다.
+core 는 Skia 로 그리므로 같은 alpine 에서 GPU 없는 Skia 정적 라이브러리(build/skia/out/chwp-linux-musl-cpu)를 먼저 만든다.
 한 번 만들면 다시 쓰고, --skia 를 주면 다시 만든다.
 
   python tools/chwp-agent/package-skill.py [출력.zip] [--skia]  (기본: tmp/chwp-agent-skill/chwp-agent-<버전>.zip)
@@ -53,18 +53,18 @@ SKILL = ROOT / "skills" / "chwp-agent"
 SOURCES = ["CMakeLists.txt", "CMakePresets.json", "cmake", "core", "tools/chwp-agent", "tools/chwp-dump",
            "tools/chwp-font-grid", "skills/chwp-agent/reference.md"]
 SKIA = ROOT / "build" / "skia"
-SKIA_OUT = "out/chwp-linux-musl"
-# core 가 읽는 Skia·Dawn 헤더와 alpine 에서 만든 정적 라이브러리.
-SKIA_FOR_CORE = ["include", "src", "modules", "third_party/externals/dawn/include", SKIA_OUT + "/libskia.a",
-                 SKIA_OUT + "/libdawn_combined.a", SKIA_OUT + "/gen/third_party/dawn/include"]
+SKIA_OUT = "out/chwp-linux-musl-cpu"
+# core 가 읽는 Skia 헤더와 alpine 에서 만든 정적 라이브러리(CPU 래스터만, Dawn 없음).
+SKIA_FOR_CORE = ["include", "src", "modules", SKIA_OUT + "/libskia.a"]
 # Skia 를 빌드할 때 빼는 것: 다른 빌드 산출물, 저장소 기록, Dawn 의 시험과 이 설정이 쓰지 않는 외부 라이브러리.
 SKIA_SKIP = {"out", "third_party/externals/dawn/test", "third_party/externals/dawn/third_party/gn"}
 # Dawn(Vulkan)이 CMake 로 빌드할 때 쓰는 외부 라이브러리. swiftshader 는 있는지만 보므로 컨테이너에서 빈 폴더로 둔다.
 SKIA_EXTERNALS = {"abseil-cpp", "dawn", "egl-registry", "glslang", "jinja2", "markupsafe", "opengl-registry",
                   "spirv-headers", "spirv-tools", "vulkan-headers", "vulkan-utility-libraries", "webgpu-headers"}
 
-# 화면과 같은 Skia(Graphite Dawn + CPU 래스터). 글꼴 관리자·이미지 코덱은 뺀다.
-SKIA_ARGS = (ROOT / "cmake" / "skia" / "chwp-linux-musl.gn").read_text(encoding="utf-8")
+# CPU 래스터만 둔 Skia. 에이전트가 도는 샌드박스에는 GPU 가 없어 Dawn 을 넣어도 쓰지 않고, Claude 스킬은 압축을 푼
+# 크기가 30MB 를 넘으면 받지 않는다. 글꼴 관리자·이미지 코덱은 뺀다.
+SKIA_ARGS = (ROOT / "cmake" / "skia" / "chwp-linux-musl-cpu.gn").read_text(encoding="utf-8")
 
 SKIA_BUILD = r"""
 set -e
@@ -76,7 +76,7 @@ mkdir -p third_party/externals/swiftshader
 mkdir -p /o && printf '%s' "$SKIA_ARGS" > /o/args.gn
 gn gen /o >/g.log 2>&1 || { tail -30 /g.log >&2; exit 1; }
 ninja -C /o skia >/n.log 2>&1 || { grep -E 'error|FAILED' /n.log | head -40 >&2; exit 1; }
-cd /o && tar cf - libskia.a libdawn_combined.a args.gn gen/third_party/dawn/include
+cd /o && tar cf - libskia.a args.gn
 """
 
 BUILD = r"""
@@ -84,7 +84,7 @@ set -e
 apk add --no-cache build-base cmake ninja linux-headers >/dev/null 2>&1
 mkdir /src && cd /src && tar xf -
 cmake -S . -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHWP_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
-  -DCHWP_SKIA_OUT=chwp-linux-musl -DCHWP_SKIA_DAWN=ON >/b.log 2>&1 \
+  -DCHWP_SKIA_OUT=chwp-linux-musl-cpu -DCHWP_SKIA_DAWN=OFF >/b.log 2>&1 \
   || { tail -30 /b.log >&2; exit 1; }
 cmake --build /b --target chwp-agent >>/b.log 2>&1 || { grep -E 'error|Error' /b.log | head -30 >&2; exit 1; }
 strip /b/tools/chwp-agent/chwp-agent
@@ -94,7 +94,7 @@ cd /pkg && tar cf - .
 
 
 def build_skia() -> None:
-    """build/skia 로 alpine 정적 Skia·Dawn 을 만들어 build/skia/out/chwp-linux-musl 에 둔다. 처음 한 번은 오래 걸린다."""
+    """build/skia 로 alpine 정적 Skia(CPU 래스터)를 만들어 build/skia/out/chwp-linux-musl-cpu 에 둔다. 처음 한 번은 오래 걸린다."""
     def keep(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         name = info.name.removeprefix("./")
         if ".git" in name.split("/") or any(name == skip or name.startswith(skip + "/") for skip in SKIA_SKIP):
@@ -158,7 +158,7 @@ def main() -> None:
     version = project_version()
     out = Path(args[0]) if args else ROOT / "tmp" / "chwp-agent-skill" / f"chwp-agent-{version}.zip"
     out.parent.mkdir(parents=True, exist_ok=True)
-    if "--skia" in sys.argv or not (SKIA / SKIA_OUT / "libdawn_combined.a").is_file():
+    if "--skia" in sys.argv or not (SKIA / SKIA_OUT / "libskia.a").is_file():
         build_skia()
     built = tarfile.open(fileobj=io.BytesIO(build_linux()))
     with zipfile.ZipFile(out, "w") as zf:

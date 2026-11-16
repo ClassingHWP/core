@@ -7,7 +7,8 @@
 #   out/chwp-wasm-pthread/libskia.a  Emscripten (-pthread. 칸 스레드와 한 wasm에 묶인다. WebGPU 는 브라우저가 준다)
 #   out/chwp-wasm/libskia.a          Emscripten, 스레드 없는 이전 산출물
 #   out/chwp-linux/libskia.a    Linux (Dawn 이면 libdawn_combined.a 를 같은 폴더에)
-#   out/chwp-linux-musl/libskia.a  Linux 정적(alpine, chwp-agent 패키지), Dawn Vulkan. CHWP_SKIA_OUT=chwp-linux-musl 로 고른다
+#   out/chwp-linux-musl-cpu/libskia.a  Linux 정적(alpine, chwp-agent 패키지), CPU 래스터만(CHWP_SKIA_DAWN=OFF).
+#                                  CHWP_SKIA_OUT=chwp-linux-musl-cpu 로 고른다. 샌드박스에는 GPU 가 없다
 #   out/chwp-android/libskia.a  Android
 #   out/chwp-ios/libskia.a      iOS
 #   out/chwp-mac/libskia.a      macOS
