@@ -29,6 +29,9 @@ core 가 달라고 한 글꼴 파일을 받아 캐시 폴더에 넣는 일만 �
 사용법은 실행 파일과 같다:
   python chwp_agent.py <문서.hwp|.hwpx> [요청.jsonl | -] [-c JSON]... [--save 경로] [--out-dir 폴더]
 
+문서 한눈에 보기(outline 호출의 글을 그대로 찍는다. 문단 번호·글자 수·글, 표 칸 격자와 칸 story):
+  python chwp_agent.py --outline <문서.hwp|.hwpx>
+
 MCP 서버(stdio)로 쓰려면:
   python chwp_agent.py --mcp
 실행 파일의 MCP 모드(chwp-agent --mcp --font-relay)를 띄워 클라이언트와 줄을 그대로 잇는다. 실행 파일이 캐시에
@@ -368,6 +371,23 @@ def main() -> int:
     args = [a for a in args if a != "--no-font-fetch"]
     if "--mcp" in args:
         return run_mcp(binary, fetch)
+    if "--outline" in args:
+        rest = [a for a in args if a != "--outline"]
+        document = first_positional(rest)
+        if not document:
+            sys.stderr.write("사용법: python chwp_agent.py --outline <문서.hwp|.hwpx>\n")
+            return 2
+        run = subprocess.run([str(binary), document, "-c", '{"call":"outline"}'], stdout=subprocess.PIPE)
+        try:
+            reply = json.loads(run.stdout.decode("utf-8").splitlines()[-1])
+        except (IndexError, ValueError):
+            sys.stdout.buffer.write(run.stdout)
+            return run.returncode or 1
+        if not reply.get("ok"):
+            print(json.dumps(reply, ensure_ascii=False))
+            return 1
+        sys.stdout.write(reply["outline"])
+        return 0
     if "--fetch-fonts" in args:
         return fetch_only([a for a in args if a != "--fetch-fonts"], binary)
     document = first_positional(args)

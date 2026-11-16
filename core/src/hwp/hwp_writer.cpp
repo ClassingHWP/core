@@ -2617,6 +2617,8 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options,
     cfb.addStream("\x05HwpSummaryInformation", buildSummaryInformationStream(doc.metadata));
     // 잠근 문서는 미리 보기 글을 두지 않는다(본문이 풀린 채로 남는다. 한글도 쓰지 않는다).
     if (!locked) cfb.addStream("PrvText", buildPrvTextStream(doc));
+    // 첫 쪽 미리 보기 그림. 한글 2024 처럼 압축하지 않은 PNG 그대로다. 잠근 문서는 글과 같이 두지 않는다.
+    if (!locked && !options.previewPng.empty()) cfb.addStream("PrvImage", options.previewPng);
 
     return cfb.build(out, error);
 }

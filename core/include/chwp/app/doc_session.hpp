@@ -86,7 +86,8 @@ public:
     // 문서 전체가 바뀐 뒤(글꼴 이름 바꾸기 등) 같은 조판 설정으로 다시 놓는다.
     void relayoutAll();
     // 저장한다. 고친 문단과 lineSeg 없이 들어온 문단은 조판 결과를 lineSeg 로 적는다(문서 자체는 그대로).
-    std::optional<Bytes> save(model::SourceFormat format, std::string* error = nullptr) const;
+    // 한글처럼 첫 쪽 미리 보기 그림(긴 변 1024px PNG)을 함께 넣는다.
+    std::optional<Bytes> save(model::SourceFormat format, std::string* error = nullptr);
     // 저장할 형식. format 이 "hwp"/"hwpx" 면 그것, 비었으면 이름 끝(.hwp/.hwpx), 그것도 없으면 연 파일의 형식.
     // format 이 그 밖의 글이면 nullopt.
     std::optional<model::SourceFormat> saveFormatFor(const std::string& name, const std::string& format = {}) const;

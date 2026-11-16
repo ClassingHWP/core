@@ -80,6 +80,15 @@
 `missingGlyphs` 는 그 글꼴과 대체 글꼴 어디에도 없어 **그리지 못하는 글자**다. 그림에서 비거나 네모로 나온다.
 앞의 100개만 주고, 모두 몇 개인지는 `missingGlyphCount` 다.
 
+### outline
+`{"call":"outline"}` → `{"outline":"s1 section body (구역 1)\n  p0 (1) \"￼\"\n    table 1:0:0 7x4\n      (0,0 3x1) s2 ..."}`.
+문서 전체를 한 번에 훑는 글 하나다. 구역 본문부터 표 칸·글상자·머리말·꼬리말까지 글 묶음을 나무로 펼친다.
+- 문단: `p번호 (글자 수) "글"`. 글자 수는 위치의 `char` 끝값이다(`setParagraph` 는 이 수를 몰라도 된다).
+- 개체: `종류 story:문단:순번`. 표는 `줄x칸` 이 붙는다. 수식은 `script=`.
+- 표 칸: `(행,열[ 줄x칸]) s칸story`. 문단 하나에 개체가 없는 칸은 한 줄에 글까지 적는다.
+- 글이 `maxChars`(기본 60000)를 넘으면 그 자리에서 멈추고 `"truncated":true` 를 준다.
+CLI 에서는 `python3 scripts/chwp_agent.py --outline 문서` 가 이 글을 그대로 찍는다.
+
 ### pages
 `{"call":"pages"}` → `{"pages":[{"page":1,"section":1,"label":"1","order":1,"width":84188,"height":59528,"sizeMm":"297.0x210.0","landscape":true}]}`
 
@@ -273,6 +282,7 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 | `insertTable` | `at`, `rows`, `cols`, `cells` | 표를 넣는다(단 폭, 글자처럼 취급). 표는 제 문단에 놓인다. `cells` 는 `[["가","나"],["다"]]` |
 | `insertPicture` | `at`, `file` 또는 `base64`, `width`, `height` | 그림(png·jpg·gif·bmp)을 **글자처럼** 넣는다(`at` 자리에 `￼` 한 글자). `file` 은 CLI 가 읽는 경로, `base64` 는 파일 바이트의 base64(`data:image/png;base64,...` 도 된다). 크기는 HWPUNIT 이고 없으면 픽셀 × 75(단보다 넓으면 단 폭), 하나만 주면 그림 비율을 지킨다. 응답 `object` 가 새 그림 이름이다. 띄워 놓으려면 이어서 `objectProperties` 로 바꾼다(「개체 놓기」의 예) |
 | `setText` | `story`, `text` | 그 story 글 전체를 바꾼다. 표 칸을 고칠 때 쓴다 |
+| `setParagraph` | `story`, `paragraph`, `text` | 그 문단 글 전체를 바꾼다. 문단 모양과 첫 글자 모양은 그대로다. 글자처럼 놓인 개체(￼)가 든 문단은 개체가 지워지므로 거절한다(`NotEditable`) — 그때는 `replace` 로 글만 바꾼다 |
 | `insertRows` | `story`, `side`(`below`·`above`), `count` | story 칸이 걸친 줄의 아래(위)에 줄을 넣는다 |
 | `insertColumns` | `story`, `side`(`right`·`left`), `count` | story 칸이 걸친 칸의 오른쪽(왼쪽)에 칸을 넣는다. 표가 그만큼 넓어진다 |
 | `deleteRows` | `story`, `toStory` | 두 칸을 덮는 사각형이 걸친 줄을 지운다(`toStory` 가 없으면 story 칸이 걸친 줄) |
@@ -421,3 +431,59 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 `format` 이 없으면 확장자, 그것도 없으면 연 형식이다. CLI 의 `--save 경로` 는 마지막에 이 요청을 하나 더 부른다.
 PDF 로도 쓴다: `{"call":"save","path":"out/고친본.pdf","dpi":200}`(또는 `"format":"pdf"`). 편집기의 인쇄·PDF 로 저장과 같이
 쪽마다 `dpi`(72~600, 기본 200)로 그린 그림을 종이 크기에 채운다(글은 그림이라 PDF 에서 고르거나 찾을 수 없다).
+
+## 작업 요령
+
+### 문서 분석(요약·질문 답하기)
+
+글과 쪽 그림을 함께 본다. **내용·숫자·날짜·인용은 글에서, 짜임(표의 머리·병합, 그림, 서식 칸, 강조)은 그림에서** 얻는다.
+
+1. **훑기**: `{"call":"info"}` 로 쪽 수, `missingFonts`, `missingGlyphs` 를 본다.
+2. **글 읽기**: `python3 scripts/chwp_text.py "문서.hwp" > text.txt 2>/dev/null`. 읽는 차례대로 쓰고, 쪽이 바뀌는 자리에
+   `=== 03_2쪽 ===`(물리 순서_쪽 번호) 경계가 있다. 표는 제자리에 행마다 `| 칸 | 칸 |`, 머리말·각주는 끝에 `[owner]` 머리로 붙는다.
+   바탕쪽 글은 빠진다(`--master` 로 넣음).
+3. **쪽 그림 훑기**: 아래 「모든 쪽 그림으로 만들기」로 96dpi(30쪽이 넘으면 72dpi) 그림을 만들어 짜임을 잡는다.
+4. **맞춰 보기**: 헷갈리는 표(병합 칸, 여러 줄 머리)는 그림의 칸 모양대로 해석한다. 그림·도형 안에만 있는 글은 그 쪽을 150dpi 로 다시 그려 읽는다.
+5. **답하기**: 쪽은 쪽 번호로 말한다. 그림으로만 읽은 내용은 그렇다고 밝힌다.
+
+### 모든 쪽 그림으로 만들기
+
+쪽 번호는 겹칠 수 있다. 먼저 `pages` 를 부르고 쪽마다 `order` 로 그린다.
+
+```bash
+python3 scripts/chwp_agent.py "문서.hwp" -c '{"call":"pages"}' 2>/dev/null > pages.jsonl
+DPI=96 python3 -c "
+import json, os
+pages = json.loads(open('pages.jsonl', encoding='utf-8').readline())['pages']
+with open('render.jsonl', 'w', encoding='utf-8') as out:
+    for p in pages:
+        name = '%02d_%s쪽' % (p['order'], p['label'])
+        out.write(json.dumps({'call': 'render', 'page': {'order': p['order']}, 'dpi': int(os.environ['DPI']), 'name': name}, ensure_ascii=False) + '\n')
+"
+python3 scripts/chwp_agent.py "문서.hwp" render.jsonl --out-dir pages 2>/dev/null
+```
+
+### 그림·개체 놓기
+
+1. 그림은 `insertPicture` 로 넣는다. 늘 글자처럼 들어가고, 응답 `object` 가 새 그림 이름이다.
+2. 가운데 두려면 그 문단을 `format` 의 `align:"CENTER"` 로 한다.
+3. 글 옆·종이의 정한 자리·글 뒤에 둘 그림은 `objectProperties` 로 `treatAsChar:false` 와 `textWrap`·기준·정렬·거리를 준다.
+   지금 값은 `{"call":"view","op":"objectProperties","object":"1:0:0"}` 로 읽는다. 값의 뜻과 예는 「개체 놓기」에 있다.
+4. 띄우면 그 ￼ 글자가 빠져 뒤 글자 순번이 하나 당겨진다. 같은 apply 의 뒤 op 위치를 그만큼 고친다.
+5. 놓은 뒤 `layout` 의 `boxes` 로 자리를, `render` 로 글이 어떻게 비켜 갔는지 본다.
+
+### 자리 찾기와 확인
+
+- 고칠 글은 `outline` 의 문단 번호로 고르거나 `{"call":"find","text":"..."}` 로 구간(`from`·`to`)과 쪽을 얻는다.
+- 모양을 맞출 때는 지금 값을 먼저 읽는다: 글자·문단은 `{"call":"paragraph",...,"detail":true}`, 쪽은 `{"call":"section","section":1}`,
+  표 칸 테두리·배경·여백은 `{"call":"table","story":N}`. 읽은 이름이 곧 `format`·`pageSetup` 의 `set` 이름이다.
+- 고친 뒤 `{"call":"layout","page":...}` 로 줄 나눔·넘침(`overflow`)·표가 쪽에서 잘렸는지 본다. 틀렸으면 `{"call":"undo"}`(같은 실행 안에서만).
+
+### 알아 둘 것
+
+- U+FFFC(￼)는 글자처럼 놓인 개체와 각주·미주 번호 한 글자다. 지우면 그 개체가 지워진다. 띄운 개체는 `deleteObject` 로 지운다.
+- 한글 전용 기호는 사용자 영역 글자(U+E000~U+F8FF)라 터미널에 안 보일 수 있다. 순번을 셀 때 빠뜨리지 않는다.
+- 쪽은 쪽 번호 + 구역이나 `{"order":N}` 으로 가리킨다. `AmbiguousPage` 가 오면 `candidates` 에서 고른다.
+- 머리말·꼬리말·바탕쪽처럼 쪽에 놓이지 않는 글은 `NotEditable` 이 날 수 있다.
+- 글자 서식은 빈 구간에 주면 효과가 없다. 문단 서식은 빈 구간이어도 그 문단에 들어간다.
+- 머리말·각주·쪽 번호·바탕쪽·메모·단·캡션·도형 같은 편집기 명령은 op 이름으로 부르고 자리와 `set` 을 준다. 값 이름은 먼저 `view` 로 읽는다.

@@ -33,12 +33,14 @@ ExportResult writeDocument(const model::Document& doc, const ExportOptions& opti
             hwp::WriteOptions opts;
             opts.sourceData = options.sourceData;
             opts.compress = options.compress;
+            opts.previewPng = options.previewPng;
             res.ok = hwp::write(doc, res.data, opts, &res.error);
             return res;
         }
         case model::SourceFormat::Hwpx: {
             hwpx::WriteOptions opts;
             opts.sourceData = options.sourceData;
+            opts.previewPng = options.previewPng;
             res.ok = hwpx::write(doc, res.data, opts, &res.error);
             return res;
         }

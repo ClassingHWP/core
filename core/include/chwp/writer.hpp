@@ -13,6 +13,8 @@ struct ExportOptions {
     ByteView sourceData{};
     // HWP 5.0 내보내기 시 DocInfo/Section/BinData 스트림 압축 여부
     bool compress = true;
+    // 첫 쪽 미리 보기 그림(PNG). 한글처럼 HWP 는 PrvImage, HWPX 는 Preview/PrvImage.png 로 넣는다.
+    Bytes previewPng;
 };
 
 struct ExportResult {

@@ -1,5 +1,6 @@
 #include "chwp/app/doc_session.hpp"
 
+#include "chwp/render/frame_cache.hpp"
 #include "chwp/render/link_commands.hpp"
 #include "chwp/render/track_commands.hpp"
 #include "chwp/export/pdf.hpp"
@@ -31,6 +32,8 @@ bool endsWithNoCase(const std::string& text, std::string_view tail) {
 
 // 처음 고칠 때 치는 글자가 문서 글꼴에 없으면 쓰는 대체 글꼴.
 constexpr const char* kEditFallbackFaces[] = {"함초롬바탕", "함초롬돋움"};
+// 저장 파일에 넣는 첫 쪽 미리 보기 그림의 긴 변(px). 한글 2024 와 같다.
+constexpr int kPreviewLongSide = 1024;
 
 std::unordered_map<std::string, std::string>& swapPreferences() {
     static std::unordered_map<std::string, std::string> prefs;
@@ -193,10 +196,21 @@ void DocSession::relayoutAll() {
     }
 }
 
-std::optional<Bytes> DocSession::save(model::SourceFormat format, std::string* error) const {
+std::optional<Bytes> DocSession::save(model::SourceFormat format, std::string* error) {
     ExportOptions options;
     options.format = format;
     options.sourceData = file;
+    // 첫 쪽 미리 보기 그림. 한글 2024 는 긴 변을 1024px 로 맞춘 PNG 를 넣는다(A4 세로 724×1024).
+    // 문서 탐색기·파일 열기 창이 이 그림을 보인다. 그리지 못하면 그림 없이 저장한다.
+    if (!pages.empty()) {
+        const render::Node& first = pages.front();
+        int pixelHeight = kPreviewLongSide;
+        if (first.width > first.height && first.width > 0) {
+            pixelHeight = static_cast<int>(std::lround(static_cast<double>(kPreviewLongSide) * first.height / first.width));
+        }
+        render::FrameCache frames;
+        options.previewPng = renderPage(0, std::max(pixelHeight, 32), frames).png;
+    }
     model::Document saved = doc;
     render::fillMissingLineSegs(saved, pages);
     ExportResult result = writeDocument(saved, options);

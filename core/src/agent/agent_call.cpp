@@ -270,6 +270,12 @@ Status readOp(const Json& v, EditOp& op) {
         if (file) return readText(file, "file", op.text);
         return bad("insertPicture 에 base64 나 file 이 없습니다.");
     }
+    if (name == "setParagraph") {
+        op.kind = OpKind::SetParagraph;
+        if (Status s = readInt(v.get("story"), "story", op.at.story); !s.ok()) return s;
+        if (Status s = readInt(v.get("paragraph"), "paragraph", op.at.paragraph); !s.ok()) return s;
+        return readText(v.get("text"), "text", op.text);
+    }
     if (name == "setText") {
         op.kind = OpKind::SetText;
         if (Status s = readInt(v.get("story"), "story", op.story); !s.ok()) return s;
@@ -370,7 +376,7 @@ Status readOp(const Json& v, EditOp& op) {
     if (const std::string command = commandOf(v, name); !command.empty()) return readCommand(v, command, op);
     std::string commands;
     for (const std::string& known : commandNames()) commands += ", " + known;
-    return bad("op " + name + " 은 모릅니다. insertText, delete, replace, format, insertTable, setText, insertRows, "
+    return bad("op " + name + " 은 모릅니다. insertText, delete, replace, format, insertTable, setText, setParagraph, insertRows, "
                               "insertColumns, deleteRows, deleteColumns, mergeCells, splitCell, cellBorder, cellFill, equalWidth, "
                               "equalHeight, insertBreak, replaceAll, pageSetup, insertPicture" + commands + " 중 하나입니다.");
 }
@@ -666,6 +672,124 @@ Status callParagraph(Call& c) {
         }
         c.w.endObject();
     }
+    return {};
+}
+
+// 문서 한눈에 보기. 구역 본문부터 표 칸·글상자·머리말까지 글 묶음을 나무로 펼쳐 글 하나로 준다.
+// 문단마다 번호·글자 수·글을, 표는 칸 격자(행,열·합침·칸 story)를 적는다. 고칠 자리(story:문단)와 칸 story 를
+// 한 번 불러 고를 수 있게 한다. 글이 maxChars 를 넘으면 그 자리에서 멈추고 truncated 를 참으로 준다.
+std::string outlineText(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 2);
+    out += '"';
+    for (const char ch : text) {
+        if (ch == '\n') out += "\\n";
+        else if (ch == '\t') out += "\\t";
+        else out += ch;
+    }
+    out += '"';
+    return out;
+}
+
+struct OutlineWriter {
+    AgentDocument& doc;
+    std::vector<StoryInfo> stories;
+    std::string out;
+    int maxChars = 60000;
+    bool truncated = false;
+
+    const StoryInfo* find(int story) const {
+        for (const StoryInfo& s : stories) {
+            if (s.story == story) return &s;
+        }
+        return nullptr;
+    }
+
+    bool full() {
+        if (static_cast<int>(out.size()) <= maxChars) return false;
+        truncated = true;
+        return true;
+    }
+
+    Status story(int id, int depth) {
+        const StoryInfo* info = find(id);
+        if (!info) return {};
+        for (int p = 0; p < info->paragraphs && !full(); ++p) {
+            const Result<ParagraphInfo> para = doc.paragraph(id, p);
+            if (!para.ok()) return para.status;
+            paragraph(para.value, depth);
+            for (const ObjectInfo& object : para.value.objects) {
+                if (full()) break;
+                if (Status s = this->object(id, p, object, depth + 1); !s.ok()) return s;
+            }
+        }
+        return {};
+    }
+
+    void paragraph(const ParagraphInfo& p, int depth) {
+        out.append(static_cast<std::size_t>(depth) * 2, ' ');
+        out += "p" + std::to_string(p.paragraph) + " (" + std::to_string(p.length) + ") ";
+        out += outlineText(p.text);
+        out += '\n';
+    }
+
+    Status object(int ownerStory, int ownerParagraph, const ObjectInfo& object, int depth) {
+        const std::string name =
+            std::to_string(ownerStory) + ":" + std::to_string(ownerParagraph) + ":" + std::to_string(object.index);
+        out.append(static_cast<std::size_t>(depth) * 2, ' ');
+        out += object.kind + " " + name;
+        if (object.kind == "table") {
+            int rows = 0;
+            int cols = 0;
+            for (const int cell : object.stories) {
+                if (const StoryInfo* s = find(cell)) {
+                    rows = std::max(rows, s->row + s->rowSpan);
+                    cols = std::max(cols, s->col + s->colSpan);
+                }
+            }
+            out += " " + std::to_string(rows) + "x" + std::to_string(cols);
+        }
+        if (!object.script.empty()) out += " script=" + outlineText(object.script);
+        out += '\n';
+        for (const int inner : object.stories) {
+            if (full()) break;
+            const StoryInfo* s = find(inner);
+            if (!s) continue;
+            out.append(static_cast<std::size_t>(depth + 1) * 2, ' ');
+            if (s->row >= 0) {
+                out += "(" + std::to_string(s->row) + "," + std::to_string(s->col);
+                if (s->rowSpan > 1 || s->colSpan > 1) {
+                    out += " " + std::to_string(s->rowSpan) + "x" + std::to_string(s->colSpan);
+                }
+                out += ") ";
+            }
+            out += "s" + std::to_string(inner);
+            // 문단 하나에 개체가 없는 칸은 한 줄로 적는다(표 칸 대부분이 그렇다).
+            if (s->paragraphs == 1) {
+                const Result<ParagraphInfo> only = doc.paragraph(inner, 0);
+                if (!only.ok()) return only.status;
+                if (only.value.objects.empty()) {
+                    out += " " + outlineText(only.value.text) + '\n';
+                    continue;
+                }
+            }
+            out += '\n';
+            if (Status st = story(inner, depth + 2); !st.ok()) return st;
+        }
+        return {};
+    }
+};
+
+Status callOutline(Call& c) {
+    OutlineWriter writer{c.doc, c.doc.stories()};
+    if (Status s = readOptionalInt(c.request, "maxChars", writer.maxChars); !s.ok()) return s;
+    for (const StoryInfo& s : writer.stories) {
+        if (s.parentStory >= 0 || writer.full()) continue;
+        writer.out += "s" + std::to_string(s.story) + " " + s.kind + " " + s.owner + " (구역 " + std::to_string(s.section) + ")\n";
+        if (Status st = writer.story(s.story, 1); !st.ok()) return st;
+    }
+    c.w.field("outline", writer.out);
+    if (writer.truncated) c.w.field("truncated", true);
     return {};
 }
 
@@ -1106,6 +1230,7 @@ CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_v
         if (name == "info") status = callInfo(call);
         else if (name == "pages") status = callPages(call);
         else if (name == "stories") status = callStories(call);
+        else if (name == "outline") status = callOutline(call);
         else if (name == "paragraph") status = callParagraph(call);
         else if (name == "table") status = callTable(call);
         else if (name == "section") status = callSection(call);
@@ -1120,7 +1245,7 @@ CallResult agentCall(AgentDocument& doc, std::string_view request, std::string_v
             body.field("pages", static_cast<int>(doc.pages().size()));
         } else if (name == "render") status = callRender(call);
         else if (name == "save") status = callSave(call);
-        else status = bad("call " + name + " 은 모릅니다. info, pages, stories, paragraph, table, section, layout, text, find, apply, view, undo, redo, render, save 중 하나입니다.");
+        else status = bad("call " + name + " 은 모릅니다. info, pages, outline, stories, paragraph, table, section, layout, text, find, apply, view, undo, redo, render, save 중 하나입니다.");
         body.endObject();
         if (status.ok()) {
             out.ok = true;

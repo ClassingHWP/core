@@ -632,6 +632,31 @@ struct AgentDocument::Impl {
         return {};
     }
 
+    Status setParagraph(int story, int paragraph, const std::string& text) {
+        const std::vector<model::Paragraph>* paras = storyParas(story);
+        if (!paras || paras->empty()) return fail(Code::PositionOutOfRange, "story " + std::to_string(story) + " 은 없습니다.");
+        const int count = static_cast<int>(paras->size());
+        if (paragraph < 0 || paragraph >= count) {
+            return fail(Code::PositionOutOfRange, "setParagraph: story " + std::to_string(story) + " 의 문단은 0~" +
+                                                      std::to_string(count - 1) + " 입니다.");
+        }
+        const model::Paragraph& para = (*paras)[static_cast<std::size_t>(paragraph)];
+        // 글자처럼 놓인 개체는 문단 글자 하나를 차지한다. 통째로 바꾸면 개체가 지워지니 거절한다.
+        for (const model::Run& run : para.runs) {
+            for (const model::InlineItem& item : run.items) {
+                if (item.type != model::InlineItem::Type::Text && render::paint_detail::isCaretCharControl(item.control)) {
+                    return fail(Code::NotEditable, "setParagraph: " + std::to_string(story) + ":" + std::to_string(paragraph) +
+                                                       " 문단에 글자처럼 놓인 개체(표·그림 등)가 있습니다. replace 로 글만 바꾸세요.");
+                }
+            }
+        }
+        const int length = render::paint_detail::paragraphCharCount(para);
+        if (length > 0) {
+            if (Status s = erase({{story, paragraph, 0}, {story, paragraph, length}}); !s.ok()) return s;
+        }
+        return insertText({story, paragraph, 0}, text);
+    }
+
     Status setText(int story, const std::string& text) {
         const std::vector<model::Paragraph>* paras = storyParas(story);
         if (!paras || paras->empty()) return fail(Code::PositionOutOfRange, "story " + std::to_string(story) + " 은 없습니다.");
@@ -1042,6 +1067,7 @@ struct AgentDocument::Impl {
             case OpKind::Format: status = restyle(op.range, op.format, op.style); break;
             case OpKind::InsertTable: status = insertTable(op, report); break;
             case OpKind::SetText: status = setText(op.story, op.text); break;
+            case OpKind::SetParagraph: status = setParagraph(op.at.story, op.at.paragraph, op.text); break;
             case OpKind::InsertRows:
             case OpKind::InsertColumns:
             case OpKind::DeleteRows:

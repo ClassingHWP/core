@@ -14,6 +14,8 @@ struct WriteOptions {
     ByteView sourceData{};
     // DocInfo / BodyText / BinData 스트림을 raw deflate 로 압축할지 여부 (기본: true).
     bool compress = true;
+    // 첫 쪽 미리 보기 그림(PNG). 비어 있지 않으면 PrvImage 스트림으로 넣는다(한글이 문서 탐색기 미리 보기에 쓴다).
+    Bytes previewPng;
 };
 
 bool write(const model::Document& doc, Bytes& out, const WriteOptions& options = {},

@@ -305,6 +305,9 @@ enum class OpKind {
     Format,       // range 에 format 을 입힌다. 글자 모양은 구간 글자에, 문단 모양은 구간이 걸친 문단에
     InsertTable,  // at 에 rows × cols 표(글자처럼 취급, 단 폭). cells[행][열] 글을 채운다
     SetText,      // story 의 글 전체를 text 로 바꾼다(표 칸 채우기 등)
+    // at.story·at.paragraph 문단의 글 전체를 text 로 바꾼다. 문단 모양과 첫 글자 모양은 그대로다.
+    // 글자처럼 놓인 개체(표·그림 등)가 든 문단은 바꾸지 않는다(개체가 지워지므로). 그때는 Replace 로 글만 바꾼다
+    SetParagraph,
     // 표 구조. story 는 표 칸(아무 칸). 규칙은 한글 2024 와 같다. 고친 뒤 칸 story 번호가 바뀐다(OpReport::table).
     InsertRows,     // story 칸이 걸친 줄의 아래(after) 또는 위에 count 줄. 새 줄은 기준 줄의 높이·칸 나눔·테두리를 따른다
     InsertColumns,  // story 칸이 걸친 칸의 오른쪽(after) 또는 왼쪽에 count 칸. 표 폭이 그만큼 늘어난다

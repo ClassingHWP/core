@@ -2434,6 +2434,11 @@ bool write(const model::Document& doc, Bytes& out, const WriteOptions& options, 
 
     // 7. Preview/PrvText.txt
     if (!locker.addText(zw, "Preview/PrvText.txt", buildPreviewText(doc), "text/xml", error)) return false;
+    // 첫 쪽 미리 보기 그림. 한글 2024 처럼 압축하지 않은 PNG 그대로다. 잠근 문서에는 넣지 않는다.
+    if (!locker.on && !options.previewPng.empty() &&
+        !zw.addFile("Preview/PrvImage.png", options.previewPng, false, error)) {
+        return false;
+    }
 
     // 8. META-INF/manifest.xml(잠근 항목의 암호 정보). 잠근 항목을 다 쓴 뒤에 만든다.
     if (!zw.addText("META-INF/manifest.xml", writeManifestXml(locker), true, error)) return false;
