@@ -131,7 +131,13 @@ def install_command(version: str | None) -> str:
     이 OS·CPU 에 맞는 wheel 을 pip 이 고른다.
     """
     python = sys.executable or "python3"
-    python = subprocess.list2cmdline([python]) if os.name == "nt" else shlex.quote(python)
+    if os.name == "nt":
+        # 에이전트는 Windows 에서도 Git Bash 로 돌릴 때가 많다. 역빗금은 bash 가 지우므로 빗금으로 쓰고,
+        # 빈칸이 있으면 큰따옴표로 묶는다(bash·cmd 모두 읽는다).
+        python = Path(python).as_posix()
+        python = f'"{python}"' if " " in python else python
+    else:
+        python = shlex.quote(python)
     if not version:
         return f"{python} -m pip install {PACKAGE}"
     return f"{python} -m pip install {PACKAGE}=={version} --find-links {RELEASES}/v{version}"
