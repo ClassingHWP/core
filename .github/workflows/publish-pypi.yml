@@ -1,0 +1,32 @@
+# 릴리스에 붙인 엔진 패키지(classinghwp-*.whl)를 PyPI 에 올린다.
+# wheel 은 tools/chwp-agent/package-wheel.py 로 만들어 릴리스에 붙인다. 이 워크플로는 그 파일을 그대로 올리기만 한다.
+# PyPI 쪽은 신뢰할 수 있는 게시자(ClassingHWP/core, publish-pypi.yml, 환경 pypi)로 등록해 토큰 없이 올린다.
+name: publish-pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "올릴 릴리스 태그 (예: v0.3.10)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download wheels from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'classinghwp-*.whl' --dir dist
+          ls -l dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

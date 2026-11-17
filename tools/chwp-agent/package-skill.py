@@ -3,8 +3,8 @@
 
 Linux x86_64 정적 실행 파일을 Docker(alpine) 안에서 빌드하고, 스킬 폴더의 bin/ 에 넣어
 chwp-agent.zip 으로 묶는다. ZIP 안 맨 위는 chwp-agent/ 폴더이고, 실행 파일에는 실행 권한을 붙인다.
-버전은 CMakeLists.txt 의 VERSION 이다. 이 ZIP 은 스킬로 올리거나(Claude·ChatGPT), 스킬 스크립트를 돌리지 않는
-채팅(Gemini)에서는 채팅에 첨부해 그 실행 환경에서 풀어 쓴다.
+버전은 CMakeLists.txt 의 VERSION 이고 ZIP 안 chwp-agent/VERSION 에도 적는다. 이 ZIP 은 스킬로 올린다(Claude·ChatGPT).
+Windows·macOS 의 로컬 에이전트에서는 같은 ZIP 을 쓰고, 엔진은 pip 패키지(package-wheel.py, classinghwp)로 깐다.
 
 core 는 Skia 로 그리므로 같은 alpine 에서 GPU 없는 Skia 정적 라이브러리(build/skia/out/chwp-linux-musl-cpu)를 먼저 만든다.
 한 번 만들면 다시 쓰고, --skia 를 주면 다시 만든다.
@@ -163,6 +163,8 @@ def main() -> None:
     built = tarfile.open(fileobj=io.BytesIO(build_linux()))
     with zipfile.ZipFile(out, "w") as zf:
         add_skill_text(zf)
+        # chwp_agent.py 가 bin/ 엔진이 이 컴퓨터용이 아닐 때 pip 패키지(classinghwp) 버전을 이것과 맞춘다.
+        add(zf, "chwp-agent/VERSION", (version + "\n").encode("ascii"))
         for member in built.getmembers():
             if not member.isfile():
                 continue

@@ -523,24 +523,30 @@ Bytes buildDocInfoStream(const Document& doc, const HwpBinRegistry& bins, bool c
         if (cs.bold) attr |= (1u << 1);
         if (cs.underline == "BOTTOM") attr |= (1u << 2);
         else if (cs.underline == "TOP") attr |= (3u << 2);
+        // 읽을 때와 같은 비트 자리(hwp_reader.cpp parseCharShape). 모양 번호는 저장값 그대로다(0 이 실선).
+        attr |= (static_cast<std::uint32_t>(cs.underlineShapeId) & 0xFu) << 4;
+        attr |= (static_cast<std::uint32_t>(cs.outline) & 0x7u) << 8;
+        attr |= (static_cast<std::uint32_t>(cs.shadow) & 0x3u) << 11;
+        if (cs.emboss) attr |= (1u << 13);
+        if (cs.engrave) attr |= (1u << 14);
         if (cs.superscript) attr |= (1u << 15);
         if (cs.subscript) attr |= (1u << 16);
-        if (cs.strikeout) {
-            attr |= (1u << 18);
-            attr |= (1u << 26);  // strikeout shape = SOLID
-        }
+        if (cs.strikeout) attr |= (1u << 18);
+        attr |= (static_cast<std::uint32_t>(cs.emphasis) & 0xFu) << 21;
         if (cs.useFontSpace) attr |= (1u << 25);
+        attr |= (static_cast<std::uint32_t>(cs.strikeShapeId) & 0xFu) << 26;
+        if (cs.useKerning) attr |= (1u << 30);
         w.u32(attr);
 
-        w.i8(10);  // shadow offset X
-        w.i8(10);  // shadow offset Y
+        w.i8(cs.shadowOffsetX);
+        w.i8(cs.shadowOffsetY);
         const std::uint32_t txtCol = toColorRef(cs.textColor, 0x00000000u);
         w.u32(txtCol);
-        w.u32(txtCol);  // underline color
+        w.u32(toColorRef(cs.underlineColor, txtCol));
         w.u32(toColorRef(cs.shadeColor, 0xFFFFFFFFu));
-        w.u32(0x00B2B2B2u);  // shadow color
+        w.u32(toColorRef(cs.shadowColor, 0x00B2B2B2u));
         w.u16(static_cast<std::uint16_t>(cs.borderFillId > 0 ? cs.borderFillId : 1));
-        w.u32(txtCol);  // strikeout color
+        w.u32(toColorRef(cs.strikeColor, txtCol));
         appendRecord(stream, tag::CharShape, 1, w.view());
     }
 

@@ -104,6 +104,9 @@ python skills/chwp-agent/scripts/chwp_agent.py 문서.hwp -c '{"call":"info"}'
 
 부르는 법과 요청 모양은 [skills/chwp-agent/SKILL.md](skills/chwp-agent/SKILL.md), [reference.md](skills/chwp-agent/reference.md) 에 있다.
 claude.ai 에 올릴 스킬 묶음(Linux 정적 실행 파일 포함)은 `tools/chwp-agent/package-skill.py` 가 Docker 로 만든다.
+같은 묶음을 내 컴퓨터의 에이전트(Claude Code 등)에서 쓸 수 있다. `~/.claude/skills/chwp-agent/` 에 풀면 된다.
+Windows 처럼 묶음의 Linux 실행 파일이 맞지 않는 곳에서는 엔진 패키지 `classinghwp` 를 pip 으로 깐다(스킬 스크립트가 명령을 알려 준다).
+엔진 패키지(wheel)는 `tools/chwp-agent/package-wheel.py` 가 만든다.
 `chwp-agent --mcp` 는 같은 기능을 MCP 서버(stdio)로 낸다. 설정은 [tools/chwp-agent/MCP.md](tools/chwp-agent/MCP.md) 에 있다.
 
 ### 웹 앱

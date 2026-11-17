@@ -14,7 +14,9 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/chwp_agent.py <문서> [요청.jsonl | -] [-
 ```
 
 `${CLAUDE_SKILL_DIR}` 이 없는 곳에서는 이 SKILL.md 가 있는 폴더 기준 경로로 부른다(Windows 는 `python`).
-실행 파일은 `bin/chwp-agent`(Linux) 이고, 압축을 풀어 쓴 곳이면 실행 권한(755)을 준다.
+엔진은 `bin/chwp-agent`(Linux x86_64) 이고, 스크립트가 알아서 찾는다. 스크립트가 stderr 에
+`chwp-agent: engine-missing {"install":"..."}` 를 내면(Windows·macOS 처럼 bin/ 이 맞지 않는 곳) 그 `install` 명령을
+한 번 실행하고 원래 명령을 다시 부른다. 그 명령은 pip 으로 이 스킬 버전의 엔진 패키지(classinghwp)를 깐다.
 
 ## 빠른 시작
 

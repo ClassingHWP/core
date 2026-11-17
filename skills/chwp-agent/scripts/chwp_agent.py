@@ -4,10 +4,17 @@
 무엇을 받을지, 무엇을 할지는 모두 실행 파일(core)이 정한다. 이 스크립트는 실행 파일 자리를 찾고,
 core 가 달라고 한 글꼴 파일을 받아 캐시 폴더에 넣는 일만 한다.
 
-실행 파일을 찾는 차례:
+실행 파일(엔진)을 찾는 차례:
   1. 환경 변수 CHWP_AGENT_BIN
-  2. 스킬 폴더의 bin/chwp-agent(.exe)  (묶어서 배포할 때)
-  3. 저장소 build/*/tools/chwp-agent/ 아래에서 가장 최근에 만든 것
+  2. 스킬 폴더의 bin/chwp-agent(.exe) — 이 컴퓨터의 OS·CPU 용일 때만. 올리는 스킬 ZIP 에는 Linux x86_64 판이 들어 있어
+     claude.ai·ChatGPT 샌드박스와 Linux 에서는 이것을 쓰고, Windows·macOS 에서는 건너뛴다.
+  3. pip 으로 설치한 classinghwp 패키지의 엔진(Windows·macOS 처럼 bin/ 이 맞지 않는 곳). 스킬 폴더에 VERSION 이
+     있으면 패키지 버전이 같아야 한다.
+  4. 저장소 build/*/tools/chwp-agent/ 아래에서 가장 최근에 만든 것
+  엔진이 없거나 패키지 버전이 다르면 stderr 에 아래 한 줄을 남기고 끝낸다. 에이전트는 install 의 명령을 한 번 실행하고
+  다시 부른다(설치는 이 스크립트가 하지 않는다. 사용자가 보고 허락할 일이다).
+      chwp-agent: engine-missing {"install":"python -m pip install classinghwp==0.3.10 --find-links ...", "installed":null, ...}
+  엔진 wheel 은 PyPI 와 그 버전의 GitHub 릴리스(ClassingHWP/core)에 올린다.
 
 글꼴:
   - 서버: 환경 변수 CHWP_FONT_BASE, 없으면 https://ede.kr/hwp/fonts/ (웹 뷰어와 같은 글꼴 서버)
@@ -39,8 +46,11 @@ MCP 서버(stdio)로 쓰려면:
 그 요청과 답은 클라이언트에 보내지 않는다. 무엇을 할지(도구·판단)는 모두 실행 파일(core)이 정한다.
 """
 
+import importlib
 import json
 import os
+import platform
+import shlex
 import socket
 import subprocess
 import sys
@@ -57,18 +67,96 @@ FONT_CACHE = Path(os.environ.get("CHWP_FONT_CACHE", Path.home() / ".cache" / "ch
 CATALOG = {"index.json": "CHWP_FONT_INDEX", "license-swap.json": "CHWP_FONT_LICENSE_SWAP", "replace.json": "CHWP_FONT_REPLACE"}
 
 
+SKILL = Path(__file__).resolve().parent.parent
+PACKAGE = "classinghwp"
+# 버전마다 엔진 wheel 을 붙이는 GitHub 릴리스의 파일 목록 페이지(뒤에 /v<버전>).
+RELEASES = "https://github.com/ClassingHWP/core/releases/expanded_assets"
+# 엔진 ELF 의 e_machine 과 그 CPU 를 부르는 platform.machine() 이름들.
+ELF_MACHINES = {0x3E: {"x86_64", "amd64"}, 0xB7: {"aarch64", "arm64"}}
+
+
+def runs_here(path: Path) -> bool:
+    """이 컴퓨터의 OS·CPU 에서 도는 실행 파일인지 머리 바이트로 본다."""
+    try:
+        with path.open("rb") as file:
+            head = file.read(64)
+    except OSError:
+        return False
+    if sys.platform.startswith("linux"):
+        if len(head) < 20 or head[:4] != b"\x7fELF":
+            return False
+        machine = int.from_bytes(head[18:20], "little" if head[5] == 1 else "big")
+        return platform.machine().lower() in ELF_MACHINES.get(machine, set())
+    if os.name == "nt":
+        return head[:2] == b"MZ"
+    if sys.platform == "darwin":
+        # 한 갈래(64비트) 또는 여러 갈래(universal) Mach-O. Apple 실리콘은 x86_64 판도 Rosetta 로 돌린다.
+        return head[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe")
+    return False
+
+
+def executable(path: Path) -> Path:
+    # ZIP 으로 올린 스킬은 풀 때 실행 권한이 빠질 수 있다.
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        path.chmod(path.stat().st_mode | 0o755)
+    return path
+
+
+def skill_version() -> str | None:
+    """스킬 ZIP 을 만들 때 넣은 버전(package-skill.py). 저장소에서 바로 쓰면 없다."""
+    try:
+        return (SKILL / "VERSION").read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def package_engine() -> tuple[Path | None, str | None]:
+    """pip 으로 설치한 classinghwp 패키지의 엔진 경로와 패키지 버전. 패키지가 없으면 (None, None)."""
+    try:
+        module = importlib.import_module(PACKAGE)
+    except ImportError:
+        return None, None
+    version = getattr(module, "__version__", None)
+    try:
+        path = Path(module.engine_path())
+    except Exception:  # 패키지가 깨졌으면 없는 것으로 본다.
+        return None, version
+    return (path if path.is_file() and runs_here(path) else None), version
+
+
+def install_command(version: str | None) -> str:
+    """이 스크립트를 돌린 파이썬에 엔진 패키지를 까는 명령.
+
+    pip 이 PyPI 와 함께 그 버전 GitHub 릴리스의 파일 목록에서도 찾게 한다(--find-links). 어느 쪽이든
+    이 OS·CPU 에 맞는 wheel 을 pip 이 고른다.
+    """
+    python = sys.executable or "python3"
+    python = subprocess.list2cmdline([python]) if os.name == "nt" else shlex.quote(python)
+    if not version:
+        return f"{python} -m pip install {PACKAGE}"
+    return f"{python} -m pip install {PACKAGE}=={version} --find-links {RELEASES}/v{version}"
+
+
+# find_binary 가 엔진을 못 찾았을 때 그 까닭(engine-missing 줄에 쓴다).
+MISSING = {"installed": None}
+
+
 def find_binary() -> Path | None:
     env = os.environ.get("CHWP_AGENT_BIN")
     if env and Path(env).is_file():
         return Path(env)
-    skill = Path(__file__).resolve().parent.parent
-    bundled = skill / "bin" / EXE
-    if bundled.is_file():
-        # ZIP 으로 올린 스킬은 풀 때 실행 권한이 빠질 수 있다.
-        if os.name != "nt" and not os.access(bundled, os.X_OK):
-            bundled.chmod(bundled.stat().st_mode | 0o755)
-        return bundled
-    for root in [skill, *skill.parents]:
+    bundled = SKILL / "bin" / EXE
+    if bundled.is_file() and runs_here(bundled):
+        return executable(bundled)
+    wanted = skill_version()
+    engine, version = package_engine()
+    MISSING["installed"] = version
+    if engine is not None and (wanted is None or version == wanted):
+        return executable(engine)
+    if engine is not None:
+        # 스킬 글(op·호출 설명)과 엔진 버전이 어긋나면 op 가 맞지 않을 수 있다. 스킬 버전의 엔진을 깔게 한다.
+        return None
+    for root in [SKILL, *SKILL.parents]:
         build = root / "build"
         if not build.is_dir():
             continue
@@ -358,13 +446,31 @@ def fetch_only(args: list[str], binary: Path) -> int:
     return 0 if not blocked else 1
 
 
+def report_engine_missing() -> None:
+    """엔진이 없거나 버전이 다르면 에이전트가 알아볼 한 줄과 사람이 읽을 설명을 stderr 에 남긴다."""
+    wanted = skill_version()
+    installed = MISSING["installed"]
+    notice = {
+        "install": install_command(wanted),
+        "installed": installed,
+        "wanted": wanted,
+        "platform": f"{sys.platform}-{platform.machine().lower()}",
+    }
+    sys.stderr.write("chwp-agent: engine-missing " + json.dumps(notice, ensure_ascii=False) + "\n")
+    if installed and wanted and installed != wanted:
+        reason = f"설치된 {PACKAGE} {installed} 이 스킬 버전 {wanted} 와 다릅니다."
+    else:
+        reason = "이 컴퓨터에서 돌릴 chwp-agent 엔진을 찾지 못했습니다."
+    sys.stderr.write(f"{reason} 다음을 한 번 실행한 뒤 다시 부르세요:\n  {notice['install']}\n")
+    if wanted is None:
+        sys.stderr.write("저장소에서 쓰는 중이면 빌드해도 됩니다: "
+                         "cmake --build build/windows-msvc --config Release --target chwp-agent\n")
+
+
 def main() -> int:
     binary = find_binary()
     if binary is None:
-        sys.stderr.write(
-            "chwp-agent 실행 파일을 찾지 못했습니다. 저장소에서 다음으로 빌드하거나 CHWP_AGENT_BIN 을 주세요:\n"
-            "  cmake --build build/windows-msvc --config Release --target chwp-agent\n"
-        )
+        report_engine_missing()
         return 2
     args = sys.argv[1:]
     fetch = "--no-font-fetch" not in args
