@@ -1771,6 +1771,24 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
         p.groupX = i32(off, "x");
         p.groupY = i32(off, "y");
     }
+    // 돌린 개체(숨긴 한글 2024: rotationInfo angle). sz 는 돌린 상자라 크기는 돌리기 전 크기(curSz, 없으면 orgSz)다.
+    if (auto rotation = child(node, "rotationInfo")) p.rotation = ((i32(rotation, "angle") % 360) + 360) % 360;
+    // 기울이기(숨긴 한글 2024: scaMatrix e2 = -tan 가로, e4 = -tan 세로). 첫 배율 행렬이 이 개체의 것이다.
+    if (auto info = child(node, "renderingInfo")) {
+        for (auto matrix : info.children()) {
+            if (!is(matrix, "scaMatrix")) continue;
+            const double e2 = matrix.attribute("e2").as_double(0);
+            const double e4 = matrix.attribute("e4").as_double(0);
+            const double toDeg = 180.0 / 3.14159265358979323846;
+            if (e2 != 0) p.skewX = static_cast<std::int32_t>(std::lround(std::atan(-e2) * toDeg));
+            if (e4 != 0) p.skewY = static_cast<std::int32_t>(std::lround(std::atan(-e4) * toDeg));
+            break;
+        }
+    }
+    if (p.rotation != 0 || p.skewX != 0 || p.skewY != 0) {
+        if (!widthIsCurrent) p.width = orgW;
+        if (!heightIsCurrent) p.height = orgH;
+    }
     // 그룹할 때마다 행렬이 하나 더 붙는다. 배율은 크기에 곱하고, 행렬의 이동(e3, e6)은 offset에 더한다.
     // 이동은 뒤 행렬부터 로컬 원점에 적용한다. transMatrix 는 offset 과 같으므로 다시 더하지 않는다.
     double scaleX = 1;
@@ -1810,12 +1828,28 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
     }
     double shiftX = 0;
     double shiftY = 0;
-    for (auto it = affixes.rbegin(); it != affixes.rend(); ++it) {
-        if (it->translation) continue;
-        const double nextX = it->e1 * shiftX + it->e2 * shiftY + it->e3;
-        const double nextY = it->e4 * shiftX + it->e5 * shiftY + it->e6;
-        shiftX = nextX;
-        shiftY = nextY;
+    const auto through = [&](double x, double y, double& outX, double& outY) {
+        for (auto it = affixes.rbegin(); it != affixes.rend(); ++it) {
+            if (it->translation) continue;
+            const double nextX = it->e1 * x + it->e2 * y + it->e3;
+            const double nextY = it->e4 * x + it->e5 * y + it->e6;
+            x = nextX;
+            y = nextY;
+        }
+        outX = x;
+        outY = y;
+    };
+    through(0, 0, shiftX, shiftY);
+    // 돌린 개체의 묶음 안 자리는 돌린 상자의 왼쪽 위(네 모서리 가운데 가장 작은 값)다.
+    if ((p.rotation != 0 || p.skewX != 0 || p.skewY != 0) && orgW > 0 && orgH > 0) {
+        const double cornersX[] = {0, static_cast<double>(orgW), 0, static_cast<double>(orgW)};
+        const double cornersY[] = {0, 0, static_cast<double>(orgH), static_cast<double>(orgH)};
+        for (int i = 0; i < 4; ++i) {
+            double cx = 0, cy = 0;
+            through(cornersX[i], cornersY[i], cx, cy);
+            if (i == 0 || cx < shiftX) shiftX = cx;
+            if (i == 0 || cy < shiftY) shiftY = cy;
+        }
     }
     p.matrixX = static_cast<std::int32_t>(std::llround(shiftX));
     p.matrixY = static_cast<std::int32_t>(std::llround(shiftY));
@@ -1827,7 +1861,7 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
     applyScale(p.height, orgH, heightIsCurrent, scaleYs);
     // 배치 크기는 sz 다. curSz 는 원본×배율의 소수점을 버려 1 작을 수 있다. 40575×0.195613 은 sz 7937, curSz 7936이다.
     // 묶음 안 자식에는 sz 가 없어 위 계산을 그대로 쓴다.
-    if (auto sz = child(node, "sz")) {
+    if (auto sz = child(node, "sz"); sz && p.rotation == 0 && p.skewX == 0 && p.skewY == 0) {
         const std::uint32_t szW = u32(sz, "width");
         const std::uint32_t szH = u32(sz, "height");
         if (szW > 0 && nearHu(szW, p.width)) p.width = szW;

@@ -254,11 +254,27 @@ struct PointerHold {
     // 그림이 아닌 개체(표·도형·글상자)의 크기 조절. 뗄 때 resizeObjectPending 이 켜지고 editResizeObject 가 반영한다.
     // 표는 그린 줄 높이·칸 폭(resizeRows·resizeCols)을 비율대로 늘린다.
     bool resizeObjectPending = false;
+    // 개체 회전(한글 회전 단추의 개체 회전). 켜면 고른 개체의 손잡이를 끌어 가운데를 중심으로 돌린다. 뗄 때 돌린 각을 넣는다.
+    bool rotateMode = false;
+    bool rotateDragging = false;
+    double rotateCenterX = 0;
+    double rotateCenterY = 0;
+    double rotateStartAngle = 0;
+    int rotateDelta = 0;
+    bool rotatePending = false;
+    int rotatePage = -1;
+    int rotateStory = -1;
+    int rotateParagraph = -1;
+    int rotateItem = -1;
     int resizeStory = -1;
     int resizeParagraph = -1;
     int resizeItem = -1;
     std::int32_t resizeNewLeft = 0;
     std::int32_t resizeNewTop = 0;
+    std::int32_t resizeNewRight = 0;
+    std::int32_t resizeNewBottom = 0;
+    std::int32_t resizeAlignW = -1;  // 늘리는 개체의 맞춤 기준 크기(ObjectExtra::alignW). 모르면 -1
+    std::int32_t resizeAlignH = -1;
     std::vector<std::int32_t> resizeRows;
     std::vector<std::int32_t> resizeCols;
     // 표 칸 경계 끌기. 1 세로선(칸 폭), 2 가로선(줄 높이). borderIndex 는 그 선 왼쪽(위) 칸·줄 번호다.
@@ -433,6 +449,8 @@ model::BorderFill borderFillOf(const model::Document& doc, std::uint32_t id);
 std::uint32_t internBorderFillOf(model::Document& doc, const model::BorderFill& fill);
 // 문단 종류(headingType)를 바꾸면 그 종류가 가리킬 번호·글머리표 정의를 고르거나 만든다.
 void applyParaHeadingFields(model::Document& doc, model::ParaShape& shape, const FormatFields& fields);
+// 글머리표 및 문단 번호 대화 상자의 모양 목록(값, 보일 글). kind 는 number·bullet·check.
+std::vector<std::pair<std::string, std::string>> headingPresetOptions(const std::string& kind);
 // 막힌 글꼴 때문에 남겨 둔 개체 넣기를 이어서 한다. 남은 것이 없으면 문서를 바꾸지 않은 결과다.
 EditResult resumePendingInsert(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 // 그린 도형만 버린다. dropPendingInsert 가 부른다.
@@ -576,10 +594,32 @@ bool pickAnchoredObject(const model::Document& doc, const std::vector<Node>& pag
                         int item);
 // 고른 개체(첫 개체와 여러 개체 고르기로 더한 개체)를 모두 지운다. 고른 개체가 없으면 handled 가 거짓이다.
 EditResult deleteSelectedObjectsNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 그 개체를 그린 쪽과 쪽 좌표 상자(왼쪽 위·폭·높이). 처음 그린 쪽이다. 없으면 거짓.
+struct PlacedBox {
+    int page = -1;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+};
+bool placedObjectBox(const model::Document& doc, const std::vector<Node>& pages, int story, int paragraph, int item,
+                     PlacedBox& out);
+// 개체 묶기·풀기(한글 Group·Ungroup). 자리는 글 묶음·문단·항목 순번이다.
+EditResult groupObjectsNow(model::Document& doc, std::vector<Node>& pages, std::vector<ObjectSpot> spots,
+                           bool useStoredLineHeight, std::string& why);
+EditResult ungroupObjectNow(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
+                            bool useStoredLineHeight, std::string& why);
+EditResult rotateObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 고른 개체의 네 꼭짓점(쪽 HU, 왼쪽 위부터 시계 방향). 돌리거나 기울인 개체는 돌린 모양의 꼭짓점이다.
+bool objectCorners(const PointerHold& hold, double out[4][2]);
+// 지금 고른 개체들(첫 개체와 여러 개체 고르기). 고른 개체가 없으면 비어 있다.
+std::vector<ObjectSpot> selectedObjectSpots();
 bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
                             int paragraph, int item);
 // 개체 노드가 가리키는 문서의 컨트롤. 없으면 nullptr 이다.
 model::Control* anchoredControl(model::Document& doc, int story, int paragraph, int item);
+// 손잡이로 늘린 띄운 개체의 자리. 한글처럼 끈 쪽만 움직이고 반대쪽 끝은 그대로 둔다(맞춤마다 자리 값을 다시 잰다).
+void keepResizedEdges(model::Placement& placement, const PointerHold& hold);
 // 개체 하나의 크기를 바꾼다(점·글상자 폭·캡션 폭을 같이). 표는 따로 칸을 늘린다.
 void resizeControl(model::Control& ctrl, std::uint32_t oldW, std::uint32_t oldH, std::uint32_t newW,
                    std::uint32_t newH);
@@ -677,6 +717,8 @@ EditResult applyPageSetupNow(model::Document& doc, std::vector<Node>& pages, con
 EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int rows, int cols, bool useStoredLineHeight,
                           const TableCreateOptions& options = {});
 EditResult insertBreakNow(model::Document& doc, std::vector<Node>& pages, BreakKind kind, bool useStoredLineHeight);
+// 표 만들기 너비의 처음 값: 캐럿 자리 단에 맞춤 표 폭(HWPUNIT). 캐럿이 없으면 0.
+std::int32_t tableCreateColumnWidth(const model::Document& doc, const std::vector<Node>& pages);
 EditResult replaceTextNow(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                           const std::string& replacement, bool matchCase, bool useStoredLineHeight);
 EditResult replaceAllTextNow(model::Document& doc, std::vector<Node>& pages, const std::string& text,

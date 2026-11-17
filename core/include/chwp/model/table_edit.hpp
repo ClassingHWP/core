@@ -96,6 +96,12 @@ struct CellBorderFillSpec {
 };
 TableEdit setTableCellBorderFill(Table& table, int row0, int col0, int row1, int col1, const CellBorderFillSpec& spec,
                                  const BorderFillAccess& fills);
+// 셀 음영(한글 표 디자인 탭 셀 음영의 증가·감소 칸, 숨긴 한글 2024 로 확인). step 1~6 은 증가(진하게), -1~-6 은
+// 감소(흐리게), 0 은 셀 음영 없음(배경을 없앤다). 배경이 없는 칸은 흰색에서 시작한다.
+// 색은 윈도 정수 HLS(0~240, ColorRGBToHLS)로 색상·채도를 읽고, 밝기만 칸마다 정한 값으로 바꿔 float HLS→RGB 로
+// 되돌린다(각 채널 (int)(x*255)). 밝기는 증가 123·106·89·72·55·38, 감소 140·157·174·191·209·225 다.
+std::string shadedFaceColor(const std::string& faceColor, int step);
+TableEdit shadeTableCells(Table& table, int row0, int col0, int row1, int col1, int step, const BorderFillAccess& fills);
 // 블록 칸의 배경을 한 색으로 칠한다. faceColor 가 비었거나 "none" 이면 배경을 없앤다.
 TableEdit fillTableCells(Table& table, int row0, int col0, int row1, int col1, const std::string& faceColor,
                          const BorderFillAccess& fills);

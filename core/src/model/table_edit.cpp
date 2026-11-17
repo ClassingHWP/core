@@ -1,6 +1,8 @@
 #include "chwp/model/table_edit.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <map>
 #include <cstdlib>
 #include <numeric>
@@ -709,6 +711,115 @@ TableEdit fillTableCells(Table& table, int row0, int col0, int row1, int col1, c
         if (static_cast<int>(c.row) < row0 || lastRow(c) > row1 || static_cast<int>(c.col) < col0 || lastCol(c) > col1) continue;
         BorderFill f = fills.read(c.borderFillId);
         f.faceColor = faceColor.empty() ? "none" : faceColor;
+        c.borderFillId = fills.intern(f);
+    }
+    out.focusCell = firstBlockCell(table, row0, col0);
+    return out;
+}
+
+namespace {
+
+// 윈도 shlwapi ColorRGBToHLS 와 같은 정수 계산(HLSMAX 240, RGBMAX 255). 회색이면 색상 160, 채도 0 이다.
+void rgbToHls240(int r, int g, int b, int& h, int& l, int& s) {
+    const int mx = std::max({r, g, b});
+    const int mn = std::min({r, g, b});
+    const int total = mx + mn;
+    const int diff = mx - mn;
+    l = (total * 240 + 255) / 510;
+    if (mx == mn) {
+        h = 160;
+        s = 0;
+        return;
+    }
+    s = l <= 120 ? (diff * 240 + total / 2) / total : (diff * 240 + (510 - total) / 2) / (510 - total);
+    const int rn = ((mx - r) * 40 + diff / 2) / diff;
+    const int gn = ((mx - g) * 40 + diff / 2) / diff;
+    const int bn = ((mx - b) * 40 + diff / 2) / diff;
+    if (r == mx) h = bn - gn;
+    else if (g == mx) h = 80 + rn - bn;
+    else h = 160 + gn - rn;
+    if (h < 0) h += 240;
+    if (h > 240) h -= 240;
+}
+
+// 한글 셀 음영의 HLS→RGB 는 float 계산이다(double 로 하면 감소 1칸 빨강이 #FF2A2A 가 되어 #FE2A2A 와 다르다).
+// 곱셈과 덧셈을 한 식에 두면 컴파일러가 FMA 로 묶어 끝자리가 달라질 수 있어 문장을 나눈다.
+float hlsPart(float m1, float m2, float hue) {
+    hue = hue - std::floor(hue);
+    const float sixth = 1.0f / 6.0f;
+    const float twoThirds = 2.0f / 3.0f;
+    if (hue < sixth) {
+        const float span = (m2 - m1) * hue;
+        const float scaled = span * 6.0f;
+        return m1 + scaled;
+    }
+    if (hue < 0.5f) return m2;
+    if (hue < twoThirds) {
+        const float left = twoThirds - hue;
+        const float span = (m2 - m1) * left;
+        const float scaled = span * 6.0f;
+        return m1 + scaled;
+    }
+    return m1;
+}
+
+int hexByte(const std::string& text, std::size_t at) {
+    return static_cast<int>(std::strtol(text.substr(at, 2).c_str(), nullptr, 16));
+}
+
+}  // namespace
+
+std::string shadedFaceColor(const std::string& faceColor, int step) {
+    static const int kIncrease[] = {123, 106, 89, 72, 55, 38};
+    static const int kDecrease[] = {140, 157, 174, 191, 209, 225};
+    if (step == 0 || step > 6 || step < -6) return std::string();
+    int r = 255, g = 255, b = 255;
+    if (faceColor.size() == 7 && faceColor[0] == '#') {
+        r = hexByte(faceColor, 1);
+        g = hexByte(faceColor, 3);
+        b = hexByte(faceColor, 5);
+    }
+    int h = 0, l = 0, s = 0;
+    rgbToHls240(r, g, b, h, l, s);
+    const float hue = static_cast<float>(h) / 240.0f;
+    const float lum = static_cast<float>(step > 0 ? kIncrease[step - 1] : kDecrease[-step - 1]) / 240.0f;
+    const float sat = static_cast<float>(s) / 240.0f;
+    float rr = lum, gg = lum, bb = lum;
+    if (s != 0) {
+        float m2 = 0;
+        if (lum <= 0.5f) {
+            const float grow = 1.0f + sat;
+            m2 = lum * grow;
+        } else {
+            const float product = lum * sat;
+            const float sum = lum + sat;
+            m2 = sum - product;
+        }
+        const float twice = 2.0f * lum;
+        const float m1 = twice - m2;
+        const float third = 1.0f / 3.0f;
+        rr = hlsPart(m1, m2, hue + third);
+        gg = hlsPart(m1, m2, hue);
+        bb = hlsPart(m1, m2, hue - third);
+    }
+    char out[8];
+    std::snprintf(out, sizeof out, "#%02X%02X%02X", static_cast<int>(rr * 255.0f), static_cast<int>(gg * 255.0f),
+                  static_cast<int>(bb * 255.0f));
+    return out;
+}
+
+TableEdit shadeTableCells(Table& table, int row0, int col0, int row1, int col1, int step, const BorderFillAccess& fills) {
+    TableEdit out;
+    if (out.error = checkBlock(table, row0, col0, row1, col1); !out.ok()) return out;
+    for (TableCell& c : table.cells) {
+        if (static_cast<int>(c.row) < row0 || lastRow(c) > row1 || static_cast<int>(c.col) < col0 || lastCol(c) > col1) continue;
+        BorderFill f = fills.read(c.borderFillId);
+        if (step == 0) {
+            f.faceColor = "none";
+        } else {
+            const std::string base = f.faceColor == "none" ? std::string() : f.faceColor;
+            f.faceColor = shadedFaceColor(base, step);
+        }
         c.borderFillId = fills.intern(f);
     }
     out.focusCell = firstBlockCell(table, row0, col0);

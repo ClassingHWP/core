@@ -40,7 +40,7 @@ int maskZoomPercent(int percent, bool dragging);
 // 언제나 보이는 배율 이상으로 구워 밉맵으로 줄이기만 한다. 작은 글자 점이 늘어나 덩어리로 보이지 않는다.
 int pageCachePercent(int percent);
 
-// 멈춰 있을 때 쓰는 마스크 배율. 100% 이하는 쪽 텍스처에 1:1로 찍히도록 그 텍스처 배율에 맞춘다.
+// 멈춰 있을 때 쓰는 마스크 배율. 쪽 텍스처에 1:1로 찍히도록 그 텍스처 배율에 맞춘다(100% 이하는 50·100, 넘으면 그 배율).
 int restingMaskZoom(int percent);
 
 // 글자 마스크를 찍는 픽셀 크기(ppem). 화면에 보이는 크기 그대로 찍고, 아틀라스 한 장(2048) 안에 들도록

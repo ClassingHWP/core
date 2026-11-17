@@ -1012,7 +1012,9 @@ StyleReport styleToSend(StyleReport report) {
         return report;
     }
     report.styleChanged = report.style.active && !(report.style == gSentStyle->style);
-    report.statusChanged = report.status.active && !(report.status == gSentStyle->status);
+    // 개체를 고르면 글 캐럿은 없지만(active 거짓) 고른 개체 갈래가 바뀐 것은 셸에 알린다(그림·도형 탭).
+    const bool objectChanged = report.status.object != gSentStyle->status.object;
+    report.statusChanged = (report.status.active || objectChanged) && !(report.status == gSentStyle->status);
     if (report.styleChanged) gSentStyle->style = report.style;
     if (report.statusChanged) gSentStyle->status = report.status;
     return report;
@@ -1705,6 +1707,17 @@ EditReport editInsertPicture(const Bytes& image) {
     if (wasCrew) {
         resumeCrewAfterEdit(res);
     }
+    frameAfterEdit();
+    return makeEditReport(res);
+}
+
+EditReport editPictureBullet(const Bytes& image) {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    const chwp::render::EditResult res = gDoc.pictureBullet(image);
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
     frameAfterEdit();
     return makeEditReport(res);
 }
@@ -2441,6 +2454,27 @@ EditReport editShortcut(const std::string& command) {
     // "2026년 11월 17일"). 날짜/시간 코드(Ctrl+K,C)는 같은 글을 담은 날짜 필드다.
     if (command == "dateString") return editText(chwp::model::koreanDateText(chwp::model::filetimeNow()), false);
     if (command == "dateField") return editInsertDateField();
+    // 개체 묶기·풀기(한글 Group·Ungroup). 고른 개체(여러 개체 고르기)를 묶고, 고른 묶음을 푼다.
+    // 개체 회전 켜고 끄기(한글 회전 단추의 개체 회전). 켜면 고른 개체의 손잡이를 끌어 돌린다.
+    if (command == "rotateObjectMode") {
+        chwp::render::toggleObjectRotateMode();
+        frameAfterEdit();
+        return makeEditReport(chwp::render::EditResult{});
+    }
+    if (command == "groupObjects" || command == "ungroupObjects") {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        std::string why;
+        const chwp::render::EditResult res =
+            command == "groupObjects" ? gDoc.groupObjects({}, &why) : gDoc.ungroupObject(nullptr, &why);
+        if (res.documentChanged) syncEditedDocument(res);
+        if (wasCrew) resumeCrewAfterEdit(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.documentChanged) report.error = why;
+        return report;
+    }
     // Hangul StyleShortcut1..10 (Ctrl+1..0, Ctrl+Alt+1..0): the Nth style in the document style list.
     if (command.rfind("styleShortcut", 0) == 0) {
         const int index = std::atoi(command.c_str() + 13) - 1;
@@ -2713,6 +2747,11 @@ EditReport editInsertTable(int rows, int cols, const render::FormatFields& field
     for (const auto& [name, value] : fields) {
         if (name == "widthFit") {
             if (const std::string* s = std::get_if<std::string>(&value)) options.fitParagraph = *s == "paragraph";
+        } else if (name == "width" || name == "height") {
+            // 임의 값(mm). 한글처럼 HWPUNIT 으로 버려 바꾼다.
+            if (const double* mm = std::get_if<double>(&value)) {
+                (name == "width" ? options.width : options.height) = render::tableCreateUnitFromMm(*mm);
+            }
         } else if (name == "treatAsChar") {
             if (const bool* b = std::get_if<bool>(&value)) options.treatAsChar = *b;
         }
@@ -5669,6 +5708,7 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
         if (askSwap) out.needsFontSwap = true;
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.moveObject();
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.resizeObject();
+        if (!drawn.documentChanged && !askSwap) drawn = gDoc.rotateObject();
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.resizeTableBorder();
         if (drawn.documentChanged) {
             syncEditedDocument(drawn);
@@ -5680,7 +5720,7 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
         }
         if (wasCrew) resumeCrewAfterEdit(drawn);
     }
-    if ((kind == 3 || outcome.tap) && chwp::render::commitObjectResize(gDoc.doc)) {
+    if ((kind == 3 || outcome.tap) && chwp::render::editCommitObjectResize(gDoc.doc, gDoc.pages, gDoc.storedLineHeight)) {
         const bool wasCrew = crewRunning();
         if (wasCrew) pauseCrew();
         const chwp::render::ResizeCommitInfo resized = chwp::render::resizeCommitInfo();
@@ -5746,6 +5786,36 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     gFallbackImages.clear();
     if (!gScreenOn) gFallbackImages = chwp::render::pointerImages(gDoc.doc, gDoc.pages);
     return out;
+}
+
+render::FormatFields selectedObjectView() {
+    int story = 0;
+    int paragraph = 0;
+    int item = 0;
+    if (!chwp::render::selectedObjectAnchor(story, paragraph, item)) return {};
+    return gDoc.objectPropertiesView(story, paragraph, item);
+}
+
+EditReport editSelectedObject(const render::FormatFields& fields) {
+    int story = 0;
+    int paragraph = 0;
+    int item = 0;
+    if (!chwp::render::selectedObjectAnchor(story, paragraph, item)) return makeEditReport(chwp::render::EditResult{});
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    std::string why;
+    const chwp::render::EditResult res = gDoc.objectProperties(story, paragraph, item, fields, &why);
+    if (res.documentChanged) syncEditedDocument(res);
+    // 고친 개체를 다시 고른 채로 둔다(이어서 고치게).
+    if (res.documentChanged) gDoc.selectObject(story, paragraph, item);
+    if (wasCrew) {
+        resumeCrewAfterEdit(res);
+    }
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged) report.error = why;
+    return report;
 }
 
 std::string contextMenuKind() {
@@ -5879,6 +5949,11 @@ const std::vector<KeyBinding>& keyBindings() {
         out.push_back(KeyBinding{"Backspace", 0, true, false, "subtractRow", 0, false, "cellStart"});
         // 표 안 Alt+Insert 줄/칸 추가하기, Alt+Delete 줄/칸 지우기 대화 상자(한글 InsertTableRowColumnDlg·DeleteTableRowColumnDlg).
         out.push_back(KeyBinding{"Insert", 0, false, true, "insertRowColDialog", 0, false, "table"});
+        // 개체를 골랐을 때 G·Ctrl+G 개체 묶기, U·Ctrl+U 개체 풀기(한글 도형 단축키 Group·Ungroup).
+        out.push_back(KeyBinding{"KeyG", 0, false, false, "groupObjects", 0, false, "object"});
+        out.push_back(KeyBinding{"KeyG", 0, true, false, "groupObjects", 0, false, "object"});
+        out.push_back(KeyBinding{"KeyU", 0, false, false, "ungroupObjects", 0, false, "object"});
+        out.push_back(KeyBinding{"KeyU", 0, true, false, "ungroupObjects", 0, false, "object"});
         out.push_back(KeyBinding{"Delete", 0, false, true, "deleteRowColDialog", 0, false, "table"});
         // 한글 2024 지우기 단축키: DeleteWordBack(Ctrl+Backspace), DeleteWord(Ctrl+Delete·Ctrl+T),
         // DeleteLine(Ctrl+Y), DeleteLineCurEnd(Alt+Y). 브라우저는 Ctrl+T 를 막지 못해 웹에서는 Ctrl+Delete 를 쓴다.
@@ -5966,6 +6041,7 @@ const std::vector<KeyBinding>& keyBindings() {
         chord("KeyK", "KeyA", "updateAllToc");     // UpdateAllTOC
         chord("KeyK", "KeyH", "hyperlinkDialog");  // HyperlinkDlg
         chord("KeyK", "KeyD", "dateString");       // DateTimeString(날짜/시간 문자열)
+        chord("KeyK", "KeyN", "headingShapeDialog");  // ParaNumberBulletDlg(문단 번호/글머리표)
         chord("KeyK", "KeyC", "dateField");        // InsertDateTimeField(날짜/시간 코드)
         chord("KeyN", "KeyN", "footnote");         // Footnotes
         chord("KeyN", "KeyE", "endnote");          // Endnotes
@@ -6203,6 +6279,7 @@ InputReport input(const InputMessage& msg) {
     const std::string& type = msg.type;
     // 마우스 오른쪽 단추(상황 메뉴): 고른 것이 있으면 그대로 둔다(메뉴가 그것에 걸린다). 없으면 왼쪽 누름처럼 그 자리에
     // 캐럿을 두거나 개체를 고른다. 누른 채 끌기는 하지 않는다. 메뉴 갈래는 뗀 뒤 contextMenuKind 가 정한다.
+    // 숨긴 한글 2024 로 확인: 글 블록이 있으면 블록 밖을 눌러도 블록을 두고 블록 메뉴를 열고, 블록이 없으면 누른 자리로 캐럿이 간다.
     if (type == "pointer" && msg.pointer.button == 2 &&
         static_cast<chwp::input::Device>(msg.pointer.device) == chwp::input::Device::Mouse) {
         const int phase = msg.pointer.phase.value_or(1);

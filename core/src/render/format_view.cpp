@@ -507,6 +507,10 @@ FormatView textView(const FormatFields& fields) {
     view.specs.push_back(choiceSpec("strikeView", strikes));
     view.specs.push_back(choiceSpec("outline", ids({"0", "1", "2", "3", "4", "5", "6"})));
     view.specs.push_back(choiceSpec("emphasis", ids({"0", "1", "2", "3", "4", "5", "6"})));
+    // 글머리표 및 문단 번호 대화 상자의 모양 목록. 값은 번호이고 이름은 단추에 보일 글이다.
+    view.specs.push_back(choiceSpec("headingNumberPreset", headingPresetOptions("number")));
+    view.specs.push_back(choiceSpec("headingBulletPreset", headingPresetOptions("bullet")));
+    view.specs.push_back(choiceSpec("headingCheckPreset", headingPresetOptions("check")));
     view.values.emplace_back("underlineOn", textIn(values, "underlineType", "NONE") != "NONE");
     view.values.emplace_back("outlineOn", numberIn(values, "outline") > 0);
     view.values.emplace_back("shadowOn", numberIn(values, "shadow") > 0);
@@ -688,8 +692,14 @@ FormatView formatView(const model::Document& doc, const std::vector<Node>& pages
                       const FormatFields& viewPatch, const CaretPlace* base) {
     if (kind == FormatViewKind::Table) {
         FormatView view;
-        view.values = {{"rows", static_cast<double>(kTableStartRows)}, {"cols", static_cast<double>(kTableStartCols)}};
-        view.specs = {numberSpec("rows", "", 1, kTableMaxRows, 1, 0), numberSpec("cols", "", 1, kTableMaxCols, 1, 0)};
+        // 너비 처음 값은 단에 맞춤 폭(mm, 한글 표 만들기 148.0 mm). 높이 처음 값은 자동 표 높이(줄마다 칸 높이 282 + 글자 크기).
+        const double huPerMm = 7200.0 / 25.4;
+        const double widthMm = std::floor(tableCreateColumnWidth(doc, pages) / huPerMm * 10.0) / 10.0;
+        const double heightMm = std::floor(kTableStartRows * (282 + 1000) / huPerMm * 10.0) / 10.0;
+        view.values = {{"rows", static_cast<double>(kTableStartRows)}, {"cols", static_cast<double>(kTableStartCols)},
+                       {"width", widthMm}, {"height", heightMm}};
+        view.specs = {numberSpec("rows", "", 1, kTableMaxRows, 1, 0), numberSpec("cols", "", 1, kTableMaxCols, 1, 0),
+                      numberSpec("width", "mm", 1, 1000, 0.1, 1), numberSpec("height", "mm", 1, 1000, 0.1, 1)};
         return view;
     }
     if (kind == FormatViewKind::PageBorder) return pageBorderView(resolvePageBorder(doc, viewPatch));

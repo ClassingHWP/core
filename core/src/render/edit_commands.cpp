@@ -1,6 +1,7 @@
 #include "chwp/render/paint.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <atomic>
 #include <functional>
@@ -3595,12 +3596,20 @@ EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int ro
     placement.marginRight = 283;
     placement.marginTop = 283;
     placement.marginBottom = 283;
-    const std::int32_t tableWidth = std::max<std::int32_t>(cols * 200, columnWidth - 566);
-    const std::int32_t cellWidth = tableWidth / cols;
+    const bool customWidth = options.width > 0;
+    const bool customHeight = options.height > 0;
+    if (customWidth) placement.horzRelTo = "COLUMN";
+    const std::int32_t tableWidth =
+        customWidth ? std::max<std::int32_t>(cols, options.width) : std::max<std::int32_t>(cols * 200, columnWidth - 566);
+    const std::int32_t tableHeight = customHeight ? std::max<std::int32_t>(rows, options.height) : 0;
+    // 임의 값은 누적 버림으로 나눈다(합이 그 값). 맞춤은 고른 폭 ÷ 칸 수(버림)이고, 한글은 표 폭을 칸 폭의 합으로 적는다(41954 → 41952).
+    const auto share = [](std::int32_t total, int count, int i) {
+        const std::int64_t t = total;
+        return static_cast<std::int32_t>(t * (i + 1) / count - t * i / count);
+    };
     const std::int32_t cellHeight = 282;
-    // 한글은 짠 뒤 표 폭을 칸 폭의 합으로 적는다(41954 → 41952).
-    placement.width = static_cast<std::uint32_t>(cellWidth * cols);
-    placement.height = static_cast<std::uint32_t>(rows * (cellHeight + lineHeight));
+    placement.width = static_cast<std::uint32_t>(customWidth ? tableWidth : (tableWidth / cols) * cols);
+    placement.height = static_cast<std::uint32_t>(customHeight ? tableHeight : rows * (cellHeight + lineHeight));
     control.placement = placement;
 
     model::Table table;
@@ -3618,8 +3627,8 @@ EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int ro
             model::TableCell cell;
             cell.row = static_cast<std::uint32_t>(r);
             cell.col = static_cast<std::uint32_t>(c);
-            cell.width = static_cast<std::uint32_t>(cellWidth);
-            cell.height = static_cast<std::uint32_t>(cellHeight);
+            cell.width = static_cast<std::uint32_t>(customWidth ? share(tableWidth, cols, c) : tableWidth / cols);
+            cell.height = static_cast<std::uint32_t>(customHeight ? share(tableHeight, rows, r) : cellHeight);
             cell.borderFillId = table.borderFillId;
             cell.marginLeft = 510;
             cell.marginRight = 510;
@@ -3681,6 +3690,19 @@ EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int ro
     }
     if (cellStory > 0) setPointerCursor(doc, pages, model::CursorPos{cellStory, 0, 0});
     return makeEditResult(doc, true, true, story, paraIdx, &relayout);
+}
+
+std::int32_t tableCreateUnitFromMm(double mm) {
+    if (!(mm > 0)) return 0;
+    // 7200/25.4 를 곱한 뒤 버린다. 25.4 처럼 딱 떨어지는 값이 부동소수로 7199.999… 가 되지 않게 조금 더한다.
+    return static_cast<std::int32_t>(std::floor(mm * 7200.0 / 25.4 + 1e-6));
+}
+
+// 표 만들기 대화 상자의 너비 처음 값: 캐럿 자리의 단에 맞춤 표 폭(한글: 148.0 mm = 41954).
+std::int32_t tableCreateColumnWidth(const model::Document& doc, const std::vector<Node>& pages) {
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0) return 0;
+    return std::max<std::int32_t>(0, columnWidthAt(doc, pages, cur.story, cur.paragraph) - 566);
 }
 
 bool breakKindOf(const std::string& name, BreakKind& kind) {
@@ -3789,6 +3811,57 @@ EditResult insertBreakNow(model::Document& doc, std::vector<Node>& pages, BreakK
     return makeEditResult(doc, true, true, newStory, newPara, &relayout);
 }
 
+// 그림 파일을 문서에 넣고 그 이름을 준다. HWP 에서 온 문서는 숫자 번호, HWPX 는 imageN 이다.
+std::string addImageBin(model::Document& doc, const Bytes& image, const std::string& extension) {
+    model::BinItem bin;
+    const bool numbered = doc.format.format == model::SourceFormat::Hwp;
+    for (int seq = static_cast<int>(doc.header.binItems.size()) + 1;; ++seq) {
+        const std::string id = numbered ? std::to_string(seq) : "image" + std::to_string(seq);
+        const bool used = std::any_of(doc.header.binItems.begin(), doc.header.binItems.end(),
+                                      [&](const model::BinItem& item) { return item.id == id; });
+        if (!used) {
+            bin.id = id;
+            break;
+        }
+    }
+    bin.storage = "EMBEDDING";
+    bin.extension = extension;
+    bin.mediaType = extension == "jpg" ? "image/jpeg" : "image/" + extension;
+    if (numbered) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "BinData/BIN%04X.%s", static_cast<unsigned>(doc.header.binItems.size() + 1),
+                      extension.c_str());
+        bin.path = name;
+    } else {
+        bin.path = "BinData/" + bin.id + "." + extension;
+    }
+    bin.size = image.size();
+    bin.data = image;
+    const std::string id = bin.id;
+    doc.header.binItems.push_back(std::move(bin));
+    return id;
+}
+
+// 그림 글머리표(한글 글머리표 및 문단 번호 [그림 글머리표] 사용자 정의 모양, 숨긴 한글 2024 로 확인): 고른 그림 파일을
+// 문서에 넣고, 글자 ●·useImage 1·그림(밝기·대비 0, 원래 그림)·글머리표와 같은 머리 값의 정의를 블록(캐럿) 문단에 건다.
+EditResult editPictureBullet(model::Document& doc, std::vector<Node>& pages, const Bytes& image, bool useStoredLineHeight) {
+    if (readOnly()) return {};
+    int pixelW = 0;
+    int pixelH = 0;
+    std::string extension;
+    if (!imageInfo(image.data(), image.size(), pixelW, pixelH, extension)) return {};
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0) return {};
+    const std::size_t before = doc.header.binItems.size();
+    const std::string binId = addImageBin(doc, image, extension);
+    FormatPatch patch;
+    setFormatField(patch, "headingType", std::string("BULLET"));
+    setFormatField(patch, "headingBulletImage", binId);
+    EditResult result = editApplyFormat(doc, pages, patch, useStoredLineHeight);
+    if (!result.documentChanged && doc.header.binItems.size() > before) doc.header.binItems.resize(before);
+    return result;
+}
+
 // 그림 넣기. 한글 2024 그림 넣기(원래 크기)와 같다(tmp/insert/pic-*). 크기는 픽셀 × 75(96dpi, 파일의 dpi 는 보지 않는다),
 // 글자처럼 취급, 위아래로 비켜 가기, 바깥 여백 0 이다. 단보다 넓으면 비율을 지켜 단 폭으로 줄인다(한글은 줄이지 않는다).
 // 그림은 캐럿 자리의 글자가 되고, 캐럿은 그 뒤로 간다.
@@ -3825,33 +3898,8 @@ EditResult insertPictureNow(model::Document& doc, std::vector<Node>& pages, cons
         oldEnd = charIndex;
     }
 
-    // 그림 파일을 문서에 넣는다. HWP 에서 온 문서는 숫자 번호, HWPX 는 imageN 이다.
-    model::BinItem bin;
-    const bool numbered = doc.format.format == model::SourceFormat::Hwp;
-    for (int seq = static_cast<int>(doc.header.binItems.size()) + 1;; ++seq) {
-        const std::string id = numbered ? std::to_string(seq) : "image" + std::to_string(seq);
-        const bool used = std::any_of(doc.header.binItems.begin(), doc.header.binItems.end(),
-                                      [&](const model::BinItem& item) { return item.id == id; });
-        if (!used) {
-            bin.id = id;
-            break;
-        }
-    }
-    bin.storage = "EMBEDDING";
-    bin.extension = extension;
-    bin.mediaType = extension == "jpg" ? "image/jpeg" : "image/" + extension;
-    if (numbered) {
-        char name[32];
-        std::snprintf(name, sizeof(name), "BinData/BIN%04X.%s", static_cast<unsigned>(doc.header.binItems.size() + 1),
-                      extension.c_str());
-        bin.path = name;
-    } else {
-        bin.path = "BinData/" + bin.id + "." + extension;
-    }
-    bin.size = image.size();
-    bin.data = image;
-    const std::string binId = bin.id;
-    doc.header.binItems.push_back(std::move(bin));
+    // 그림 파일을 문서에 넣는다.
+    const std::string binId = addImageBin(doc, image, extension);
 
     std::int64_t width = static_cast<std::int64_t>(pixelW) * 75;
     std::int64_t height = static_cast<std::int64_t>(pixelH) * 75;
@@ -4198,6 +4246,31 @@ EditRelayoutResult paint_detail::relayoutObjectParagraph(model::Document& doc, s
     return relayoutAfterEdit(doc, pages, spec);
 }
 
+// 숨긴 한글 2024: 손잡이로 늘리면 맞춤과 상관없이 끈 쪽 끝만 움직인다. 가운데 맞춤 그림(단 42520, 너비 30000, 자리 0)을
+// 오른쪽으로 37688 까지 늘리면 자리 3844(왼쪽 끝 그대로), 이어서 왼쪽으로 42525 까지 늘리면 1425(오른쪽 끝 그대로).
+// 오른쪽 맞춤은 오른쪽 손잡이로 3828 늘리면 자리가 3828 줄고, 아래 맞춤은 아래 손잡이로 3539 늘리면 3539 준다.
+void paint_detail::keepResizedEdges(model::Placement& placement, const PointerHold& hold) {
+    const auto shift = [](const std::string& align, std::int32_t& offset, std::int32_t area, std::int32_t oldStart,
+                          std::int32_t oldEnd, std::int32_t newStart, std::int32_t newEnd) {
+        const std::int32_t oldSize = oldEnd - oldStart;
+        const std::int32_t newSize = newEnd - newStart;
+        if (align == "RIGHT" || align == "BOTTOM" || align == "OUTSIDE") {
+            offset -= newEnd - oldEnd;
+        } else if (align == "CENTER") {
+            // 자리 = 기준 원점 + (기준 크기 - 개체)/2 + offset 이다(나눗셈은 0 쪽으로 버린다).
+            const std::int32_t before = area >= 0 ? (area - oldSize) / 2 : -oldSize / 2;
+            const std::int32_t after = area >= 0 ? (area - newSize) / 2 : -newSize / 2;
+            offset += (newStart - oldStart) + before - after;
+        } else {
+            offset += newStart - oldStart;
+        }
+    };
+    shift(placement.horzAlign, placement.horzOffset, hold.resizeAlignW, hold.resizeLeft, hold.resizeRight,
+          hold.resizeNewLeft, hold.resizeNewRight);
+    shift(placement.vertAlign, placement.vertOffset, hold.resizeAlignH, hold.resizeTop, hold.resizeBottom,
+          hold.resizeNewTop, hold.resizeNewBottom);
+}
+
 EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
     PointerHold& hold = pointerHold();
     if (!hold.resizeObjectPending) return {};
@@ -4206,10 +4279,31 @@ EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool 
     model::Control* control = anchoredControl(doc, hold.resizeStory, hold.resizeParagraph, hold.resizeItem);
     if (!control || !control->placement) return {};
     model::Placement& placement = *control->placement;
-    const std::uint32_t oldW = hold.resizeOldW;
-    const std::uint32_t oldH = hold.resizeOldH;
-    const std::uint32_t newW = hold.resizeNewW;
-    const std::uint32_t newH = hold.resizeNewH;
+    std::uint32_t oldW = hold.resizeOldW;
+    std::uint32_t oldH = hold.resizeOldH;
+    std::uint32_t newW = hold.resizeNewW;
+    std::uint32_t newH = hold.resizeNewH;
+    // 돌린 개체의 손잡이는 돌린 상자 둘레에 있다. 90·270도면 너비와 높이가 서로 바뀌고, 다른 각이면 돌리기 전 크기를
+    // 돌린 상자가 늘어난 비율만큼 늘린다.
+    if (const int turn = ((placement.rotation % 360) + 360) % 360;
+        turn != 0 || placement.skewX != 0 || placement.skewY != 0) {
+        if (turn % 180 == 90 && placement.skewX == 0 && placement.skewY == 0) {
+            std::swap(oldW, oldH);
+            std::swap(newW, newH);
+        } else if (oldW > 0 && oldH > 0) {
+            const auto scaled = [](std::uint32_t size, std::uint32_t to, std::uint32_t from) {
+                return to == from ? size
+                                  : static_cast<std::uint32_t>(std::max<long long>(
+                                        1, std::llround(static_cast<double>(size) * to / static_cast<double>(from))));
+            };
+            const std::uint32_t fileW = placement.width;
+            const std::uint32_t fileH = placement.height;
+            newW = scaled(fileW, newW, oldW);
+            newH = scaled(fileH, newH, oldH);
+            oldW = fileW;
+            oldH = fileH;
+        }
+    }
     if (control->table) {
         model::Table& table = *control->table;
         const std::vector<std::int32_t> cols = scaledSizes(hold.resizeCols, static_cast<std::int32_t>(newW), 300);
@@ -4237,16 +4331,7 @@ EditResult resizeObjectNow(model::Document& doc, std::vector<Node>& pages, bool 
             for (model::Paragraph& para : list.paragraphs) para.lineSegs.clear();
         }
     }
-    // 왼쪽·위 손잡이로 늘렸으면 띄운 개체의 자리도 옮긴다.
-    if (!placement.treatAsChar) {
-        const std::int32_t dx = hold.resizeNewLeft - hold.resizeLeft;
-        const std::int32_t dy = hold.resizeNewTop - hold.resizeTop;
-        const auto step = [](const std::string& align, std::int32_t delta) {
-            return align == "RIGHT" || align == "BOTTOM" || align == "OUTSIDE" ? -delta : delta;
-        };
-        placement.horzOffset += step(placement.horzAlign, dx);
-        placement.vertOffset += step(placement.vertAlign, dy);
-    }
+    if (!placement.treatAsChar) keepResizedEdges(placement, hold);
     const bool inlineObject = placement.treatAsChar;
     if (std::vector<model::Paragraph>* paras = storyParagraphs(doc, hold.resizeStory); paras && !inlineObject) {
         const bool wraps = placement.textWrap == "SQUARE" || placement.textWrap == "TOP_AND_BOTTOM";

@@ -114,6 +114,7 @@ val packCaretStatus(const chwp::render::CaretStatus& st) {
     out.set("cellStart", st.cellStart);
     out.set("note", st.note);
     out.set("master", st.master);
+    out.set("object", st.object);
     out.set("overwrite", st.overwrite);
     return out;
 }
@@ -990,6 +991,7 @@ val editTable(const std::string& kind, bool after, int count, int rows, int cols
     return packEditReport(app::editTable(kind, after, count, rows, cols, border, color, lineType, lineWidth, lineColor));
 }
 val editInsertPicture(const val& input) { return packEditReport(app::editInsertPicture(toBytes(input))); }
+val editPictureBullet(const val& input) { return packEditReport(app::editPictureBullet(toBytes(input))); }
 
 // chosenVal 은 셸에서 고른 {막힌 글꼴: 바꿀 글꼴}이다.
 val editSwapFonts(const val& chosenVal) {
@@ -1106,6 +1108,8 @@ val styleCommand(const std::string& action, const val& fields) {
 }
 val editTableProperties(const val& fields) { return packEditReport(app::editTableProperties(fieldsOf(fields))); }
 val tablePropertiesView() { return packFields(app::tablePropertiesViewNow()); }
+val selectedObjectView() { return packFields(app::selectedObjectView()); }
+val editSelectedObject(const val& fields) { return packEditReport(app::editSelectedObject(fieldsOf(fields))); }
 val editGlyphGroup(const val& fields) { return packEditReport(app::editGlyphGroup(fieldsOf(fields))); }
 val glyphGroupView() { return packFields(app::glyphGroupViewNow()); }
 val editConvertText(const val& fields) { return packEditReport(app::editConvertText(fieldsOf(fields))); }
@@ -1304,6 +1308,8 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("openStyleSource", &openStyleSource);
     emscripten::function("exportStyles", &exportStyles);
     emscripten::function("tablePropertiesView", &tablePropertiesView);
+    emscripten::function("selectedObjectView", &selectedObjectView);
+    emscripten::function("editSelectedObject", &editSelectedObject);
     emscripten::function("editGlyphGroup", &editGlyphGroup);
     emscripten::function("glyphGroupView", &glyphGroupView);
     emscripten::function("editConvertText", &editConvertText);
@@ -1325,6 +1331,7 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("editFindReplace", &editFindReplace);
     emscripten::function("setDrawTool", &chwp::render::setDrawTool);
     emscripten::function("editInsertPicture", &editInsertPicture);
+    emscripten::function("editPictureBullet", &editPictureBullet);
     emscripten::function("editRedo", &editRedo);
     emscripten::function("editStyle", &editStyle);
     emscripten::function("formatFields", &formatFieldsNow);

@@ -612,7 +612,16 @@ render::EditResult DocSession::applyFormat(const render::FormatPatch& asked) {
     }
     patch.linePicks.clear();
     render::EditResult result = render::editApplyFormat(doc, pages, patch, storedLineHeight);
-    noteEdit(result, patch.hasFont ? std::vector<std::string>{patch.font} : std::vector<std::string>{});
+    std::vector<std::string> faces;
+    if (patch.hasFont) faces.push_back(patch.font);
+    // 글머리표·문단 번호를 바꾸면 새 머리 글자(기호 영역 글머리표 등)를 그릴 글꼴이 더 필요할 수 있다.
+    // 문서를 열 때처럼 받은 글꼴로 그리지 못하는 글자의 대체 글꼴을 더한다.
+    const bool heading = std::any_of(patch.fields.begin(), patch.fields.end(),
+                                     [](const auto& field) { return field.first.rfind("heading", 0) == 0; });
+    if (heading && result.documentChanged) {
+        for (const std::string& face : layout::documentFontGaps(doc)) faces.push_back(face);
+    }
+    noteEdit(result, faces);
     return result;
 }
 
@@ -1067,6 +1076,13 @@ render::EditResult DocSession::insertPicture(const Bytes& image, std::int32_t wi
     return result;
 }
 
+render::EditResult DocSession::pictureBullet(const Bytes& image) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editPictureBullet(doc, pages, image, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
 render::EditResult DocSession::applyPageSetup(const render::FormatFields& fields, bool whole) {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editApplyPageSetup(doc, pages, fields, whole, storedLineHeight);
@@ -1121,6 +1137,20 @@ render::EditResult DocSession::deleteObject(int story, int paragraph, int item, 
     return result;
 }
 
+render::EditResult DocSession::groupObjects(const std::vector<render::ObjectSpot>& spots, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editGroupObjects(doc, pages, spots, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::ungroupObject(const render::ObjectSpot* spot, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editUngroupObject(doc, pages, spot, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
 render::EditResult DocSession::insertDrawnShape() {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editInsertDrawnShape(doc, pages, storedLineHeight);
@@ -1138,6 +1168,13 @@ render::EditResult DocSession::moveObject() {
 render::EditResult DocSession::resizeObject() {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editResizeObject(doc, pages, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::rotateObject() {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editRotateObject(doc, pages, storedLineHeight);
     noteEdit(result);
     return result;
 }

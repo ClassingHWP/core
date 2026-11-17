@@ -1,6 +1,7 @@
 #include "chwp/agent.hpp"
 
 #include <algorithm>
+#include <tuple>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -411,7 +412,11 @@ struct AgentDocument::Impl {
         }
         if (Status s = check(op.at); !s.ok()) return s;
         if (Status s = place(op.at, op.at); !s.ok()) return s;
-        const render::EditResult r = session.insertTable(op.rows, op.cols);
+        // width·height 는 표 만들기의 너비·높이 임의 값(HU). 0 이면 단에 맞춤·자동이다.
+        render::TableCreateOptions options;
+        options.width = op.width;
+        options.height = op.height;
+        const render::EditResult r = session.insertTable(op.rows, op.cols, options);
         if (!r.documentChanged) return refused(r, "insertTable");
         render::rebuildStoryMap(doc);
         // 캐럿이 든 첫 칸의 표를 찾아 칸 story 를 줄·칸 자리에 놓는다.
@@ -535,7 +540,7 @@ struct AgentDocument::Impl {
             case OpKind::MergeCells: cmd.kind = render::TableEditKind::Merge; break;
             case OpKind::SplitCell: cmd.kind = render::TableEditKind::Split; break;
             case OpKind::CellBorder: cmd.kind = render::TableEditKind::CellBorder; break;
-            case OpKind::CellFill: cmd.kind = render::TableEditKind::CellFill; break;
+            case OpKind::CellFill: cmd.kind = op.shade ? render::TableEditKind::CellShade : render::TableEditKind::CellFill; break;
             case OpKind::EqualWidth: cmd.kind = render::TableEditKind::EqualWidth; break;
             case OpKind::EqualHeight: cmd.kind = render::TableEditKind::EqualHeight; break;
             default: return fail(Code::Internal, "표 op 가 아닙니다.");
@@ -799,7 +804,7 @@ struct AgentDocument::Impl {
         bool placed = false;
         if (Status s = placeCommand(op, placed); !s.ok()) return s;
         // 문서 전체에 거는 명령 말고는 자리가 있어야 한다(agent 는 커서를 들고 있지 않는다).
-        const bool anywhere = name == "exchangeNotes" || name == "insertShape";
+        const bool anywhere = name == "exchangeNotes" || name == "insertShape" || name == "groupObjects";
         if (!placed && !anywhere) {
             return fail(Code::BadArgument, name + ": 자리(at·range·object·story·section)가 없습니다.");
         }
@@ -966,6 +971,28 @@ struct AgentDocument::Impl {
             if (Status s = objectItem(op.object, item); !s.ok()) return s;
             r = session.editEquationAt(op.object.story, op.object.paragraph, item, script,
                                        static_cast<std::int32_t>(size * 100 + 0.5), &why);
+        } else if (name == "groupObjects") {
+            // 개체 묶기(한글 Group). 띄운 그림·도형·묶음 둘 이상. 응답 object 가 새 묶음이다.
+            if (op.objects.size() < 2) return fail(Code::BadArgument, "groupObjects: objects 에 개체를 둘 이상 주세요.");
+            std::vector<render::ObjectSpot> spots;
+            for (const ObjectRef& ref : op.objects) {
+                int item = -1;
+                if (Status s = objectItem(ref, item); !s.ok()) return s;
+                spots.push_back({ref.story, ref.paragraph, item});
+            }
+            r = session.groupObjects(spots, &why);
+            if (r.documentChanged) {
+                const auto first = std::min_element(spots.begin(), spots.end(), [](const auto& a, const auto& b) {
+                    return std::tie(a.story, a.paragraph, a.item) < std::tie(b.story, b.paragraph, b.item);
+                });
+                report.object = objectRefOf(first->story, first->paragraph, first->item);
+            }
+        } else if (name == "ungroupObject") {
+            if (!op.hasObject) return fail(Code::BadArgument, "ungroupObject: object 가 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            const render::ObjectSpot spot{op.object.story, op.object.paragraph, item};
+            r = session.ungroupObject(&spot, &why);
         } else if (name == "objectProperties" || name == "deleteObject") {
             if (!op.hasObject) return fail(Code::BadArgument, name + ": object 가 없습니다.");
             int item = -1;
@@ -1598,7 +1625,7 @@ std::vector<std::string> commandNames() {
                                       "columns", "caption", "bookmark", "tableToText", "textToTable", "deleteMarks",
                                       "tableProperties", "glyphGroup", "convertText", "sortParagraphs", "insertHyperlink",
                                       "copyShape", "insertShape", "objectProperties", "deleteObject", "insertEquation",
-                                      "equation"};
+                                      "equation", "groupObjects", "ungroupObject"};
     // 쪽 탭 컨트롤(머리말·꼬리말·쪽 번호·바탕쪽·메모·교정 부호 ...)은 편집기 이름 그대로다.
     for (int k = 0; k <= static_cast<int>(render::PageControlKind::InsertProofMark); ++k) {
         names.emplace_back(render::pageControlName(static_cast<render::PageControlKind>(k)));

@@ -155,6 +155,13 @@ Status readCommand(const Json& v, const std::string& name, EditOp& op) {
         } else if (key == "object") {
             if (Status s = readObject(&value, op.object); !s.ok()) return s;
             op.hasObject = true;
+        } else if (key == "objects") {
+            if (value.type != Json::Type::Array) return bad("objects 는 개체 이름의 배열이어야 합니다.");
+            for (const Json& one : value.items) {
+                ObjectRef ref;
+                if (Status s = readObject(&one, ref); !s.ok()) return s;
+                op.objects.push_back(ref);
+            }
         } else if (key == "story") {
             if (Status s = readInt(&value, "story", op.story); !s.ok()) return s;
         } else if (key == "section") {
@@ -236,6 +243,13 @@ Status readOp(const Json& v, EditOp& op) {
         if (Status s = readPosition(v.get("at"), "at", op.at); !s.ok()) return s;
         if (Status s = readInt(v.get("rows"), "rows", op.rows); !s.ok()) return s;
         if (Status s = readInt(v.get("cols"), "cols", op.cols); !s.ok()) return s;
+        int width = 0;
+        int height = 0;
+        if (Status s = readOptionalInt(v, "width", width); !s.ok()) return s;
+        if (Status s = readOptionalInt(v, "height", height); !s.ok()) return s;
+        if (width < 0 || height < 0) return bad("insertTable 의 width·height 는 0 이상의 HU 입니다.");
+        op.width = width;
+        op.height = height;
         if (const Json* cells = v.get("cells")) {
             if (cells->type != Json::Type::Array) return bad("cells 는 [[글, ...], ...] 이어야 합니다.");
             for (const Json& row : cells->items) {
@@ -355,6 +369,13 @@ Status readOp(const Json& v, EditOp& op) {
     }
     if (name == "cellFill") {
         if (Status s = tableOp(OpKind::CellFill); !s.ok()) return s;
+        // shade 는 한글 셀 음영 칸이다(1~6 증가, -1~-6 감소, 0 음영 없음). 주면 color 대신 쓴다.
+        if (const Json* shade = v.get("shade")) {
+            if (Status s = readInt(shade, "shade", op.count); !s.ok()) return s;
+            if (op.count < -6 || op.count > 6) return bad("shade 는 -6~6 입니다.");
+            op.shade = true;
+            return {};
+        }
         return readText(v.get("color"), "color", op.color);
     }
     if (name == "equalWidth") return tableOp(OpKind::EqualWidth);

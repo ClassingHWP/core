@@ -18,9 +18,15 @@ struct CaretMark {
     int anchorChar = 0;
     int paragraph = -1;
     int focusChar = 0;
+    // 편집할 때 골라 둔 개체(글 묶음·문단·문단 안 항목 순번). 되돌리면 한글처럼 그 개체를 다시 고른다.
+    // 편집 앞 모습에만 적는다(숨긴 한글 2024: 다시 하기는 개체를 고르지 않는다).
+    int objectStory = -1;
+    int objectParagraph = -1;
+    int objectItem = -1;
     bool operator==(const CaretMark& other) const {
         return story == other.story && anchorParagraph == other.anchorParagraph && anchorChar == other.anchorChar &&
-               paragraph == other.paragraph && focusChar == other.focusChar;
+               paragraph == other.paragraph && focusChar == other.focusChar && objectStory == other.objectStory &&
+               objectParagraph == other.objectParagraph && objectItem == other.objectItem;
     }
 };
 

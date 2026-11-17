@@ -3205,7 +3205,7 @@ struct FrameWalk {
         frame.page = pageIndex;
         frame.layer = layer;
         const bool paraChrome = kind >= 100 && kind < 104;
-        frame.rank = paraChrome ? 0 : (kind >= 3 ? 2 : (kind == 0 ? 1 : 0));
+        frame.rank = paraChrome || isObjectTileKind(kind) ? 0 : (kind >= 3 ? 2 : (kind == 0 ? 1 : 0));
         frame.z = z;
         frame.kind = kind;
         frame.x = left;
@@ -3560,6 +3560,25 @@ struct FrameWalk {
                 myStep = kFrameZSlot;
             }
             nextLayer = (bandDepth > 0 || frameBehind(node)) ? 0 : 2;
+            // 돌린 개체는 안의 글·그림까지 한 칸(9)에 돌려 굽는다. 칸은 돌린 상자를 덮는다.
+            if (node.ext().obj().shaped) {
+                const std::int32_t pad = objectInkBleed(node) + 600;
+                const std::int32_t boxW = node.ext().obj().shapeBoxW;
+                const std::int32_t boxH = node.ext().obj().shapeBoxH;
+                // 기울이면 상자가 크기보다 훨씬 넓어진다. 선 굵기 몫은 상자 둘레에 두 배로 둔다.
+                const std::int32_t bx = x + node.width / 2 - boxW / 2 - pad * 2;
+                const std::int32_t by = y + node.height / 2 - boxH / 2 - pad * 2;
+                const std::int32_t bw = boxW + pad * 4;
+                const std::int32_t bh = boxH + pad * 4;
+                if (force || !misses(bx, by, bw, bh)) {
+                    emit(node, 9, bx, by, bw, bh, x, y, nextLayer, myZ, path, inObject);
+                }
+                // 글상자 글은 돌리지 않는다(한글과 같다). 글 줄은 보통 칸으로 굽는다.
+                bool hasText = false;
+                for (const Node& child : node.children) hasText = hasText || child.kind != NodeKind::Object;
+                if (hasText) visitKids(node, x, y, path, nextLayer, myZ, myStep, true);
+                return;
+            }
             if (node.role != "table" || tableBoxHasInk(node)) {
                 // 그림 효과는 그림 사각형 밖까지 그린다. 칸도 효과 상자만큼 넓힌다.
                 const EffectBox fx = node.role == "picture"
@@ -3571,7 +3590,24 @@ struct FrameWalk {
                 const std::int32_t inkY = y - fx.top - pad;
                 const std::int32_t inkW = node.width + fx.left + fx.right + pad * 2;
                 const std::int32_t inkH = node.height + fx.top + fx.bottom + pad * 2;
-                if (force || !misses(inkX - bleed, inkY - bleed, inkW + bleed * 2, inkH + bleed * 2)) {
+                // 그림·표가 아닌 큰 개체는 조각으로 굽는다(kObjectTileKind). 조각 번호는 격자 자리라 화면에 든 조각만 내도 같다.
+                const int tileCols = (inkW + kObjectTileHu - 1) / kObjectTileHu;
+                const int tileRows = (inkH + kObjectTileHu - 1) / kObjectTileHu;
+                const bool tiled = node.role != "picture" && node.role != "table" && !turned && tileCols * tileRows > 1 &&
+                                   tileCols * tileRows <= kObjectTileLimit;
+                if (tiled) {
+                    for (int row = 0; row < tileRows; ++row) {
+                        for (int col = 0; col < tileCols; ++col) {
+                            const std::int32_t tx = inkX + col * kObjectTileHu;
+                            const std::int32_t ty = inkY + row * kObjectTileHu;
+                            const std::int32_t tw = std::min(kObjectTileHu, inkX + inkW - tx);
+                            const std::int32_t th = std::min(kObjectTileHu, inkY + inkH - ty);
+                            if (!force && misses(tx - bleed, ty - bleed, tw + bleed * 2, th + bleed * 2)) continue;
+                            emit(node, kObjectTileKind + row * tileCols + col, tx, ty, tw, th, x, y, nextLayer, myZ, path,
+                                 inObject);
+                        }
+                    }
+                } else if (force || !misses(inkX - bleed, inkY - bleed, inkW + bleed * 2, inkH + bleed * 2)) {
                     emit(node, 1, inkX, inkY, inkW, inkH, x, y, nextLayer, myZ, path, inObject,
                          pictureFitsBaseFrame(node, baseScale) || pictureDrawsOnScreen(node));
                 }
@@ -3889,6 +3925,19 @@ PageBitmap renderFrame(const model::Document& doc, const Node& page, const Frame
     const bool tableStroke = (frame.kind >= 3 && frame.kind < 100 && node->kind != NodeKind::Column) || frame.kind >= 700;
     if (tableStroke && bordersOnScreen() && !turned) painter.borderSink = &borders;
     const bool needPaintPiece = !placed || frame.kind != 0 || lineHasBitmapInk(*node, &doc) || clippedByAncestor;
+    if (isObjectTileKind(frame.kind)) {
+        // 조각은 이웃 조각과 맞닿은 변에서만 자른다(경계 픽셀이 같아 틈도 겹침도 없다). 바깥 변은 여백까지 칠한다.
+        // 선 없는 글상자의 투명 선처럼 상자 가장자리에 걸친 획이 잘리지 않게 한다.
+        const std::int32_t bleed = objectInkBleed(*node);
+        const bool atLeft = frame.drawHuX <= frame.originX - bleed;
+        const bool atTop = frame.drawHuY <= frame.originY - bleed;
+        const bool atRight = frame.drawHuX + frame.drawHuW >= frame.originX + node->width + bleed;
+        const bool atBottom = frame.drawHuY + frame.drawHuH >= frame.originY + node->height + bleed;
+        painter.clips.push_back(Painter::Clip{atLeft ? 0 : kFramePad, atTop ? 0 : kFramePad,
+                                              atRight ? painter.bitmap.width : painter.bitmap.width - kFramePad,
+                                              atBottom ? painter.bitmap.height : painter.bitmap.height - kFramePad});
+        painter.applyCpuClip();
+    }
     if (needPaintPiece) {
         std::int32_t stripY0 = 0;
         std::int32_t stripY1 = -1;
@@ -5036,6 +5085,7 @@ CaretStatus caretStatus(const model::Document& doc, const std::vector<Node>& pag
     const PointerHold& hold = pointerHold();
     if (hold.bandStory > 0 && !hold.bandMaster) st.band = hold.bandHeader ? 1 : 2;
     st.master = hold.bandStory > 0 && hold.bandMaster;
+    st.object = selectedObjectKind(doc);
     if (hold.drag.mode == DragMode::Cells && hold.drag.control) {
         st.table = true;
         st.cellBlock = true;
@@ -7139,7 +7189,58 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
                 canvas->restore();
             }
         }
-        if (page && page->w > 0 && page->h > 0) {
+        // 개체 회전(숨긴 한글 2024): 손잡이는 돌린 모양의 네 꼭짓점에 초록 점, 가운데에 표시를 둔다. 끄는 동안은
+        // 개체와 손잡이를 그대로 두고 돌아갈 모양을 점선으로 보인다.
+        double corners[4][2];
+        if (page && page->w > 0 && page->h > 0 && hold.rotateMode && objectCorners(hold, corners)) {
+            const float sx = static_cast<float>(page->w) / static_cast<float>(hold.caretPageW);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(std::max<std::int32_t>(hold.caretPageH, 1));
+            const auto screen = [&](double hx, double hy) {
+                return SkPoint::Make(static_cast<float>(page->x - scrollX) + static_cast<float>(hx) * sx,
+                                     static_cast<float>(page->y - scrollY) + static_cast<float>(hy) * sy);
+            };
+            const double cx = box.x + box.width / 2.0;
+            const double cy = box.y + box.height / 2.0;
+            if (hold.rotateDragging && hold.rotateDelta != 0) {
+                const double rad = hold.rotateDelta * 3.14159265358979323846 / 180.0;
+                const double c = std::cos(rad);
+                const double s = std::sin(rad);
+                SkPathBuilder ghost;
+                for (int i = 0; i < 4; ++i) {
+                    const double dx = corners[i][0] - cx;
+                    const double dy = corners[i][1] - cy;
+                    const SkPoint pt = screen(cx + dx * c - dy * s, cy + dx * s + dy * c);
+                    if (i == 0) ghost.moveTo(pt);
+                    else ghost.lineTo(pt);
+                }
+                ghost.close();
+                SkPaint dotted;
+                dotted.setAntiAlias(true);
+                dotted.setStyle(SkPaint::kStroke_Style);
+                dotted.setStrokeWidth(1.f);
+                dotted.setColor(SkColorSetARGB(255, 80, 80, 80));
+                const SkScalar dashes[2] = {2.f, 2.f};
+                dotted.setPathEffect(SkDashPathEffect::Make(dashes, 0));
+                canvas->drawPath(ghost.detach(), dotted);
+            }
+            SkPaint green;
+            green.setAntiAlias(true);
+            green.setColor(SkColorSetARGB(255, 92, 196, 92));
+            const float rad = std::max(3.5f, 4.f * sx);
+            for (const auto& corner : corners) {
+                const SkPoint pt = screen(corner[0], corner[1]);
+                canvas->drawCircle(pt.x(), pt.y(), rad, green);
+            }
+            const SkPoint mid = screen(cx, cy);
+            SkPaint mark;
+            mark.setAntiAlias(true);
+            mark.setStyle(SkPaint::kStroke_Style);
+            mark.setStrokeWidth(1.f);
+            mark.setColor(SkColorSetARGB(255, 90, 90, 90));
+            canvas->drawCircle(mid.x(), mid.y(), rad * 0.8f, mark);
+            canvas->drawLine(mid.x() - rad * 1.4f, mid.y(), mid.x() + rad * 1.4f, mid.y(), mark);
+            canvas->drawLine(mid.x(), mid.y() - rad * 1.4f, mid.x(), mid.y() + rad * 1.4f, mark);
+        } else if (page && page->w > 0 && page->h > 0) {
             const float sx = static_cast<float>(page->w) / static_cast<float>(hold.caretPageW);
             const float sy = static_cast<float>(page->h) / static_cast<float>(std::max<std::int32_t>(hold.caretPageH, 1));
             const float x0 = static_cast<float>(page->x - scrollX) + static_cast<float>(box.x) * sx;

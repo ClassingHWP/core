@@ -354,7 +354,8 @@ struct EditOp {
     int story = -1;     // SetText, 표 구조 op 의 기준 칸
     int toStory = -1;   // DeleteRows·DeleteColumns·MergeCells: 범위의 다른 끝 칸
     bool after = true;  // InsertRows·InsertColumns: 참이면 아래(오른쪽), 거짓이면 위(왼쪽)
-    int count = 1;      // InsertRows·InsertColumns
+    int count = 1;      // InsertRows·InsertColumns. CellFill 에 shade 를 주면 셀 음영 칸(1~6 증가, -1~-6 감소, 0 없음)
+    bool shade = false;  // CellFill: 색 대신 셀 음영
     std::string breakKind = "page";  // InsertBreak
     std::string find;        // ReplaceAll: 찾을 글
     std::string border;      // CellBorder: 단추 이름
@@ -369,7 +370,7 @@ struct EditOp {
     int cols = 0;
     std::vector<std::vector<std::string>> cells;
     Bytes image;               // InsertPicture: 그림 파일 바이트
-    std::int32_t width = 0;    // InsertPicture: HWPUNIT. 0 이면 그림 크기
+    std::int32_t width = 0;    // InsertPicture: HWPUNIT. 0 이면 그림 크기. InsertTable: 너비·높이 임의 값(0 이면 단에 맞춤·자동)
     std::int32_t height = 0;
     // Command
     std::string command;       // 명령 이름(insertNote, header, objectProperties ...)
@@ -378,6 +379,7 @@ struct EditOp {
     bool hasRange = false;
     bool hasObject = false;
     ObjectRef object;
+    std::vector<ObjectRef> objects;  // groupObjects: 묶을 개체들
     PageRef page;              // insertShape: 쪽
 };
 

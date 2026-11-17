@@ -1490,7 +1490,17 @@ void Painter::paintPiece(const Node& node, int kind, std::int32_t x, std::int32_
         return;
     }
     if (kind == 0) line(node, x, y, inObject);
-    else if (kind == 1) objectBox(node, x, y);
+    else if (kind == 9) {
+        // 돌린 개체 상자와 묶음 안 개체(walkRotated). 글상자 글은 줄 칸이 따로 그린다.
+        const Node* outerFilter = childFilterNode;
+        const bool outerFilterObjects = childFilterObjects;
+        skipRotatedText = true;
+        walk(node, x - node.x, y - node.y, inObject);
+        skipRotatedText = false;
+        childFilterNode = outerFilter;
+        childFilterObjects = outerFilterObjects;
+    }
+    else if (kind == 1 || isObjectTileKind(kind)) objectBox(node, x, y);
     else if (kind >= 100 && kind < 104 && node.kind == NodeKind::Paragraph)
         paintParagraphChrome(node, x, y, kind - 100, true, true);
     else if (kind >= 3 && node.kind == NodeKind::Column) paintColumnRuleSpan(node.ext().borderRight, x, y, stripY1 - stripY0);
@@ -1514,6 +1524,124 @@ void Painter::paintPageBorder(const Node& paper, std::int32_t ox, std::int32_t o
         if (child.role != "pageBorder") continue;
         strokePageBorderNode(child, ox + child.x, oy + child.y);
     }
+}
+
+void Painter::walkRotated(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin) {
+    // 글자 자리만 남기는 걸음은 돌린 글의 자리를 셀 수 없다. 돌린 개체 글은 자리 없이 비트맵으로만 그린다.
+    if (placesOnly || scale <= 0.f || bitmap.width <= 0 || bitmap.height <= 0) return;
+    const std::int32_t x = ox + node.x;
+    const std::int32_t y = oy + node.y;
+    // 선 굵기·그림 효과가 상자 밖으로 나가는 몫까지 그린다.
+    const std::int32_t pad = objectInkBleed(node) + 600;
+    const int offW = std::max(1, px(node.width + pad * 2) + 2);
+    const int offH = std::max(1, px(node.height + pad * 2) + 2);
+    if (static_cast<std::int64_t>(offW) * offH > 64LL * 1024 * 1024) return;
+    ensureBitmap(bitmap);
+
+    Bitmap off;
+    off.width = offW;
+    off.height = offH;
+    off.px.assign(static_cast<std::size_t>(offW) * static_cast<std::size_t>(offH) * 4u, 0);
+    off.clipR = offW;
+    off.clipB = offH;
+    std::swap(bitmap, off);
+    std::vector<Clip> outerClips;
+    std::swap(clips, outerClips);
+    sk_sp<SkSurface> outerSurface = std::move(skiaSurface);
+    SkCanvas* outerCanvas = skiaCanvas;
+    const int outerSaves = skiaSaves;
+    skiaCanvas = nullptr;
+    skiaSaves = 0;
+    const float outerRight = viewRightHu;
+    const float outerBottom = viewBottomHu;
+    viewRightHu = static_cast<float>(offW) / scale;
+    viewBottomHu = static_cast<float>(offH) / scale;
+    FrameGlyphs* outerGlyphs = glyphSink;
+    std::vector<FramePicture>* outerPictures = pictureSink;
+    std::vector<BorderPiece>* outerBorders = borderSink;
+    const bool outerSkip = skipGlyphs;
+    glyphSink = nullptr;
+    pictureSink = nullptr;
+    borderSink = nullptr;
+    skipGlyphs = false;
+    const std::int32_t outerOriginX = originX;
+    const std::int32_t outerOriginY = originY;
+    originX += x - pad;
+    originY += y - pad;
+    clips.push_back(Clip{0, 0, offW, offH});
+    applyCpuClip();
+    rotating = true;
+    // 돌리는 것은 개체 상자(선·채우기·그림)와 묶음 안 개체다. 글상자 글은 돌리지 않는다(숨긴 한글 2024: 30도 돌린
+    // 글상자의 글은 가로로, 돌리기 전 상자 자리에 그대로 있고 누르면 캐럿이 든다).
+    const Node* outerFilter = childFilterNode;
+    const bool outerFilterObjects = childFilterObjects;
+    childFilterNode = &node;
+    childFilterObjects = true;
+    walk(node, pad - node.x, pad - node.y, inObject, borderJoin);
+    childFilterNode = outerFilter;
+    childFilterObjects = outerFilterObjects;
+    rotating = false;
+    if (skiaCanvas) {
+        while (skiaSaves > 0) {
+            skiaCanvas->restore();
+            --skiaSaves;
+        }
+    }
+    skiaSurface = std::move(outerSurface);
+    skiaCanvas = outerCanvas;
+    skiaSaves = outerSaves;
+    originX = outerOriginX;
+    originY = outerOriginY;
+    glyphSink = outerGlyphs;
+    pictureSink = outerPictures;
+    borderSink = outerBorders;
+    skipGlyphs = outerSkip;
+    viewRightHu = outerRight;
+    viewBottomHu = outerBottom;
+    std::swap(clips, outerClips);
+    applyCpuClip();
+    std::swap(bitmap, off);
+
+    // 돌리기 전 상자의 점을 차지하는 상자 안 자리로 옮기는 행렬(model::objectGeometry 의 local)로 붙인다.
+    // 한글과 같이 회전은 시계 방향, 기울이기 가로는 위가 오른쪽으로 밀린다.
+    SkCanvas* dst = canvas();
+    if (!dst) return;
+    const SkImageInfo info = SkImageInfo::Make(offW, offH, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+    SkPixmap pixmap(info, off.px.data(), static_cast<std::size_t>(offW) * 4u);
+    sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(pixmap);
+    if (!image) return;
+    const auto& m = node.ext().obj().shapeLocal;
+    const float boxX = static_cast<float>(x) + static_cast<float>(node.width) / 2.f - static_cast<float>(node.ext().obj().shapeBoxW / 2);
+    const float boxY = static_cast<float>(y) + static_cast<float>(node.height) / 2.f - static_cast<float>(node.ext().obj().shapeBoxH / 2);
+    SkMatrix place;
+    place.setScale(scale, scale);
+    place.preTranslate(boxX, boxY);
+    SkMatrix local;
+    local.setAll(static_cast<float>(m[0]), static_cast<float>(m[1]), static_cast<float>(m[2]), static_cast<float>(m[3]),
+                 static_cast<float>(m[4]), static_cast<float>(m[5]), 0.f, 0.f, 1.f);
+    place.preConcat(local);
+    place.preTranslate(static_cast<float>(-pad), static_cast<float>(-pad));
+    place.preScale(1.f / scale, 1.f / scale);
+    dst->save();
+    dst->concat(place);
+    dst->drawImage(image, 0, 0, SkSamplingOptions(SkFilterMode::kLinear), nullptr);
+    dst->restore();
+    paintUnrotatedText(node, x, y);
+}
+
+void Painter::paintUnrotatedText(const Node& node, std::int32_t x, std::int32_t y) {
+    if (skipRotatedText) return;
+    bool hasText = false;
+    for (const Node& child : node.children) hasText = hasText || (child.kind != NodeKind::Object && child.role != "caption");
+    if (!hasText) return;
+    const Node* outerFilter = childFilterNode;
+    const bool outerFilterObjects = childFilterObjects;
+    childFilterNode = &node;
+    childFilterObjects = false;
+    const ObjectLayerScope layers(*this, true, objectPlace(node));
+    paintStackedChildren(node, x, y, true);
+    childFilterNode = outerFilter;
+    childFilterObjects = outerFilterObjects;
 }
 
 void Painter::walkTurned(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin) {
@@ -1600,6 +1728,10 @@ void Painter::walkTurned(const Node& node, std::int32_t ox, std::int32_t oy, boo
 
 void Painter::walk(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin) {
     if (node.role == "pageFill" || node.role == "pageBorder") return;
+    if (node.kind == NodeKind::Object && !rotating && node.ext().obj().shaped) {
+        walkRotated(node, ox, oy, inObject, borderJoin);
+        return;
+    }
     if (node.turned != 0 && !turning) {
         walkTurned(node, ox, oy, inObject, borderJoin);
         return;
@@ -1663,6 +1795,7 @@ void Painter::paintStackedChildren(const Node& node, std::int32_t x, std::int32_
     for (const auto& child : node.children) {
         if (child.role == "caption" || child.role == "pageFill" || child.role == "pageBorder") continue;
         if (masterOnly && !child.fromMaster) continue;
+        if (&node == childFilterNode && (child.kind == NodeKind::Object) != childFilterObjects) continue;
         if (child.pageBand) {
             bands.push_back(&child);
             continue;

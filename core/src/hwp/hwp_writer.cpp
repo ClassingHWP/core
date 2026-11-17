@@ -968,8 +968,17 @@ void writePlacementBytes(ByteWriter& w, const Control& ctrl) {
     w.u32(attr);
     w.i32(p.vertOffset);
     w.i32(p.horzOffset);
-    w.u32(p.width);
-    w.u32(p.height);
+    // 돌린 개체의 개체 공통 크기는 돌린 상자다(숨긴 한글 2024).
+    std::uint32_t boxW = p.width;
+    std::uint32_t boxH = p.height;
+    if (const model::ObjectGeometry g = model::objectGeometry(p.width, p.height, p.rotation, p.skewX, p.skewY,
+                                                                          p.flipHorizontal, p.flipVertical);
+        g.shaped) {
+        boxW = g.boxWidth;
+        boxH = g.boxHeight;
+    }
+    w.u32(boxW);
+    w.u32(boxH);
     w.i32(p.zOrder);
     w.i16(static_cast<std::int16_t>(p.marginLeft));
     w.i16(static_cast<std::int16_t>(p.marginRight));
@@ -1120,8 +1129,19 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         if (groupDepth == 0) {
             w.u32(shapeId);  // 최상위 SHAPE_COMPONENT만 ID를 2회 기록
         }
-        w.i32(p.groupX - p.matrixX);
-        w.i32(p.groupY - p.matrixY);
+        // 돌린 개체(숨긴 한글 2024): offset·이동 행렬은 돌리기 전 상자의 왼쪽 위를 돌린 상자 기준으로 잰 값,
+        // 회전 가운데는 돌린 상자의 반, 회전 행렬은 돌리기 전 상자의 가운데를 중심으로 돌린다(HWPX 와 같은 값).
+        const model::ObjectGeometry geo = model::objectGeometry(curW, curH, p.rotation, p.skewX, p.skewY, p.flipHorizontal,
+                                                                p.flipVertical);
+        const bool rotated = geo.shaped;  // 돌리거나 기울였다
+        const std::uint32_t rotW = geo.boxWidth;
+        const std::uint32_t rotH = geo.boxHeight;
+        const std::int32_t offsetX =
+            rotated ? (groupDepth > 0 || p.groupInRoot ? p.groupX : 0) + geo.transX : p.groupX - p.matrixX;
+        const std::int32_t offsetY =
+            rotated ? (groupDepth > 0 || p.groupInRoot ? p.groupY : 0) + geo.transY : p.groupY - p.matrixY;
+        w.i32(offsetX);
+        w.i32(offsetY);
         w.u16(static_cast<std::uint16_t>(groupDepth));
         w.u16(1);
         w.u32(initW);
@@ -1136,21 +1156,23 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         else if (st == "container") flipFlags |= 0x00090000u;
         else flipFlags |= 0x00080000u;
         w.u32(flipFlags);
-        w.u16(0);  // rotation angle
-        w.i32(static_cast<std::int32_t>(curW / 2));
-        w.i32(static_cast<std::int32_t>(curH / 2));
+        w.u16(static_cast<std::uint16_t>(rotated ? p.rotation % 360 : 0));  // rotation angle
+        w.i32(static_cast<std::int32_t>(rotW / 2));
+        w.i32(static_cast<std::int32_t>(rotH / 2));
         const std::uint16_t matrixPairs = static_cast<std::uint16_t>(groupDepth + 1);
         w.u16(matrixPairs);
 
         // transMatrix (6 doubles = 48 bytes)
         const std::array<double, 6> identMat = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
-        for (double v : identMat) w.f64(v);
+        const std::array<double, 6> transMat = {1.0, 0.0, static_cast<double>(offsetX), 0.0, 1.0, static_cast<double>(offsetY)};
+        for (double v : rotated ? transMat : identMat) w.f64(v);
 
         // scaMatrix + rotMatrix pairs
-        const std::array<double, 6> scaMat = {
-            sx, 0.0, static_cast<double>(p.matrixX), 0.0, sy, static_cast<double>(p.matrixY)};
+        const std::array<double, 6> scaMat = {sx, geo.skew[1], rotated ? 0.0 : static_cast<double>(p.matrixX), geo.skew[3], sy,
+                                              rotated ? 0.0 : static_cast<double>(p.matrixY)};
         for (double v : scaMat) w.f64(v);
-        for (double v : identMat) w.f64(v);
+        // 좌우·상하 대칭도 회전 행렬에 든다(HWPX 와 같은 값, model::objectGeometry).
+        for (double v : geo.rotation) w.f64(v);
         for (int g = 0; g < groupDepth; ++g) {
             for (double v : identMat) w.f64(v);
             for (double v : identMat) w.f64(v);

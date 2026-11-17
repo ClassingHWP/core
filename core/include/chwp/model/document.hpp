@@ -467,7 +467,44 @@ struct Placement {
     std::int32_t marginBottom = 0;
     bool flipHorizontal = false;  // hp:flip. 상자 안에서 좌우를 뒤집는다.
     bool flipVertical = false;
+    // 회전각(도, 0~359, 한글 개체 회전·회전각). width·height 는 돌리기 전 크기이고, 쪽에서 차지하는 상자(sz)와
+    // horzOffset·vertOffset 이 가리키는 자리는 돌린 상자(rotatedBox)다. 돌린 상자의 가운데가 개체의 가운데다.
+    std::int32_t rotation = 0;
+    // 기울이기(도, 한글 개체 속성 기울이기 가로·세로). 가로는 위가 오른쪽으로, 세로는 오른쪽이 위로 밀린다.
+    std::int32_t skewX = 0;
+    std::int32_t skewY = 0;
 };
+
+// 돌린 개체가 쪽에서 차지하는 상자(한글 sz). 숨긴 한글 2024: 40×30mm(11339×8504)를 30도 돌리면 14071×13034,
+// 90도면 8504×11339 다(w|cos|+h|sin|, w|sin|+h|cos| 를 버린 값).
+void rotatedBox(std::uint32_t width, std::uint32_t height, std::int32_t degrees, std::uint32_t& outW, std::uint32_t& outH);
+// 돌리거나 기울인 개체의 모양(숨긴 한글 2024: 40×30mm 사각형을 30도, 기울이기 가로 20·세로 15, 둘을 함께 줘 확인).
+// - 기울이기만: 상자 = (w + h·tan가로, h + w·tan세로) 를 버린 값, 이동 = (h·tan가로, w·tan세로) 를 버린 값.
+// - 회전만: rotatedBox, 이동 = (상자 − 크기) / 2, 회전은 돌리기 전 상자의 가운데(정수)가 중심이다.
+// - 둘 다: 기울인 정수 상자의 가운데를 중심으로 돌리고, 모서리를 감싼 상자에서 이동 = 반올림(−최소), 상자 = 반올림(최대 + 이동).
+// tan·cos·sin 은 소수 여섯째 자리로 반올림한 값이다. 행렬은 한글 hc:scaMatrix(기울이기)·hc:rotMatrix 와 같은 차례이고,
+// local 은 돌리기 전 상자의 점을 차지하는 상자(sz) 안 자리로 옮기는 행렬(이동·회전·기울이기)이다.
+struct ObjectGeometry {
+    bool shaped = false;  // 돌리거나 기울였다
+    std::uint32_t boxWidth = 0;
+    std::uint32_t boxHeight = 0;
+    std::int32_t transX = 0;
+    std::int32_t transY = 0;
+    std::int32_t centerX = 0;  // 회전 정보 가운데(상자의 반)
+    std::int32_t centerY = 0;
+    std::array<double, 6> skew{1, 0, 0, 0, 1, 0};
+    std::array<double, 6> rotation{1, 0, 0, 0, 1, 0};
+    std::array<double, 6> local{1, 0, 0, 0, 1, 0};
+};
+// 좌우·상하 대칭(flipH·flipV)을 주면 회전 행렬에 대칭을 곱한다(숨긴 한글 2024). 한 번만 뒤집은 개체의 회전각은
+// 뒤집기 전 각의 반대(360-각)로 적혀 있어, 상자·이동은 뒤집기 전 각으로 잰다. 회전 행렬은 뒤집기 전 회전 다음에
+// 대칭을 곱하고, 대칭의 축은 기울인 정수 가운데(S·(너비/2, 높이/2))를 반올림한 자리다. local 은 상자 안에서 이미
+// 뒤집힌 모델의 점(보이는 점)을 받는다.
+ObjectGeometry objectGeometry(std::uint32_t width, std::uint32_t height, std::int32_t rotation, std::int32_t skewX,
+                              std::int32_t skewY, bool flipH = false, bool flipV = false);
+// 돌린 개체의 회전 행렬(한글 hc:rotMatrix, HWP 개체 요소 회전 행렬). 돌리기 전 상자의 가운데(너비/2, 높이/2 정수)를
+// 중심으로 돌린다. e1 cos, e2 -sin, e3, e4 sin, e5 cos, e6.
+std::array<double, 6> rotationMatrix(std::uint32_t width, std::uint32_t height, std::int32_t degrees);
 
 struct Paragraph;
 

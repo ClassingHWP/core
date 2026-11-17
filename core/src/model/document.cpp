@@ -1,5 +1,7 @@
 #include "chwp/model/document.hpp"
 
+#include <cmath>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -751,6 +753,145 @@ int replaceFontFace(Document& doc, const std::string& from, const std::string& t
         }
     }
     return changed;
+}
+
+void rotatedBox(std::uint32_t width, std::uint32_t height, std::int32_t degrees, std::uint32_t& outW, std::uint32_t& outH) {
+    const int turn = ((degrees % 360) + 360) % 360;
+    if (turn == 0) {
+        outW = width;
+        outH = height;
+        return;
+    }
+    const double rad = turn * 3.14159265358979323846 / 180.0;
+    const double c = std::fabs(std::cos(rad));
+    const double s = std::fabs(std::sin(rad));
+    const double w = static_cast<double>(width);
+    const double h = static_cast<double>(height);
+    outW = static_cast<std::uint32_t>(w * c + h * s + 1e-6);
+    outH = static_cast<std::uint32_t>(w * s + h * c + 1e-6);
+}
+
+std::array<double, 6> rotationMatrix(std::uint32_t width, std::uint32_t height, std::int32_t degrees) {
+    const int turn = ((degrees % 360) + 360) % 360;
+    const double rad = turn * 3.14159265358979323846 / 180.0;
+    // 한글은 cos·sin 을 소수 여섯째 자리로 반올림한 값을 쓴다(30도: 0.866025, 0.5 — HWP 의 double 도 그 값이다).
+    const double c = std::round(std::cos(rad) * 1e6) / 1e6;
+    const double s = std::round(std::sin(rad) * 1e6) / 1e6;
+    const double cx = static_cast<double>(width / 2);
+    const double cy = static_cast<double>(height / 2);
+    return {c, -s, cx - c * cx + s * cy, s, c, cy - s * cx - c * cy};
+}
+
+namespace {
+
+double round6(double v) { return std::round(v * 1e6) / 1e6; }
+
+std::array<double, 6> multiply(const std::array<double, 6>& a, const std::array<double, 6>& b) {
+    return {a[0] * b[0] + a[1] * b[3], a[0] * b[1] + a[1] * b[4], a[0] * b[2] + a[1] * b[5] + a[2],
+            a[3] * b[0] + a[4] * b[3], a[3] * b[1] + a[4] * b[4], a[3] * b[2] + a[4] * b[5] + a[5]};
+}
+
+}  // namespace
+
+namespace {
+
+ObjectGeometry baseGeometry(std::uint32_t width, std::uint32_t height, std::int32_t rotation, std::int32_t skewX,
+                            std::int32_t skewY) {
+    ObjectGeometry g;
+    const int turn = ((rotation % 360) + 360) % 360;
+    const double pi = 3.14159265358979323846;
+    const double tx = skewX != 0 ? round6(std::tan(skewX * pi / 180.0)) : 0.0;
+    const double ty = skewY != 0 ? round6(std::tan(skewY * pi / 180.0)) : 0.0;
+    const double w = static_cast<double>(width);
+    const double h = static_cast<double>(height);
+    g.boxWidth = width;
+    g.boxHeight = height;
+    g.centerX = static_cast<std::int32_t>(width / 2);
+    g.centerY = static_cast<std::int32_t>(height / 2);
+    if (turn == 0 && tx == 0 && ty == 0) return g;
+    g.shaped = true;
+    g.skew = {1, tx != 0 ? -tx : 0.0, 0, ty != 0 ? -ty : 0.0, 1, 0};  // 0 을 "-0" 으로 적지 않게
+    // 기울인 정수 상자.
+    const double xs[] = {0, w, -tx * h, w - tx * h};
+    const double ys[] = {0, -ty * w, h, h - ty * w};
+    double minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+    for (int i = 1; i < 4; ++i) {
+        minX = std::min(minX, xs[i]);
+        maxX = std::max(maxX, xs[i]);
+        minY = std::min(minY, ys[i]);
+        maxY = std::max(maxY, ys[i]);
+    }
+    // 한글은 반올림한다(가로 40도: 11339 + 7135.7 → 18475, offset 7136).
+    const auto skewOffX = static_cast<std::int32_t>(std::llround(-minX));
+    const auto skewOffY = static_cast<std::int32_t>(std::llround(-minY));
+    const auto skewW = static_cast<std::uint32_t>(std::llround(maxX) + skewOffX);
+    const auto skewH = static_cast<std::uint32_t>(std::llround(maxY) + skewOffY);
+    if (turn == 0) {
+        g.boxWidth = skewW;
+        g.boxHeight = skewH;
+        g.transX = skewOffX;
+        g.transY = skewOffY;
+    } else if (tx == 0 && ty == 0) {
+        rotatedBox(width, height, turn, g.boxWidth, g.boxHeight);
+        g.rotation = rotationMatrix(width, height, turn);
+        g.transX = (static_cast<std::int32_t>(g.boxWidth) - static_cast<std::int32_t>(width)) / 2;
+        g.transY = (static_cast<std::int32_t>(g.boxHeight) - static_cast<std::int32_t>(height)) / 2;
+    } else {
+        const double rad = turn * pi / 180.0;
+        const double c = round6(std::cos(rad));
+        const double s = round6(std::sin(rad));
+        const double cx = static_cast<double>(static_cast<std::int32_t>(skewW / 2) - skewOffX);
+        const double cy = static_cast<double>(static_cast<std::int32_t>(skewH / 2) - skewOffY);
+        g.rotation = {c, -s, cx - c * cx + s * cy, s, c, cy - s * cx - c * cy};
+        const std::array<double, 6> rs = multiply(g.rotation, g.skew);
+        double lo[2] = {0, 0}, hi[2] = {0, 0};
+        const double px[] = {0, w, 0, w};
+        const double py[] = {0, 0, h, h};
+        for (int i = 0; i < 4; ++i) {
+            const double qx = rs[0] * px[i] + rs[1] * py[i] + rs[2];
+            const double qy = rs[3] * px[i] + rs[4] * py[i] + rs[5];
+            if (i == 0 || qx < lo[0]) lo[0] = qx;
+            if (i == 0 || qx > hi[0]) hi[0] = qx;
+            if (i == 0 || qy < lo[1]) lo[1] = qy;
+            if (i == 0 || qy > hi[1]) hi[1] = qy;
+        }
+        g.transX = static_cast<std::int32_t>(std::llround(-lo[0]));
+        g.transY = static_cast<std::int32_t>(std::llround(-lo[1]));
+        g.boxWidth = static_cast<std::uint32_t>(std::max<long long>(1, std::llround(hi[0] + g.transX)));
+        g.boxHeight = static_cast<std::uint32_t>(std::max<long long>(1, std::llround(hi[1] + g.transY)));
+    }
+    g.centerX = static_cast<std::int32_t>(g.boxWidth / 2);
+    g.centerY = static_cast<std::int32_t>(g.boxHeight / 2);
+    g.local = multiply({1, 0, static_cast<double>(g.transX), 0, 1, static_cast<double>(g.transY)},
+                       multiply(g.rotation, g.skew));
+    return g;
+}
+
+}  // namespace
+
+ObjectGeometry objectGeometry(std::uint32_t width, std::uint32_t height, std::int32_t rotation, std::int32_t skewX,
+                              std::int32_t skewY, bool flipH, bool flipV) {
+    // 숨긴 한글 2024 ShapeObjHorzFlip·VertFlip: 30도 돌린 11339×8504 를 좌우로 뒤집으면 각 330, 상자·offset 그대로,
+    // 회전 행렬 = 대칭(e3 11338)·30도 행렬. 둘 다 뒤집으면 각 30 그대로. 기울인 개체(가로 20도)는 대칭 축이
+    // 5669 - 0.36397×4252 → 4121(e3 8242), 세로 15도는 4252 - 0.267949×5669 → 2733(e6 5466).
+    const int turn = ((rotation % 360) + 360) % 360;
+    const bool odd = flipH != flipV;
+    ObjectGeometry g = baseGeometry(width, height, odd ? (360 - turn) % 360 : turn, skewX, skewY);
+    if (!flipH && !flipV) return g;
+    const double cx = static_cast<double>(width / 2);
+    const double cy = static_cast<double>(height / 2);
+    const double ax = static_cast<double>(2 * std::llround(cx + g.skew[1] * cy));
+    const double ay = static_cast<double>(2 * std::llround(g.skew[3] * cx + cy));
+    const std::array<double, 6> mirror{flipH ? -1.0 : 1.0, 0, flipH ? ax : 0.0, 0, flipV ? -1.0 : 1.0, flipV ? ay : 0.0};
+    g.rotation = multiply(mirror, g.rotation);
+    if (g.shaped) {
+        // 모델의 점은 상자 안에서 뒤집혀 있다. 파일의 점으로 되돌린 뒤 한글 차례(이동·회전·기울이기)로 옮긴다.
+        const std::array<double, 6> unflip{flipH ? -1.0 : 1.0, 0, flipH ? static_cast<double>(width) : 0.0,
+                                           0, flipV ? -1.0 : 1.0, flipV ? static_cast<double>(height) : 0.0};
+        g.local = multiply({1, 0, static_cast<double>(g.transX), 0, 1, static_cast<double>(g.transY)},
+                           multiply(g.rotation, multiply(g.skew, unflip)));
+    }
+    return g;
 }
 
 }  // namespace chwp::model

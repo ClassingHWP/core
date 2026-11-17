@@ -524,7 +524,8 @@ std::string writeHeaderXml(const Document& doc, const BinRegistry& bins) {
             ph.append_attribute("numFormat") =
                 bd.head.numFormat.empty() ? "DIGIT" : bd.head.numFormat.c_str();
             ph.append_attribute("charPrIDRef") = bd.head.charShapeId;
-            ph.append_attribute("checkable") = 0;
+            // 한글은 확인용 글머리표(체크 문자가 있는 것)에 checkable 1 을 적는다.
+            ph.append_attribute("checkable") = bd.checkedText.empty() ? 0 : 1;
         }
     }
 
@@ -733,9 +734,18 @@ void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinR
     objNode.append_attribute("dropcapstyle") = "None";
 
     auto sz = objNode.append_child("hp:sz");
-    sz.append_attribute("width") = p.width;
+    // 돌린 개체의 sz 는 돌린 상자다(숨긴 한글 2024).
+    std::uint32_t boxW = p.width;
+    std::uint32_t boxH = p.height;
+    if (const model::ObjectGeometry g = model::objectGeometry(p.width, p.height, p.rotation, p.skewX, p.skewY,
+                                                                          p.flipHorizontal, p.flipVertical);
+        g.shaped) {
+        boxW = g.boxWidth;
+        boxH = g.boxHeight;
+    }
+    sz.append_attribute("width") = boxW;
     sz.append_attribute("widthRelTo") = "ABSOLUTE";
-    sz.append_attribute("height") = p.height;
+    sz.append_attribute("height") = boxH;
     sz.append_attribute("heightRelTo") = "ABSOLUTE";
     sz.append_attribute("protect") = 0;
 
@@ -1029,9 +1039,19 @@ void writeShapeGeometryAndCommon(pugi::xml_node node, const Control& ctrl, const
     static std::uint32_t nextInst = 1;
     node.append_attribute("instid") = nextInst++;
 
+    // 돌린 개체(숨긴 한글 2024): offset·이동 행렬은 돌리기 전 상자의 왼쪽 위를 돌린 상자 기준으로 잰 값이고,
+    // 회전 정보의 가운데는 돌린 상자의 반, 회전 행렬은 돌리기 전 상자의 가운데를 중심으로 돌린다.
+    const model::ObjectGeometry geo =
+        model::objectGeometry(p.width, p.height, p.rotation, p.skewX, p.skewY, p.flipHorizontal, p.flipVertical);
+    const bool rotated = geo.shaped;  // 돌리거나 기울였다
+    const std::uint32_t rotW = geo.boxWidth;
+    const std::uint32_t rotH = geo.boxHeight;
+    const std::int32_t offsetX = rotated ? (grouped ? p.groupX : 0) + geo.transX : p.groupX - p.matrixX;
+    const std::int32_t offsetY = rotated ? (grouped ? p.groupY : 0) + geo.transY : p.groupY - p.matrixY;
+    // 한글은 offset 을 부호 없는 수로 적고 그렇게 읽는다(-1417 은 4294965879). "-1417" 이라 적으면 한글이 0 으로 읽는다.
     auto offset = node.append_child("hp:offset");
-    offset.append_attribute("x") = p.groupX - p.matrixX;
-    offset.append_attribute("y") = p.groupY - p.matrixY;
+    offset.append_attribute("x") = static_cast<std::uint32_t>(offsetX);
+    offset.append_attribute("y") = static_cast<std::uint32_t>(offsetY);
 
     const std::uint32_t curW = p.width;
     const std::uint32_t curH = p.height;
@@ -1057,9 +1077,9 @@ void writeShapeGeometryAndCommon(pugi::xml_node node, const Control& ctrl, const
     flip.append_attribute("vertical") = p.flipVertical ? 1 : 0;
 
     auto rot = node.append_child("hp:rotationInfo");
-    rot.append_attribute("angle") = 0;
-    rot.append_attribute("centerX") = curW / 2;
-    rot.append_attribute("centerY") = curH / 2;
+    rot.append_attribute("angle") = rotated ? p.rotation % 360 : 0;
+    rot.append_attribute("centerX") = rotW / 2;
+    rot.append_attribute("centerY") = rotH / 2;
     rot.append_attribute("rotateimage") = 1;
 
     auto ri = node.append_child("hp:renderingInfo");
@@ -1071,13 +1091,12 @@ void writeShapeGeometryAndCommon(pugi::xml_node node, const Control& ctrl, const
                 formatFloat(m[static_cast<std::size_t>(i)]).c_str();
         }
     };
-    writeMat("hc:transMatrix",
-             {1.0, 0.0, static_cast<double>(p.groupX - p.matrixX), 0.0, 1.0,
-              static_cast<double>(p.groupY - p.matrixY)});
+    writeMat("hc:transMatrix", {1.0, 0.0, static_cast<double>(offsetX), 0.0, 1.0, static_cast<double>(offsetY)});
     writeMat("hc:scaMatrix",
-             {p.scaleX != 0.0 ? p.scaleX : 1.0, 0.0, static_cast<double>(p.matrixX), 0.0,
-              p.scaleY != 0.0 ? p.scaleY : 1.0, static_cast<double>(p.matrixY)});
-    writeMat("hc:rotMatrix", {1.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+             {p.scaleX != 0.0 ? p.scaleX : 1.0, geo.skew[1], rotated ? 0.0 : static_cast<double>(p.matrixX), geo.skew[3],
+              p.scaleY != 0.0 ? p.scaleY : 1.0, rotated ? 0.0 : static_cast<double>(p.matrixY)});
+    // 좌우·상하 대칭도 회전 행렬에 든다(숨긴 한글 2024: 좌우 e1 -1·e3 정수 가운데의 두 배, model::objectGeometry).
+    writeMat("hc:rotMatrix", geo.rotation);
 }
 
 // 보관한 개체의 딸린 묶음 항목(차트 XML). write 가 비우고 마지막에 묶음에 담는다.

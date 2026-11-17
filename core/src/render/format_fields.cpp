@@ -236,6 +236,22 @@ const std::vector<ParaField>& paraFields() {
                       return FormatValue{p.headingType.empty() ? std::string("NONE") : p.headingType};
                   },
                   [](model::ParaShape&, const FormatValue&) {}},
+        // 글머리표 문자, 캐럿 수준의 번호 글·번호 종류(문단 번호/글머리표 대화 상자). 정의를 고르는 일은
+        // applyParaHeadingFields 가 한다. 읽을 값은 없다(정의는 문서 머리에 있다).
+        ParaField{"headingBullet", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingNumberFormat", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingNumberPreset", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingBulletPreset", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingBulletImage", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingNewList", [](const model::ParaShape&) { return FormatValue{false}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
+        ParaField{"headingNumberType", [](const model::ParaShape&) { return FormatValue{std::string()}; },
+                  [](model::ParaShape&, const FormatValue&) {}},
         // 수준은 0부터다. 한글 대화상자의 1 수준이 0 이다.
         CHWP_PARA_INT("headingLevel", headingLevel, 0, 9),
     };
@@ -523,10 +539,311 @@ bool formatFieldsTouchPara(const FormatFields& fields) {
     });
 }
 
+namespace {
+
+// 글머리표 및 문단 번호 대화 상자(한글 2024 ParaNumberBulletDlg)의 모양 목록. 숨긴 한글 2024 에서 칸마다 골라 저장한
+// HWPX 로 확인했다. 번호 모양은 10 수준의 번호 종류와 번호 글이고, 다른 값은 모두 같다(시작 1, 왼쪽 정렬, 글자 폭 따름,
+// 자동 내어 쓰기, 본문과 50%, 글자 모양 없음). 한글 목록의 마지막 칸은 첫 칸과 같은 정의라 한 번만 둔다.
+struct NumberPresetLevel {
+    const char* numFormat;
+    const char* text;
+};
+const NumberPresetLevel kNumberPresets[][10] = {
+    {{"DIGIT", "^1."}, {"HANGUL_SYLLABLE", "^2."}, {"DIGIT", "^3)"}, {"HANGUL_SYLLABLE", "^4)"}, {"DIGIT", "(^5)"},
+     {"HANGUL_SYLLABLE", "(^6)"}, {"CIRCLED_DIGIT", "^7"}, {"CIRCLED_HANGUL_SYLLABLE", "^8"}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"DIGIT", "(^1)"}, {"HANGUL_SYLLABLE", "(^2)"}, {"LATIN_SMALL", "(^3)"}, {"DIGIT", "^4)"}, {"HANGUL_SYLLABLE", "^5)"},
+     {"LATIN_SMALL", "^6)"}, {"CIRCLED_DIGIT", "^7"}, {"CIRCLED_HANGUL_SYLLABLE", "^8"}, {"CIRCLED_LATIN_SMALL", "^9"},
+     {"DIGIT", ""}},
+    {{"DIGIT", "^1)"}, {"HANGUL_SYLLABLE", "^2)"}, {"LATIN_SMALL", "^3)"}, {"DIGIT", "(^4)"}, {"HANGUL_SYLLABLE", "(^5)"},
+     {"LATIN_SMALL", "(^6)"}, {"CIRCLED_DIGIT", "^7"}, {"CIRCLED_HANGUL_SYLLABLE", "^8"}, {"CIRCLED_LATIN_SMALL", "^9"},
+     {"DIGIT", ""}},
+    {{"CIRCLED_DIGIT", "^1"}, {"HANGUL_JAMO", "(^2)"}, {"LATIN_SMALL", "(^3)"}, {"DIGIT", "^4)"}, {"HANGUL_JAMO", "^5)"},
+     {"LATIN_SMALL", "^6)"}, {"DIGIT", "-"}, {"DIGIT", ""}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"HANGUL_SYLLABLE", "^1)"}, {"LATIN_SMALL", "^2)"}, {"DIGIT", "(^3)"}, {"HANGUL_SYLLABLE", "(^4)"},
+     {"LATIN_SMALL", "(^5)"}, {"CIRCLED_DIGIT", "^6"}, {"DIGIT", "-"}, {"DIGIT", ""}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"HANGUL_JAMO", "(^1)"}, {"DIGIT", "(^2)"}, {"LATIN_SMALL", "(^3)"}, {"DIGIT", "^4)"}, {"LATIN_SMALL", "^5)"},
+     {"CIRCLED_DIGIT", "^6"}, {"DIGIT", "-"}, {"DIGIT", ""}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"ROMAN_CAPITAL", "^1."}, {"LATIN_CAPITAL", "^2."}, {"DIGIT", "^3."}, {"ROMAN_SMALL", "^4)"}, {"LATIN_SMALL", "^5)"},
+     {"DIGIT", "^6)"}, {"CIRCLED_DIGIT", "^7"}, {"CIRCLED_LATIN_SMALL", "^8"}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"ROMAN_SMALL", "^1."}, {"LATIN_SMALL", "^2."}, {"ROMAN_SMALL", "(^3)"}, {"LATIN_SMALL", "(^4)"},
+     {"ROMAN_SMALL", "^5)"}, {"LATIN_SMALL", "^6)"}, {"DIGIT", "-"}, {"DIGIT", ""}, {"DIGIT", ""}, {"DIGIT", ""}},
+    {{"LATIN_CAPITAL", "^1."}, {"DIGIT", "^2."}, {"HANGUL_SYLLABLE", "^3,"}, {"LATIN_SMALL", "(^4)"}, {"DIGIT", "(^5)"},
+     {"HANGUL_SYLLABLE", "(^6)"}, {"CIRCLED_LATIN_SMALL", "^7"}, {"CIRCLED_DIGIT", "^8"},
+     {"CIRCLED_HANGUL_SYLLABLE", "^9"}, {"DIGIT", ""}},
+    {{"DIGIT", "^1."}, {"DIGIT", "^1.^2."}, {"DIGIT", "^1.^2.^3."}, {"DIGIT", "^1.^2.^3.^4."},
+     {"DIGIT", "^1.^2.^3.^4.^5."}, {"DIGIT", "^1.^2.^3.^4.^5.^6."}, {"DIGIT", "^1.^2.^3.^4.^5.^6.^7."},
+     {"DIGIT", "^1.^2.^3.^4.^5.^6.^7.^8."}, {"DIGIT", "^1.^2.^3.^4.^5.^6.^7.^8.^9."},
+     {"DIGIT", "^1.^2.^3.^4.^5.^6.^7.^8.^9.^:."}},
+};
+constexpr int kNumberPresetCount = static_cast<int>(sizeof(kNumberPresets) / sizeof(kNumberPresets[0]));
+
+// 글머리표 모양(문자)과 보일 문자. 한글은 기호 글꼴(Wingdings) 자리의 사용자 영역 문자(U+F0xx)를 많이 쓴다.
+// 보일 문자는 대화 상자 단추에 그릴 같은 모양의 유니코드 문자다. 마지막 칸(●)은 첫 칸과 같아 뺐다.
+struct BulletPreset {
+    const char* text;
+    const char* checked;  // 확인용 글머리표면 체크했을 때 문자
+    const char* shown;
+    const char* shownChecked;
+};
+const BulletPreset kBulletPresets[] = {
+    {"\xEF\x81\xAC", "", "\xE2\x97\x8F", ""},      // U+F06C ●
+    {"\xEF\x82\x9F", "", "\xE2\x80\xA2", ""},      // U+F09F •
+    {"\xEF\x81\xAE", "", "\xE2\x96\xA0", ""},      // U+F06E ■
+    {"\xEF\x82\xA7", "", "\xE2\x96\xAA", ""},      // U+F0A7 ▪
+    {"\xEF\x81\xB5", "", "\xE2\x97\x86", ""},      // U+F075 ◆
+    {"\xEF\x81\xB7", "", "\xE2\xAC\xA9", ""},      // U+F077 ⬩
+    {"\xE2\x96\xB6", "", "\xE2\x96\xB6", ""},      // ▶
+    {"\xE2\x97\xAF", "", "\xE2\x97\xAF", ""},      // ◯
+    {"\xE2\x96\xA1", "", "\xE2\x96\xA1", ""},      // □
+    {"\xE2\x97\x87", "", "\xE2\x97\x87", ""},      // ◇
+    {"\xE2\x96\xB7", "", "\xE2\x96\xB7", ""},      // ▷
+    {"\xEF\x82\xA4", "", "\xE2\x97\x89", ""},      // U+F0A4 ◉
+    {"\xEF\x83\xBE", "", "\xE2\x98\x91", ""},      // U+F0FE ☑
+    {"\xEF\x83\xBC", "", "\xE2\x9C\x93", ""},      // U+F0FC ✓
+    {"\xEF\x82\xAB", "", "\xE2\x98\x85", ""},      // U+F0AB ★
+    {"\xEF\x81\xB6", "", "\xE2\x9D\x96", ""},      // U+F076 ❖
+    {"\xEF\x81\x86", "", "\xE2\x98\x9E", ""},      // U+F046 ☞
+    {"\xE2\x9D\x8D", "", "\xE2\x9D\x8D", ""},      // ❍
+    // 확인용 글머리표(체크하면 checked 문자). 한글 목록의 마지막 칸은 첫 칸과 같다.
+    {"\xE2\x98\x90", "\xE2\x98\x91", "\xE2\x98\x90", "\xE2\x98\x91"},  // ☐ ☑
+    {"\xEF\x82\xA8", "\xEF\x83\xBE", "\xE2\x97\xBB", "\xE2\x98\x91"},  // U+F0A8 ◻, U+F0FE ☑
+    {"\xE2\x97\x8B", "\xE2\x97\x89", "\xE2\x97\x8B", "\xE2\x97\x89"},  // ○ ◉
+    {"\xEF\x82\xA1", "\xEF\x82\xA4", "\xE2\x97\x8B", "\xE2\x97\x89"},  // U+F0A1 ○, U+F0A4 ◉
+};
+constexpr int kBulletPresetCount = static_cast<int>(sizeof(kBulletPresets) / sizeof(kBulletPresets[0]));
+
+model::Numbering numberPreset(int index) {
+    model::Numbering made;
+    made.start = 1;
+    for (int i = 0; i < 10; ++i) {
+        model::ParaHead head;
+        head.level = i + 1;
+        head.start = 1;
+        head.align = "LEFT";
+        head.useInstWidth = true;
+        head.autoIndent = true;
+        head.widthAdjust = 0;
+        head.textOffsetType = "PERCENT";
+        head.textOffset = 50;
+        head.charShapeId = 0xFFFFFFFFu;
+        head.numFormat = kNumberPresets[index][i].numFormat;
+        head.format = kNumberPresets[index][i].text;
+        made.levels.push_back(head);
+    }
+    return made;
+}
+
+// 번호 모양 견본: 수준마다 번호 글의 ^N 을 그 수준 번호 종류의 1 로 바꾼 글(대화 상자 칸에 넉 줄을 보인다).
+std::string numberPresetLabel(int index) {
+    std::string out;
+    for (int i = 0; i < 4; ++i) {
+        const std::string text = kNumberPresets[index][i].text;
+        std::string line;
+        for (std::size_t at = 0; at < text.size(); ++at) {
+            const char ch = text[at];
+            if (ch == '^' && at + 1 < text.size() && text[at + 1] >= '1' && text[at + 1] <= ':') {
+                const int level = text[at + 1] - '1';
+                line += detail::formatNumber(1, kNumberPresets[index][level].numFormat);
+                ++at;
+            } else {
+                line += ch;
+            }
+        }
+        if (!out.empty()) out += '\n';
+        out += line;
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::pair<std::string, std::string>> headingPresetOptions(const std::string& kind) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (kind == "number") {
+        for (int i = 0; i < kNumberPresetCount; ++i) out.emplace_back(std::to_string(i + 1), numberPresetLabel(i));
+    } else {
+        const bool check = kind == "check";
+        for (int i = 0; i < kBulletPresetCount; ++i) {
+            const BulletPreset& p = kBulletPresets[i];
+            if (check != (p.checked[0] != '\0')) continue;
+            out.emplace_back(std::to_string(i + 1), check ? std::string(p.shown) + p.shownChecked : std::string(p.shown));
+        }
+    }
+    return out;
+}
+
+
+
 void applyParaHeadingFields(model::Document& doc, model::ParaShape& shape, const FormatFields& fields) {
     const std::string* kind = nullptr;
+    const std::string* bulletChar = nullptr;
+    const std::string* numberFormat = nullptr;
+    const std::string* numberType = nullptr;
+    const std::string* numberPresetKey = nullptr;
+    const std::string* bulletPresetKey = nullptr;
+    const std::string* bulletImage = nullptr;
+    bool newList = false;
     for (const auto& [key, value] : fields) {
         if (key == "headingType") kind = std::get_if<std::string>(&value);
+        if (key == "headingNumberPreset") numberPresetKey = std::get_if<std::string>(&value);
+        if (key == "headingBulletPreset") bulletPresetKey = std::get_if<std::string>(&value);
+        if (key == "headingBulletImage") bulletImage = std::get_if<std::string>(&value);
+        if (key == "headingNewList") {
+            if (const bool* b = std::get_if<bool>(&value)) newList = *b;
+        }
+        if (key == "headingBullet") bulletChar = std::get_if<std::string>(&value);
+        if (key == "headingNumberFormat") numberFormat = std::get_if<std::string>(&value);
+        if (key == "headingNumberType") numberType = std::get_if<std::string>(&value);
+    }
+    // 그림 글머리표: 그 그림(문서에 넣은 그림 이름)의 정의를 쓰거나 새로 만든다. 한글처럼 글자는 ● 이다.
+    if (bulletImage && !bulletImage->empty() && kind && *kind == "BULLET") {
+        std::uint32_t maxId = 0;
+        std::uint32_t found = 0;
+        for (const model::Bullet& b : doc.header.bullets) {
+            maxId = std::max(maxId, b.id);
+            if (!found && b.imageId == *bulletImage) found = b.id;
+        }
+        if (!found) {
+            model::Bullet made;
+            made.id = maxId + 1;
+            made.text = "\u25CF";
+            made.imageId = *bulletImage;
+            made.head.level = 0;
+            made.head.align = "LEFT";
+            made.head.useInstWidth = false;
+            made.head.autoIndent = true;
+            made.head.widthAdjust = 0;
+            made.head.textOffsetType = "PERCENT";
+            made.head.textOffset = 50;
+            made.head.numFormat = "DIGIT";
+            made.head.charShapeId = 0xFFFFFFFFu;
+            doc.header.bullets.push_back(made);
+            found = made.id;
+        }
+        const bool listed = shape.headingType == "NUMBER" || shape.headingType == "BULLET";
+        shape.headingType = "BULLET";
+        shape.headingIdRef = found;
+        if (!listed) shape.headingLevel = 0;
+        return;
+    }
+    // 글머리표 모양 목록에서 고른 칸(확인용 글머리표면 체크 문자까지).
+    std::string presetChar;
+    std::string presetChecked;
+    if (bulletPresetKey && kind && *kind == "BULLET") {
+        const int index = std::atoi(bulletPresetKey->c_str()) - 1;
+        if (index >= 0 && index < kBulletPresetCount) {
+            presetChar = kBulletPresets[index].text;
+            presetChecked = kBulletPresets[index].checked;
+            bulletChar = &presetChar;
+        }
+    }
+    // 글머리표 모양(문단 번호/글머리표 대화 상자): 고른 문자의 글머리표 정의를 쓴다. 같은 문자 정의가 있으면 그것,
+    // 없으면 새로 만든다. 새 정의 값은 숨긴 한글 2024 가 글머리표 문자를 고를 때 적는 것과 같다(수준 0, 왼쪽 정렬,
+    // 글자 폭 안 따름, 자동 내어 쓰기, 본문과 50%, 글자 모양 없음). 수준은 번호·글머리표였으면 그대로 둔다.
+    if (bulletChar && !bulletChar->empty() && kind && *kind == "BULLET") {
+        std::uint32_t maxId = 0;
+        std::uint32_t found = 0;
+        for (const model::Bullet& b : doc.header.bullets) {
+            maxId = std::max(maxId, b.id);
+            if (!found && b.imageId.empty() && b.text == *bulletChar && b.checkedText == presetChecked) found = b.id;
+        }
+        if (!found) {
+            model::Bullet made;
+            made.id = maxId + 1;
+            made.text = *bulletChar;
+            made.checkedText = presetChecked;
+            made.head.level = 0;
+            made.head.align = "LEFT";
+            made.head.useInstWidth = false;
+            made.head.autoIndent = true;
+            made.head.widthAdjust = 0;
+            made.head.textOffsetType = "PERCENT";
+            made.head.textOffset = 50;
+            made.head.numFormat = "DIGIT";
+            made.head.charShapeId = 0xFFFFFFFFu;
+            doc.header.bullets.push_back(made);
+            found = made.id;
+        }
+        const bool listed = shape.headingType == "NUMBER" || shape.headingType == "BULLET";
+        shape.headingType = "BULLET";
+        shape.headingIdRef = found;
+        if (!listed) shape.headingLevel = 0;
+        return;
+    }
+    // 문단 번호 모양 목록에서 고른 칸(숨긴 한글 2024 로 확인):
+    // - 문단이 이미 번호 목록(1번 개요 정의가 아닌)이면 그 정의를 고른 모양으로 바꾼다. 같은 목록 문단이 모두 바뀐다
+    //   (한글 시작 번호 방식 "앞 번호 목록에 이어").
+    // - 새 번호 목록 시작이거나 번호 문단이 아니면 고른 모양의 정의를 새로 만든다.
+    // 수준은 번호·글머리표였으면 그대로 둔다.
+    if (numberPresetKey && kind && *kind == "NUMBER") {
+        const int index = std::atoi(numberPresetKey->c_str()) - 1;
+        if (index < 0 || index >= kNumberPresetCount) return;
+        model::Numbering made = numberPreset(index);
+        const bool listed = shape.headingType == "NUMBER" || shape.headingType == "BULLET";
+        model::Numbering* current = nullptr;
+        if (!newList && shape.headingType == "NUMBER" && shape.headingIdRef != 1) {
+            for (model::Numbering& n : doc.header.numberings) {
+                if (n.id == shape.headingIdRef) current = &n;
+            }
+        }
+        if (current) {
+            made.id = current->id;
+            *current = made;
+        } else {
+            std::uint32_t maxId = 1;
+            for (const model::Numbering& n : doc.header.numberings) maxId = std::max(maxId, n.id);
+            made.id = maxId + 1;
+            doc.header.numberings.push_back(made);
+        }
+        shape.headingType = "NUMBER";
+        shape.headingIdRef = made.id;
+        if (!listed) shape.headingLevel = 0;
+        return;
+    }
+    // 문단 번호 모양: 캐럿 문단 수준의 번호 글(^1. 따위)과 번호 종류를 바꾼 정의를 쓴다. 나머지 수준은 지금 정의
+    // (없으면 기본 번호 모양)를 따른다. 모든 수준이 같은 정의가 있으면 그것을 쓴다.
+    if ((numberFormat || numberType) && kind && *kind == "NUMBER") {
+        model::Numbering made = detail::builtinOutline();
+        if (shape.headingType == "NUMBER") {
+            for (const model::Numbering& n : doc.header.numberings) {
+                if (n.id == shape.headingIdRef) made = n;
+            }
+        }
+        const int level = shape.headingType == "NUMBER" || shape.headingType == "BULLET" ? shape.headingLevel : 0;
+        if (level >= 0 && level < static_cast<int>(made.levels.size())) {
+            // 번호 글의 ^N 은 그 수준의 번호 자리(^1·^2 …)다.
+            if (numberFormat) {
+                std::string text = *numberFormat;
+                for (std::size_t at = text.find("^N"); at != std::string::npos; at = text.find("^N", at)) {
+                    text.replace(at, 2, "^" + std::to_string(level + 1));
+                }
+                made.levels[static_cast<std::size_t>(level)].format = text;
+            }
+            if (numberType && !numberType->empty()) made.levels[static_cast<std::size_t>(level)].numFormat = *numberType;
+        }
+        const auto same = [&](const model::Numbering& n) {
+            if (n.levels.size() != made.levels.size()) return false;
+            for (std::size_t i = 0; i < n.levels.size(); ++i) {
+                if (n.levels[i].format != made.levels[i].format || n.levels[i].numFormat != made.levels[i].numFormat) return false;
+            }
+            return true;
+        };
+        std::uint32_t maxId = 1;
+        std::uint32_t found = 0;
+        for (const model::Numbering& n : doc.header.numberings) {
+            maxId = std::max(maxId, n.id);
+            if (!found && n.id != 1 && same(n)) found = n.id;
+        }
+        if (!found) {
+            made.id = maxId + 1;
+            doc.header.numberings.push_back(made);
+            found = made.id;
+        }
+        const bool listed = shape.headingType == "NUMBER" || shape.headingType == "BULLET";
+        shape.headingType = "NUMBER";
+        shape.headingIdRef = found;
+        if (!listed) shape.headingLevel = 0;
+        return;
     }
     if (!kind || kind->empty()) return;
     const std::string before = shape.headingType.empty() ? "NONE" : shape.headingType;

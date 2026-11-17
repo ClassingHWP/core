@@ -687,9 +687,16 @@ EffectBox objectEffectBox(const Control& control) {
                             static_cast<std::int32_t>(control.placement->height));
 }
 
-// 개체가 흐를 때 쓰는 배치. 효과가 없으면 파일 값과 같다.
+// 개체가 흐를 때 쓰는 배치. 효과가 없으면 파일 값과 같다. 돌린 개체는 돌린 상자(한글 sz)로 흐른다.
 Placement flowPlacement(const Control& control) {
     Placement out = *control.placement;
+    if (out.rotation % 360 != 0 || out.skewX != 0 || out.skewY != 0) {
+        const model::ObjectGeometry g = model::objectGeometry(control.placement->width, control.placement->height,
+                                                              out.rotation, out.skewX, out.skewY, out.flipHorizontal,
+                                                              out.flipVertical);
+        out.width = g.boxWidth;
+        out.height = g.boxHeight;
+    }
     const EffectBox box = objectEffectBox(control);
     out.marginLeft += box.left;
     out.marginRight += box.right;
@@ -1188,6 +1195,20 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
     node.y = y;
     node.width = static_cast<std::int32_t>(control.placement->width);
     node.height = static_cast<std::int32_t>(control.placement->height);
+    // 돌린 개체: (x, y) 는 돌린 상자 자리다. 돌리기 전 상자를 그 가운데에 둔다.
+    if (const model::ObjectGeometry g = model::objectGeometry(control.placement->width, control.placement->height,
+                                                              control.placement->rotation, control.placement->skewX,
+                                                              control.placement->skewY, control.placement->flipHorizontal,
+                                                              control.placement->flipVertical);
+        g.shaped) {
+        node.x += (static_cast<std::int32_t>(g.boxWidth) - node.width) / 2;
+        node.y += (static_cast<std::int32_t>(g.boxHeight) - node.height) / 2;
+        node.extMut().objMut().shaped = true;
+        node.extMut().objMut().rotation = control.placement->rotation;
+        node.extMut().objMut().shapeBoxW = static_cast<std::int32_t>(g.boxWidth);
+        node.extMut().objMut().shapeBoxH = static_cast<std::int32_t>(g.boxHeight);
+        node.extMut().objMut().shapeLocal = g.local;
+    }
     node.fileAudit = true;
     node.extMut().objMut().fileWidth = node.width;
     node.extMut().objMut().fileHeight = node.height;
@@ -2920,7 +2941,10 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
     // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 흘린다(turnedPlacement, uprightObject).
     std::map<const Control*, Placement> turnedPlacements;  // 세로쓰기·그림 효과가 바꾼 배치
     auto placeOf = [&](const Control& control) -> const Placement& {
-        if (frame.textDirection == 0 && objectEffectBox(control).empty()) return *control.placement;
+        if (frame.textDirection == 0 && objectEffectBox(control).empty() && control.placement->rotation % 360 == 0 &&
+            control.placement->skewX == 0 && control.placement->skewY == 0) {
+            return *control.placement;
+        }
         auto found = turnedPlacements.find(&control);
         if (found == turnedPlacements.end()) {
             const Placement flow = flowPlacement(control);
@@ -3191,6 +3215,11 @@ ColumnResume layoutColumn(Node& column, const Frame& frame, std::vector<Obstacle
             }
             Node built = makeObject(control, ox, oy, doc, frame.depth, frame.defaultTab, frame.useStoredLineHeight,
                                     frame.deferSpans);
+            const bool paperX = placement.horzRelTo == "PAPER" && frame.page && body;
+            const bool paperY = placement.vertRelTo == "PAPER" && frame.page && body;
+            built.extMut().objMut().alignW =
+                paperX ? paper.width : (placement.horzRelTo == "PARA" ? contentWidth : column.width);
+            built.extMut().objMut().alignH = paperY ? paper.height : (placement.vertRelTo == "PARA" ? 0 : column.height);
             return placeParaObject(control, std::move(built), ox, oy);
         };
         for (const auto& run : para.runs) {
@@ -3947,7 +3976,9 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                 }
                 if (only ? &item.control != only : alreadyPlaced(&item.control)) continue;
                 // 세로쓰기 틀은 개체를 세운 그대로 두고 너비·높이를 바꾼 상자로 놓는다.
-                const bool ownCopy = frame.textDirection != 0 || !objectEffectBox(item.control).empty();
+                const bool ownCopy = frame.textDirection != 0 || !objectEffectBox(item.control).empty() ||
+                                     item.control.placement->rotation % 360 != 0 || item.control.placement->skewX != 0 ||
+                                     item.control.placement->skewY != 0;
                 const Placement own = !ownCopy               ? Placement{}
                                       : frame.textDirection != 0 ? turnedPlacement(flowPlacement(item.control))
                                                                  : flowPlacement(item.control);
@@ -3986,6 +4017,8 @@ void placeFrameObjects(Node& paper, Node* body, Node& column, const Frame& frame
                 }
                 Node built = makeObject(item.control, localX, localY, doc, frame.depth, frame.defaultTab,
                                         frame.useStoredLineHeight, frame.deferSpans);
+                built.extMut().objMut().alignW = horzPaper ? paper.width : column.width;
+                built.extMut().objMut().alignH = vertPaper ? paper.height : column.height;
                 const int ordinal = itemOrdinal(para, &item.control);
                 built.extMut().objMut().anchorStory = frame.story;
                 built.extMut().objMut().anchorParagraph = pi;

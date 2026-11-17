@@ -206,6 +206,7 @@ const char* tableEditName(TableEditKind kind) {
         case TableEditKind::Split: return "splitCell";
         case TableEditKind::CellBorder: return "cellBorder";
         case TableEditKind::CellFill: return "cellFill";
+        case TableEditKind::CellShade: return "cellShade";
         case TableEditKind::CellBorderFill: return "cellBorderFill";
         case TableEditKind::EqualWidth: return "equalWidth";
         case TableEditKind::EqualHeight: return "equalHeight";
@@ -230,7 +231,7 @@ bool tableEditKindOf(const std::string& name, TableEditKind& kind) {
     for (const TableEditKind k : {TableEditKind::InsertRows, TableEditKind::InsertColumns, TableEditKind::DeleteRows,
                                   TableEditKind::DeleteColumns, TableEditKind::Merge, TableEditKind::Split,
                                   TableEditKind::CellBorder, TableEditKind::CellFill, TableEditKind::CellBorderFill,
-                                  TableEditKind::EqualWidth,
+                                  TableEditKind::CellShade, TableEditKind::EqualWidth,
                                   TableEditKind::EqualHeight, TableEditKind::CellAlign, TableEditKind::CellDirection,
                                   TableEditKind::TableMargin, TableEditKind::TreatAsChar, TableEditKind::Wrap,
                                   TableEditKind::Caption, TableEditKind::SplitTable, TableEditKind::MergeTable,
@@ -615,6 +616,7 @@ EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& p
         case TableEditKind::Merge: edit = model::mergeTableCells(table, row0, col0, row1, col1); break;
         case TableEditKind::CellBorder:
         case TableEditKind::CellFill:
+        case TableEditKind::CellShade:
         case TableEditKind::CellBorderFill: {
             model::BorderFillAccess fills;
             fills.read = [&doc](std::uint32_t id) { return borderFillOf(doc, id); };
@@ -633,6 +635,10 @@ EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& p
                 }
                 if (cmd.setFill) spec.faceColor = cmd.color == "none" ? std::string() : cmd.color;
                 edit = model::setTableCellBorderFill(table, row0, col0, row1, col1, spec, fills);
+                break;
+            }
+            if (cmd.kind == TableEditKind::CellShade) {
+                edit = model::shadeTableCells(table, row0, col0, row1, col1, cmd.count, fills);
                 break;
             }
             if (cmd.kind == TableEditKind::CellFill) {
@@ -826,6 +832,7 @@ EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& p
     clearComposition(pointerHold());
     // 테두리·배경은 칸 자리를 바꾸지 않는다. 칸 블록을 남겨 이어서 고치게 한다.
     const bool keepBlock = cmd.kind == TableEditKind::CellBorder || cmd.kind == TableEditKind::CellFill ||
+                           cmd.kind == TableEditKind::CellShade ||
                            cmd.kind == TableEditKind::CellBorderFill ||
                            cmd.kind == TableEditKind::CellAlign || cmd.kind == TableEditKind::CellDirection ||
                            cmd.kind == TableEditKind::Comma || cmd.kind == TableEditKind::AutoFill ||

@@ -500,6 +500,21 @@ int lineBoxH(const Node& node) {
     return std::max<std::int32_t>(node.fontSize, 1);
 }
 
+// 돌린 개체(회전각)가 쪽에서 차지하는 상자. 노드 상자는 돌리기 전 상자이고 그 가운데를 중심으로 돌린다.
+// 돌리지 않은 개체는 노드 상자 그대로다. 고른 개체 손잡이·묶기 상자가 이 상자를 쓴다.
+void shownObjectBox(const Node& node, std::int32_t x, std::int32_t y, std::int32_t& bx, std::int32_t& by,
+                    std::int32_t& bw, std::int32_t& bh) {
+    bx = x;
+    by = y;
+    bw = node.width;
+    bh = node.height;
+    if (node.kind != NodeKind::Object || !node.ext().obj().shaped) return;
+    bw = node.ext().obj().shapeBoxW;
+    bh = node.ext().obj().shapeBoxH;
+    bx = x + node.width / 2 - bw / 2;
+    by = y + node.height / 2 - bh / 2;
+}
+
 bool boxHas(std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h, int px, int py) {
     return w > 0 && h > 0 && px >= x && py >= y && px < x + w && py < y + h;
 }
@@ -635,6 +650,32 @@ bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int
     if (node.kind == NodeKind::Object && node.role != "caption" && node.role != "pageBorder" && node.role != "pageFill") {
         const bool behind = node.ext().obj().textWrap == "BEHIND_TEXT";
         if (behind && !allowBehind) return false;
+        // 돌린 개체는 누른 자리를 거꾸로 돌려 돌리기 전 상자로 본다. 안의 글은 돌린 채라 캐럿을 두지 않고 개체를 고른다.
+        // 글상자 글은 돌리지 않는다. 돌리기 전 상자 안 글 줄을 누르면 캐럿을 둔다(숨긴 한글 2024 와 같다).
+        if (node.ext().obj().shaped && cellContentStory(node) > 0 && boxHas(x, y, node.width, node.height, px, py)) {
+            LineRef inside;
+            lineUnder(node, ox, oy, px, py, inside);
+            if (inside.node) {
+                chain.push_back({&node, x, y, node.width, node.height});
+                line = inside;
+                return true;
+            }
+        }
+        if (node.ext().obj().shaped) {
+            std::int32_t bx = 0, by = 0, bw = 0, bh = 0;
+            shownObjectBox(node, x, y, bx, by, bw, bh);
+            // 누른 자리를 차지하는 상자 기준으로 옮겨 local 행렬을 거꾸로 풀면 돌리기 전 상자의 점이다.
+            const auto& m = node.ext().obj().shapeLocal;
+            const double det = m[0] * m[4] - m[1] * m[3];
+            if (std::fabs(det) < 1e-12) return false;
+            const double dx = px - bx - m[2];
+            const double dy = py - by - m[5];
+            const double qx = (m[4] * dx - m[1] * dy) / det;
+            const double qy = (-m[3] * dx + m[0] * dy) / det;
+            if (qx < 0 || qy < 0 || qx > node.width || qy > node.height) return false;
+            chain.push_back({&node, bx, by, bw, bh});
+            return true;
+        }
         if (!boxHas(x, y, node.width, node.height, px, py)) return false;
         for (int i = static_cast<int>(node.children.size()) - 1; i >= 0; --i) {
             std::vector<ObjRef> child;
@@ -987,6 +1028,9 @@ void showObject(PointerHold& hold, const std::vector<Node>& pages, int page, con
     hold.selectedObject = obj.node;
     hold.objectHandles = true;
     hold.resizeHandle = -1;
+    // 개체를 새로 고르면 개체 회전은 꺼진다(돌린 뒤 다시 고를 때는 rotateObjectNow 가 다시 켠다).
+    hold.rotateMode = false;
+    hold.rotateDragging = false;
     hold.tracking = false;
     if (page >= 0 && page < static_cast<int>(pages.size())) {
         hold.caretPage = page;
@@ -1019,7 +1063,9 @@ bool pickAnchoredObject(const model::Document& doc, const std::vector<Node>& pag
         if (found || node.turned != 0) return false;
         if (node.kind == NodeKind::Object && node.ext().obj().anchorStory == story &&
             node.ext().obj().anchorParagraph == paragraph && node.ext().obj().anchorItem == item) {
-            hold.multiPicked.push_back(PointerHold::PickedObject{page, story, paragraph, item, x, y, node.width, node.height});
+            std::int32_t bx = 0, by = 0, bw = 0, bh = 0;
+            shownObjectBox(node, x, y, bx, by, bw, bh);
+            hold.multiPicked.push_back(PointerHold::PickedObject{page, story, paragraph, item, bx, by, bw, bh});
             found = true;
             return false;
         }
@@ -1027,6 +1073,28 @@ bool pickAnchoredObject(const model::Document& doc, const std::vector<Node>& pag
     };
     walkPlacedNodes(doc, pages[static_cast<std::size_t>(page)], 0, 0, visit);
     return found;
+}
+
+bool placedObjectBox(const model::Document& doc, const std::vector<Node>& pages, int story, int paragraph, int item,
+                     PlacedBox& out) {
+    for (int page = 0; page < static_cast<int>(pages.size()); ++page) {
+        bool found = false;
+        auto visit = [&](const Node& node, std::int32_t x, std::int32_t y) {
+            if (found || node.turned != 0) return false;
+            if (node.kind == NodeKind::Object && node.ext().obj().anchorStory == story &&
+                node.ext().obj().anchorParagraph == paragraph && node.ext().obj().anchorItem == item) {
+                std::int32_t bx = 0, by = 0, bw = 0, bh = 0;
+                shownObjectBox(node, x, y, bx, by, bw, bh);
+                out = PlacedBox{page, bx, by, bw, bh};
+                found = true;
+                return false;
+            }
+            return true;
+        };
+        walkPlacedNodes(doc, pages[static_cast<std::size_t>(page)], 0, 0, visit);
+        if (found) return true;
+    }
+    return false;
 }
 
 bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,
@@ -1037,7 +1105,9 @@ bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>&
         if (found.node || node.turned != 0) return false;
         if (node.kind == NodeKind::Object && node.ext().obj().anchorStory == story && node.ext().obj().anchorParagraph == paragraph &&
             node.ext().obj().anchorItem == item) {
-            found = ObjRef{&node, x, y, node.width, node.height};
+            std::int32_t bx = 0, by = 0, bw = 0, bh = 0;
+            shownObjectBox(node, x, y, bx, by, bw, bh);
+            found = ObjRef{&node, bx, by, bw, bh};
             return false;
         }
         return true;
@@ -1566,8 +1636,43 @@ void applyZone(PointerHold& hold, const model::Document& doc, const std::vector<
     edgeCaret(hit.zone == ClickZone::None ? ClickZone::Bottom : hit.zone);
 }
 
+// 고른 개체의 네 꼭짓점(쪽 HU, 왼쪽 위부터 시계 방향). 돌리거나 기울인 개체는 돌린 모양의 꼭짓점이다.
+bool objectCorners(const PointerHold& hold, double out[4][2]) {
+    if (hold.boxes.empty()) return false;
+    const HeldBox& box = hold.boxes.front();
+    const Node* node = hold.selectedObject;
+    if (node && node->kind == NodeKind::Object && node->ext().obj().shaped) {
+        const auto& m = node->ext().obj().shapeLocal;
+        const double w = node->width;
+        const double h = node->height;
+        const double xs[4] = {0, w, w, 0};
+        const double ys[4] = {0, 0, h, h};
+        for (int i = 0; i < 4; ++i) {
+            out[i][0] = box.x + m[0] * xs[i] + m[1] * ys[i] + m[2];
+            out[i][1] = box.y + m[3] * xs[i] + m[4] * ys[i] + m[5];
+        }
+        return true;
+    }
+    const double xs[4] = {0, 1, 1, 0};
+    const double ys[4] = {0, 0, 1, 1};
+    for (int i = 0; i < 4; ++i) {
+        out[i][0] = box.x + xs[i] * box.width;
+        out[i][1] = box.y + ys[i] * box.height;
+    }
+    return true;
+}
+
 int objectHandleAt(const PointerHold& hold, int px, int py, double radius) {
     if (!hold.objectHandles || hold.boxes.empty() || radius <= 0) return -1;
+    // 개체 회전 중에는 돌린 모양의 네 꼭짓점이 손잡이다(숨긴 한글 2024: 초록 점 넷과 가운데 표시).
+    if (hold.rotateMode) {
+        double corners[4][2];
+        if (!objectCorners(hold, corners)) return -1;
+        for (int i = 0; i < 4; ++i) {
+            if (std::abs(px - corners[i][0]) <= radius && std::abs(py - corners[i][1]) <= radius) return i;
+        }
+        return -1;
+    }
     const HeldBox& box = hold.boxes.front();
     const std::int32_t xs[3] = {box.x, box.x + box.width / 2, box.x + box.width};
     const std::int32_t ys[3] = {box.y, box.y + box.height / 2, box.y + box.height};
@@ -1862,6 +1967,24 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
     }
     // 읽기 전용이면 개체 손잡이를 잡지 않는다. 그 자리 누르기는 보통 클릭이 된다.
     const int handle = readOnly() ? -1 : objectHandleAt(hold, x, y, handleRadius);
+    // 개체 회전 중이면 손잡이를 끌어 돌린다(한글 개체 회전). 각은 고른 상자의 가운데에서 잰다. 시계 방향이 + 다.
+    if (handle >= 0 && !hold.boxes.empty() && hold.rotateMode && hold.selectedObject &&
+        hold.selectedObject->ext().obj().anchorItem >= 0) {
+        const HeldBox& box = hold.boxes.front();
+        hold.rotateDragging = true;
+        hold.rotatePage = page;
+        hold.rotateCenterX = box.x + box.width / 2.0;
+        hold.rotateCenterY = box.y + box.height / 2.0;
+        hold.rotateStartAngle = std::atan2(y - hold.rotateCenterY, x - hold.rotateCenterX);
+        hold.rotateDelta = 0;
+        hold.rotateStory = hold.selectedObject->ext().obj().anchorStory;
+        hold.rotateParagraph = hold.selectedObject->ext().obj().anchorParagraph;
+        hold.rotateItem = hold.selectedObject->ext().obj().anchorItem;
+        hold.clickPending = false;
+        hold.tracking = true;
+        hold.eventText = "회전";
+        return pointerViewOf(hold);
+    }
     if (handle >= 0 && !hold.boxes.empty()) {
         const HeldBox& box = hold.boxes.front();
         hold.resizeHandle = handle;
@@ -1872,6 +1995,8 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         hold.resizeBottom = box.y + box.height;
         hold.resizeOldW = static_cast<std::uint32_t>(box.width);
         hold.resizeOldH = static_cast<std::uint32_t>(box.height);
+        hold.resizeAlignW = hold.selectedObject ? hold.selectedObject->ext().obj().alignW : -1;
+        hold.resizeAlignH = hold.selectedObject ? hold.selectedObject->ext().obj().alignH : -1;
         hold.resizeNewW = hold.resizeOldW;
         hold.resizeNewH = hold.resizeOldH;
         hold.resizeRole = hold.selectedObject ? hold.selectedObject->role.str() : std::string();
@@ -2183,6 +2308,20 @@ PointerView applyTimedMove(const model::Document& doc, const std::vector<Node>& 
         bumpPointerPicture();
         return pointerViewOf(hold);
     }
+    if (hold.rotateDragging) {
+        if (page == hold.rotatePage) {
+            const double now = std::atan2(y - hold.rotateCenterY, x - hold.rotateCenterX);
+            double degrees = (now - hold.rotateStartAngle) * 180.0 / 3.14159265358979323846;
+            while (degrees <= -180) degrees += 360;
+            while (degrees > 180) degrees -= 360;
+            const int delta = static_cast<int>(std::lround(degrees));
+            // 끄는 동안 돌아갈 모양을 점선으로 보인다(한글과 같다). 각이 바뀔 때만 다시 그린다.
+            if (delta != hold.rotateDelta) bumpPointerPicture();
+            hold.rotateDelta = delta;
+        }
+        hold.eventText = "회전 " + std::to_string(hold.rotateDelta) + "도";
+        return pointerViewOf(hold);
+    }
     if (hold.resizeHandle >= 0) {
         std::int32_t sx = x;
         std::int32_t sy = y;
@@ -2401,7 +2540,7 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
     if (sample.time > 0 && kind == 1) return applyTimedDown(doc, pages, page, x, y, sample);
     if (sample.time > 0 && kind == 2 &&
         (hold.clickPending || hold.pinDrag != 0 || hold.resizeHandle >= 0 || hold.moving || hold.borderDrag != 0 ||
-         hold.guideDrag != 0)) {
+         hold.guideDrag != 0 || hold.rotateDragging)) {
         return applyTimedMove(doc, pages, page, x, y, sample);
     }
     if (sample.time > 0 && kind == 3 && hold.clickPending && !hold.clickDragged) {
@@ -2440,6 +2579,21 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
             bumpPointerPicture();
             return pointerViewOf(hold);
         }
+        if (hold.rotateDragging) {
+            if (page == hold.rotatePage) {
+                const double now = std::atan2(y - hold.rotateCenterY, x - hold.rotateCenterX);
+                double degrees = (now - hold.rotateStartAngle) * 180.0 / 3.14159265358979323846;
+                while (degrees <= -180) degrees += 360;
+                while (degrees > 180) degrees -= 360;
+                hold.rotateDelta = static_cast<int>(std::lround(degrees));
+            }
+            hold.rotateDragging = false;
+            hold.rotatePending = hold.rotateDelta != 0;
+            hold.tracking = false;
+            hold.edgeActive = false;
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
         if (hold.moving) {
             if (page == hold.movePage) {
                 hold.moveDX = x - hold.moveStartX;
@@ -2468,16 +2622,23 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
             hold.resizeHandle = -1;
             // 그림이 아닌 개체는 문서의 그 컨트롤을 찾아 바꾼다(표는 칸까지). 그림은 원래 길(commitObjectResize)이다.
             const Node* picked = hold.selectedObject;
+            if (!hold.boxes.empty()) {
+                const HeldBox& now = hold.boxes.front();
+                hold.resizeNewLeft = now.x;
+                hold.resizeNewTop = now.y;
+                hold.resizeNewRight = now.x + now.width;
+                hold.resizeNewBottom = now.y + now.height;
+            }
+            // 그림도 늘린 개체 자리를 적어 둔다. 되돌리면 그 그림을 다시 고른다(editCommitObjectResize).
+            hold.resizeStory = picked && hold.resizeCommit ? picked->ext().obj().anchorStory : -1;
+            hold.resizeParagraph = picked && hold.resizeCommit ? picked->ext().obj().anchorParagraph : -1;
+            hold.resizeItem = picked && hold.resizeCommit ? picked->ext().obj().anchorItem : -1;
             if (hold.resizeCommit && picked && picked->role != "picture" && picked->ext().obj().anchorItem >= 0) {
                 hold.resizeCommit = false;
                 hold.resizeObjectPending = true;
                 hold.resizeStory = picked->ext().obj().anchorStory;
                 hold.resizeParagraph = picked->ext().obj().anchorParagraph;
                 hold.resizeItem = picked->ext().obj().anchorItem;
-                if (!hold.boxes.empty()) {
-                    hold.resizeNewLeft = hold.boxes.front().x;
-                    hold.resizeNewTop = hold.boxes.front().y;
-                }
             }
             if (hold.resizeCommit || hold.resizeObjectPending) hold.selectedObject = nullptr;
         }
@@ -2697,7 +2858,7 @@ std::string hoverCursor(const model::Document& doc, const std::vector<Node>& pag
         static const char* const kHandleCursor[8] = {"nwse-resize", "ns-resize", "nesw-resize", "ew-resize",
                                                      "ew-resize",   "nesw-resize", "ns-resize", "nwse-resize"};
         const int handle = objectHandleAt(hold, x, y, handleRadius);
-        if (handle >= 0) return kHandleCursor[handle];
+        if (handle >= 0) return hold.rotateMode ? "grab" : kHandleCursor[handle];
         // 표 칸 경계선. 누를 때처럼 손잡이 다음이다.
         TableBorderHit border;
         if (tableBorderAt(doc, pages, page, x, y, handleRadius * 0.3, border)) {
@@ -2788,6 +2949,7 @@ bool commitObjectResize(model::Document& doc) {
         if (!bin.empty() && ctrl.binItemId != bin) return;
         if (!role.empty() && std::string(model::controlKindName(ctrl.kind)) != role) return;
         resizeControl(ctrl, oldW, oldH, newW, newH);
+        if (!ctrl.placement->treatAsChar) keepResizedEdges(*ctrl.placement, hold);
         found = true;
     };
     for (model::Section& section : doc.sections) {
@@ -2809,19 +2971,6 @@ std::string pointerEventText() { return pointerHold().eventText; }
 
 int pointerPicture() { return pointerPictureClock; }
 
-std::string selectedObjectKind(model::Document& doc) {
-    const Node* node = pointerHold().selectedObject;
-    if (!node || node->kind != NodeKind::Object) return {};
-    const ObjectExtra& o = node->ext().obj();
-    const model::Control* ctrl = anchoredControl(doc, o.anchorStory, o.anchorParagraph, o.anchorItem);
-    if (!ctrl) return "shape";
-    switch (ctrl->kind) {
-        case model::ControlKind::Picture: return "picture";
-        case model::ControlKind::Table: return "table";
-        case model::ControlKind::Equation: return "equation";
-        default: return "shape";
-    }
-}
 
 bool caretShown() {
     const PointerHold& hold = pointerHold();

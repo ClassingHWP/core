@@ -184,6 +184,22 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 표·그림·도형·수식 같은 개체는 **글자처럼 취급**하거나 **띄워 놓는다**. 한글 개체 속성의 「기본」 탭과 같은 값이다.
 값은 `paragraph` 의 `objects[].placement` 나 `{"call":"view","op":"objectProperties","object":"1:0:0"}` 로 읽고,
 `objectProperties` op 의 `set` 으로 고친다(이름이 같다). 길이는 모두 HU(1mm ≈ 283.46).
+view 의 `kind` 는 개체 갈래(`picture`·`shape`·`table`·`equation`)다. 그림이면 `bright`·`contrast`(-100~100)와
+`effect`(0 원래 그림, 1 회색조, 2 흑백)도 읽고 고친다. 도형이면 `lineType`·`lineColor`·`lineWidth`(HU)와
+`fillColor`(`"#RRGGBB"`, 없으면 `"none"`)다. `set` 의 `order` 는 같은 구역 개체 사이의 순서다: `front`(맨 앞으로),
+`forward`(앞으로), `back`(맨 뒤로), `backward`(뒤로). 한글처럼 맨 앞으로는 그 위 개체들이 한 칸씩 내려가고,
+앞으로·뒤로는 바로 위·아래 개체와 자리를 바꾼다.
+그림이면 `cropLeft`·`cropTop`·`cropRight`·`cropBottom`(HU, 원래 그림에서 잘라 낸 길이)도 읽고 고친다. 잘라도 개체 크기는
+그대로이고, 남는 그림이 없게 자르면 거절한다. `set` 의 `flip` 은 `horizontal`(좌우 대칭)·`vertical`(상하 대칭)이고
+줄 때마다 켜고 끈다. 지금 값은 view 의 `flipHorizontal`·`flipVertical` 이다. 돌린 개체를 한 방향으로 뒤집으면 한글처럼
+`rotation` 이 360-각이 되고(30 → 330) 자리와 크기는 그대로다.
+`rotation` 은 회전각(도, 0~359, 시계 방향)이고 `rotate` 는 `left`·`right`(90도씩)다. 돌려도 돌린 상자의 가운데가 그대로이고,
+`width`·`height` 는 돌리기 전 크기, `horzOffset`·`vertOffset` 은 돌린 상자의 자리다(한글과 같다). 표·수식은 돌리지 않는다.
+`skewX`·`skewY` 는 기울이기(도, -89~89, 가로는 위가 오른쪽으로, 세로는 오른쪽이 위로)이고 자리(왼쪽 위)는 그대로다.
+띄운 그림·도형 둘 이상은 `{"op":"groupObjects","objects":["1:0:0","1:0:2"]}` 로 한 묶음으로 묶는다(한글 개체 묶기).
+묶음은 문서 차례로 첫 개체 자리에 놓이고 그 놓기 값을 받으며, 응답 `object` 가 새 묶음 이름이다(나머지 개체 이름은 당겨진다).
+같은 쪽 개체만 묶고, 글자처럼 취급한 개체·표·수식은 묶지 않는다. `{"op":"ungroupObject","object":"1:0:0"}` 는 묶음을 풀어
+안 개체를 그 자리에 꺼낸다.
 
 ### 글자처럼 취급(`treatAsChar: true`)
 
@@ -279,7 +295,7 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 | `delete` | `range` | 지운다. 문단을 넘으면 문단을 합친다 |
 | `replace` | `range`, `text` | 지우고 그 자리에 넣는다. 넣은 글은 앞 글자의 모양을 따른다 |
 | `format` | `range`, `set`, `style` | `set` 의 서식을 입힌다. `style` 은 문단 스타일 이름(예: `"바탕글"`, `"개요 1"`) |
-| `insertTable` | `at`, `rows`, `cols`, `cells` | 표를 넣는다(단 폭, 글자처럼 취급). 표는 제 문단에 놓인다. `cells` 는 `[["가","나"],["다"]]` |
+| `insertTable` | `at`, `rows`, `cols`, `cells`, `width`, `height` | 표를 넣는다(단 폭, 글자처럼 취급). 표는 제 문단에 놓인다. `cells` 는 `[["가","나"],["다"]]`. `width`·`height`(HU)를 주면 한글 표 만들기의 임의 값처럼 표 폭·높이가 그 값이고 칸·줄은 고르게(누적 버림) 나눈다 |
 | `insertPicture` | `at`, `file` 또는 `base64`, `width`, `height` | 그림(png·jpg·gif·bmp)을 **글자처럼** 넣는다(`at` 자리에 `￼` 한 글자). `file` 은 CLI 가 읽는 경로, `base64` 는 파일 바이트의 base64(`data:image/png;base64,...` 도 된다). 크기는 HWPUNIT 이고 없으면 픽셀 × 75(단보다 넓으면 단 폭), 하나만 주면 그림 비율을 지킨다. 응답 `object` 가 새 그림 이름이다. 띄워 놓으려면 이어서 `objectProperties` 로 바꾼다(「개체 놓기」의 예) |
 | `setText` | `story`, `text` | 그 story 글 전체를 바꾼다. 표 칸을 고칠 때 쓴다 |
 | `setParagraph` | `story`, `paragraph`, `text` | 그 문단 글 전체를 바꾼다. 문단 모양과 첫 글자 모양은 그대로다. 글자처럼 놓인 개체(￼)가 든 문단은 개체가 지워지므로 거절한다(`NotEditable`) — 그때는 `replace` 로 글만 바꾼다 |
@@ -348,6 +364,8 @@ kind: `section`, `tableCell`, `subList`, `caption`, `masterPage`. owner: `body`,
 | `equation` | `object`, `script`, `size`(pt, 주지 않으면 그대로) | 수식을 고친다. `view` 로 지금 `script`·`size` 를 읽는다 |
 | `objectProperties` | `object`, `set` | 개체 놓기·크기. 값의 뜻과 예는 「개체 놓기」(`paragraph` 의 `placement` 이름: `treatAsChar`, `textWrap`, `textFlow`, `vertRelTo`, `horzRelTo`, `vertAlign`, `horzAlign`, `vertOffset`, `horzOffset`, `width`, `height`, `zOrder`, `flowWithText`, `allowOverlap`, 바깥 여백 `marginLeft`·`marginRight`·`marginTop`·`marginBottom`. HU). 크기는 손잡이 크기 조절과 같다(표는 칸·줄을 비율대로) |
 | `deleteObject` | `object` | 개체를 지운다(표면 칸 글까지) |
+| `groupObjects` | `objects`(개체 이름 둘 이상) | 띄운 그림·도형을 한 묶음으로(한글 개체 묶기). 응답 `object` 가 새 묶음이다 |
+| `ungroupObject` | `object` | 묶음을 풀어 안 개체를 그 자리에 꺼낸다(한글 개체 풀기) |
 
 `header` 등 쪽 탭 명령은 `{"op":"pageControl","control":"header",...}` 로도 부를 수 있다.
 값을 모르면 먼저 `view` 로 읽는다.

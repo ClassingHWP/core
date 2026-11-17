@@ -50,7 +50,28 @@ CaretMark caretMark(const model::Document& doc, const std::vector<Node>& pages) 
 }
 
 void placeCaretMark(const model::Document& doc, const std::vector<Node>& pages, const CaretMark& mark) {
-    if (mark.story <= 0) return;
+    // 편집할 때 개체를 골라 두었으면 되돌린 뒤 그 개체를 다시 고른다(숨긴 한글 2024: 캡션 넣기·크기 바꾸기를 되돌리면
+    // 그 개체가 골라진다. 사이에 다른 곳을 눌렀어도 같다).
+    if (mark.objectItem >= 0 &&
+        selectAnchoredObject(doc, pages, mark.objectStory, mark.objectParagraph, mark.objectItem)) {
+        PointerHold& hold = pointerHold();
+        hold.frameLines.clear();
+        hold.framePage = -1;
+        bumpPointerPicture();
+        return;
+    }
+    if (mark.story <= 0) {
+        // 편집 앞에는 글 캐럿이 없었다(개체를 골랐다). 되돌린 뒤 편집이 둔 캐럿(예: 지운 캡션 글)과 그 글상자의
+        // 선 없는 테두리를 남기지 않는다. 남기면 없는 글 묶음을 가리키고, 테두리는 되돌리기 전 자리에 그려진다.
+        PointerHold& hold = pointerHold();
+        if (hold.caret.hit || !hold.frameLines.empty()) {
+            hold.caret = CaretPlace{};
+            hold.frameLines.clear();
+            hold.framePage = -1;
+            bumpPointerPicture();
+        }
+        return;
+    }
     const std::vector<model::Paragraph>* paras = storyParagraphs(doc, mark.story);
     if (!paras || paras->empty()) return;
     const int last = static_cast<int>(paras->size()) - 1;
@@ -155,6 +176,23 @@ public:
         : kind_(kind) {
         if (readOnly()) return;
         caretBefore_ = caretMark(doc, pages);
+        {
+            const PointerHold& hold = pointerHold();
+            if (hold.selectedObject && hold.objectHandles && hold.selectedObject->ext().obj().anchorItem >= 0) {
+                caretBefore_.objectStory = hold.selectedObject->ext().obj().anchorStory;
+                caretBefore_.objectParagraph = hold.selectedObject->ext().obj().anchorParagraph;
+                caretBefore_.objectItem = hold.selectedObject->ext().obj().anchorItem;
+            } else if ((hold.resizeObjectPending || hold.resizeCommit) && hold.resizeItem >= 0) {
+                // 손잡이로 늘린 개체는 뗄 때 고른 것을 놓았다. 늘린 그 개체를 적는다.
+                caretBefore_.objectStory = hold.resizeStory;
+                caretBefore_.objectParagraph = hold.resizeParagraph;
+                caretBefore_.objectItem = hold.resizeItem;
+            } else if (hold.rotatePending && hold.rotateItem >= 0) {
+                caretBefore_.objectStory = hold.rotateStory;
+                caretBefore_.objectParagraph = hold.rotateParagraph;
+                caretBefore_.objectItem = hold.rotateItem;
+            }
+        }
         if (kind == UndoKind::Sections) {
             sections_ = doc.sections;
             fonts_ = doc.header.fonts;
@@ -1095,6 +1133,38 @@ EditResult editObjectProperties(model::Document& doc, std::vector<Node>& pages, 
     return result;
 }
 
+EditResult editGroupObjects(model::Document& doc, std::vector<Node>& pages, const std::vector<ObjectSpot>& spots,
+                            bool useStoredLineHeight, std::string* error) {
+    const std::vector<ObjectSpot> picked = spots.empty() ? selectedObjectSpots() : spots;
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = groupObjectsNow(doc, pages, picked, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editUngroupObject(model::Document& doc, std::vector<Node>& pages, const ObjectSpot* spot,
+                             bool useStoredLineHeight, std::string* error) {
+    ObjectSpot target;
+    if (spot) {
+        target = *spot;
+    } else {
+        const std::vector<ObjectSpot> picked = selectedObjectSpots();
+        if (picked.size() != 1) {
+            if (error) *error = picked.empty() ? "고른 묶음이 없습니다." : "묶음 하나만 고르세요.";
+            return {};
+        }
+        target = picked.front();
+    }
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = ungroupObjectNow(doc, pages, target.story, target.paragraph, target.item, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
 EditResult editDeleteObject(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
                             bool useStoredLineHeight, std::string* error) {
     UndoTrack track(doc, pages, UndoKind::Sections);
@@ -1149,6 +1219,14 @@ EditResult editMoveObject(model::Document& doc, std::vector<Node>& pages, bool u
     return result;
 }
 
+EditResult editRotateObject(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    if (!pointerHold().rotatePending) return {};
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = rotateObjectNow(doc, pages, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
 EditResult editResizeObject(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
     const PointerHold& hold = pointerHold();
     if (!hold.resizeObjectPending) return {};
@@ -1156,6 +1234,16 @@ EditResult editResizeObject(model::Document& doc, std::vector<Node>& pages, bool
     EditResult result = resizeObjectNow(doc, pages, useStoredLineHeight);
     track.finish(doc, pages, result, useStoredLineHeight);
     return result;
+}
+
+bool editCommitObjectResize(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    if (!pointerHold().resizeCommit) return false;
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result;
+    result.documentChanged = commitObjectResize(doc);
+    result.handled = result.documentChanged;
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result.documentChanged;
 }
 
 EditResult editResizeTableBorder(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {

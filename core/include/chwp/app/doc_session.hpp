@@ -215,6 +215,8 @@ public:
     // 그림 넣기. 파일 바이트만 받고 종류·크기·자리는 core 가 정한다.
     // width·height 는 HWPUNIT(0 이면 그림 크기, 한쪽만 주면 비율을 지킨다).
     render::EditResult insertPicture(const Bytes& image, std::int32_t width = 0, std::int32_t height = 0);
+    // 그림 글머리표(그림 파일을 블록·캐럿 문단의 글머리표로).
+    render::EditResult pictureBullet(const Bytes& image);
     // 편집 용지. whole 이면 모든 구역에 적용한다.
     render::EditResult applyPageSetup(const render::FormatFields& fields, bool whole);
     // 조합 중 글을 확정한다.
@@ -228,10 +230,14 @@ public:
     render::EditResult objectProperties(int story, int paragraph, int item, const render::FormatFields& fields,
                                         std::string* error = nullptr);
     render::EditResult deleteObject(int story, int paragraph, int item, std::string* error = nullptr);
+    // 개체 묶기·풀기. spots 가 비거나 spot 이 없으면 지금 고른 개체다.
+    render::EditResult groupObjects(const std::vector<render::ObjectSpot>& spots, std::string* error = nullptr);
+    render::EditResult ungroupObject(const render::ObjectSpot* spot, std::string* error = nullptr);
     // 포인터로 한 개체 편집(그린 도형 넣기, 개체 옮기기·크기 바꾸기, 표 테두리 끌기).
     render::EditResult insertDrawnShape();
     render::EditResult moveObject();
     render::EditResult resizeObject();
+    render::EditResult rotateObject();
     render::EditResult resizeTableBorder();
     // 막힌 글꼴을 한꺼번에 바꾼다. 되돌리기 한 칸이다. chosen 에 없는 글꼴은 licenseSwapTargets 의 글꼴로 바꾼다.
     // 기본 짝과 다르게 고른 것은 기억하고(licenseSwapPreferences), 기본 짝을 고르면 잊는다.

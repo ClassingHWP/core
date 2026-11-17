@@ -406,7 +406,11 @@ void readShapeInk(ByteReader& r, Control& control) {
 // 개체 공통 헤더에서 선·채우기 앞까지. 최상위는 컨트롤 ID가 한 번 더 있다.
 // 배율과 행렬 이동은 묶음 자식과 같은 행렬 쌍에서 읽는다. 크기는 바꾸지 않는다.
 void skipShapeHeader(ByteReader& r, double& scaleX, double& scaleY, double& shiftX, double& shiftY,
-                     std::uint32_t& initW, std::uint32_t& initH, std::uint32_t& curW, std::uint32_t& curH) {
+                     std::uint32_t& initW, std::uint32_t& initH, std::uint32_t& curW, std::uint32_t& curH,
+                     std::int32_t* rotation = nullptr, std::int32_t* skewX = nullptr, std::int32_t* skewY = nullptr) {
+    if (rotation) *rotation = 0;
+    if (skewX) *skewX = 0;
+    if (skewY) *skewY = 0;
     scaleX = 1;
     scaleY = 1;
     shiftX = 0;
@@ -426,7 +430,8 @@ void skipShapeHeader(ByteReader& r, double& scaleX, double& scaleY, double& shif
     curH = r.u32();
     if (r.remaining() < 16) return;
     r.u32();
-    r.u16();
+    const std::uint16_t angle = r.u16();
+    if (rotation) *rotation = angle % 360;
     r.i32();
     r.i32();
     const std::uint16_t pairs = r.u16();
@@ -463,6 +468,12 @@ void skipShapeHeader(ByteReader& r, double& scaleX, double& scaleY, double& shif
         rot.e6 = readDouble();
         affixes.push_back(scale);
         affixes.push_back(rot);
+        // 기울이기(숨긴 한글 2024: 배율 행렬 e2 = -tan 가로, e4 = -tan 세로). 첫 쌍이 이 개체의 것이다.
+        if (i == 0) {
+            const double toDeg = 180.0 / 3.14159265358979323846;
+            if (skewX && scale.e2 != 0) *skewX = static_cast<std::int32_t>(std::lround(std::atan(-scale.e2) * toDeg));
+            if (skewY && scale.e4 != 0) *skewY = static_cast<std::int32_t>(std::lround(std::atan(-scale.e4) * toDeg));
+        }
         if (scale.e1 != 0) scaleX *= scale.e1;
         if (scale.e5 != 0) scaleY *= scale.e5;
     }
@@ -2213,9 +2224,12 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
             double e6 = 0;
         };
         std::vector<Affix> affixes;
+        std::int32_t childRotation = 0;
+        std::int32_t childSkewX = 0;
+        std::int32_t childSkewY = 0;
         if (r.remaining() >= 16) {
             r.u32();
-            r.u16();
+            childRotation = r.u16() % 360;
             r.i32();
             r.i32();
             const std::uint16_t pairs = r.u16();
@@ -2243,6 +2257,11 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
                 rot.e6 = readDouble();
                 affixes.push_back(scale);
                 affixes.push_back(rot);
+                if (i == 0) {
+                    const double toDeg = 180.0 / 3.14159265358979323846;
+                    if (scale.e2 != 0) childSkewX = static_cast<std::int32_t>(std::lround(std::atan(-scale.e2) * toDeg));
+                    if (scale.e4 != 0) childSkewY = static_cast<std::int32_t>(std::lround(std::atan(-scale.e4) * toDeg));
+                }
                 if (scale.e1 != 0) scaleX *= scale.e1;
                 else flatX = true;
                 if (scale.e5 != 0) scaleY *= scale.e5;
@@ -2251,17 +2270,36 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
                 scaleYs.push_back(scaleY);
             }
         }
+        const auto through = [&](double x, double y, double& outX, double& outY) {
+            for (auto it = affixes.rbegin(); it != affixes.rend(); ++it) {
+                const double nextX = it->e1 * x + it->e2 * y + it->e3;
+                const double nextY = it->e4 * x + it->e5 * y + it->e6;
+                x = nextX;
+                y = nextY;
+            }
+            outX = x;
+            outY = y;
+        };
         double shiftX = 0;
         double shiftY = 0;
-        for (auto it = affixes.rbegin(); it != affixes.rend(); ++it) {
-            const double nextX = it->e1 * shiftX + it->e2 * shiftY + it->e3;
-            const double nextY = it->e4 * shiftX + it->e5 * shiftY + it->e6;
-            shiftX = nextX;
-            shiftY = nextY;
+        through(0, 0, shiftX, shiftY);
+        // 돌린 개체의 묶음 안 자리는 돌린 상자의 왼쪽 위(네 모서리 가운데 가장 작은 값)다(HWPX 읽기와 같다).
+        if ((childRotation != 0 || childSkewX != 0 || childSkewY != 0) && initW > 0 && initH > 0) {
+            const double cornersX[] = {0, static_cast<double>(initW), 0, static_cast<double>(initW)};
+            const double cornersY[] = {0, 0, static_cast<double>(initH), static_cast<double>(initH)};
+            for (int i = 0; i < 4; ++i) {
+                double cx = 0, cy = 0;
+                through(cornersX[i], cornersY[i], cx, cy);
+                if (i == 0 || cx < shiftX) shiftX = cx;
+                if (i == 0 || cy < shiftY) shiftY = cy;
+            }
         }
         if (r.ok()) {
             Placement place;
             place.groupInRoot = true;
+            place.rotation = childRotation;
+            place.skewX = childSkewX;
+            place.skewY = childSkewY;
             place.matrixX = static_cast<std::int32_t>(std::llround(shiftX));
             place.matrixY = static_cast<std::int32_t>(std::llround(shiftY));
             place.scaleX = scaleX;
@@ -2299,9 +2337,20 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
         double shiftY = 0;
         std::uint32_t curW = 0;
         std::uint32_t curH = 0;
-        skipShapeHeader(r, scaleX, scaleY, shiftX, shiftY, pointsW, pointsH, curW, curH);
+        std::int32_t rotation = 0;
+        std::int32_t skewX = 0;
+        std::int32_t skewY = 0;
+        skipShapeHeader(r, scaleX, scaleY, shiftX, shiftY, pointsW, pointsH, curW, curH, &rotation, &skewX, &skewY);
         if (control.placement->relativeWidth && curW > 0) control.placement->width = curW;
         if (control.placement->relativeHeight && curH > 0) control.placement->height = curH;
+        // 돌린 개체(숨긴 한글 2024): 개체 공통 크기는 돌린 상자, 요소의 현재 크기가 돌리기 전 크기다.
+        control.placement->rotation = rotation;
+        control.placement->skewX = skewX;
+        control.placement->skewY = skewY;
+        if ((rotation != 0 || skewX != 0 || skewY != 0) && curW > 0 && curH > 0) {
+            control.placement->width = curW;
+            control.placement->height = curH;
+        }
         control.placement->scaleX = scaleX;
         control.placement->scaleY = scaleY;
         control.placement->matrixX = static_cast<std::int32_t>(std::llround(shiftX));

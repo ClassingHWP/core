@@ -10,6 +10,7 @@
 //   4. 그 칸에 문단과 줄
 // 글상자·표·칸처럼 안에 문단을 담는 개체는 같은 계산을 다시 탄다.
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -294,6 +295,17 @@ struct ObjectExtra {
     Name binItemId;  // 그림 파일 참조
     model::PictureView picture;
     std::int32_t zOrder = 0;
+    // 띄운 개체의 가로·세로 맞춤 기준 크기(종이·단·문단). 가운데 맞춤 개체를 손잡이로 늘릴 때 자리를 한글과 같은 정수로
+    // 다시 잰다. 모르면 -1 이다.
+    std::int32_t alignW = -1;
+    std::int32_t alignH = -1;
+    // 돌리거나 기울인 개체(model::objectGeometry). 노드 상자는 돌리기 전 상자이고 차지하는 상자(shapeBoxW·H)의
+    // 가운데에 놓인다. 그릴 때 shapeLocal 로 돌리기 전 상자의 점을 차지하는 상자 안 자리로 옮긴다.
+    bool shaped = false;
+    std::int32_t rotation = 0;
+    std::int32_t shapeBoxW = 0;
+    std::int32_t shapeBoxH = 0;
+    std::array<double, 6> shapeLocal{1, 0, 0, 0, 1, 0};
     Name textWrap;
     int cornerRatio = 0;           // 사각형 모서리 곡률 %. 0 은 직각, 50 은 짧은 변의 반원
     int imageFillMode = -1;        // 칸 그림 채우기. -1 이면 없다. binItemId 가 그림이다

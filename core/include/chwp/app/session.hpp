@@ -364,6 +364,8 @@ EditReport editTable(const std::string& kind, bool after, int count, int rows, i
 // lineType, lineWidth, lineColor, vertAlign, horzAlign, direction, margin, preset, wrap, caption, comma)이다.
 EditReport editTableFields(const std::string& kind, const render::FormatFields& fields);
 EditReport editInsertPicture(const Bytes& image);
+// 그림 글머리표: 고른 그림 파일 바이트를 블록(캐럿) 문단의 글머리표로 건다(한글 그림 글머리표 사용자 정의 모양).
+EditReport editPictureBullet(const Bytes& image);
 EditReport editStyle(const render::FormatPatch& patch);
 EditReport editPageSetup(const render::FormatFields& fields, bool wholeDocument);
 // 서식 대화 상자(0 글자 모양, 1 문단 모양, 2 편집 용지, 3 표 넣기). 셸은 칸 이름과 칸에 친 값을 그대로 넘긴다
@@ -548,6 +550,10 @@ InputReport input(const InputMessage& msg);
 // cellBlock(IDC_Cell_Block), block(IDC_Body_Block), table(IDC_Table), body(IDC_Edit_Body). 셸은 오른쪽 단추 누름·뗌을
 // 그대로 input 으로 넘기고, 뗀 뒤 이것을 물어 그 갈래의 메뉴를 띄운다.
 std::string contextMenuKind();
+// 고른 개체의 개체 속성(한글 ObjectPropertyDlg 의 크기·위치·배치·바깥 여백, 그림이면 밝기·대비·효과).
+// 이름은 에이전트 objectProperties 와 같다. 고른 개체가 없으면 빈 값·바꾸지 않음이다.
+render::FormatFields selectedObjectView();
+EditReport editSelectedObject(const render::FormatFields& fields);
 
 // 단축키 표. 키를 누른 그 순간 기본 동작을 막아야 하는 셸이 이 표를 받아 두고 찾아본다.
 // key 는 플랫폼 키 이름이다(웹: 글자 키는 KeyboardEvent.code 인 KeyZ, 나머지는 key 인 ArrowLeft·F7).

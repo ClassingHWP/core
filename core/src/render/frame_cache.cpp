@@ -160,7 +160,12 @@ int pageCachePercent(int percent) {
     return percent;
 }
 
-int restingMaskZoom(int percent) { return maskZoomPercent(pageCachePercent(percent), false); }
+// 100% 를 넘으면 쪽 텍스처가 그 배율이라 마스크도 그 배율로 찍는다. 10% 칸으로 올려 찍은 마스크를 줄여 붙이면
+// 1 픽셀 가로 획이 두 줄에 반씩 퍼져 흐려지거나 사라진다(125% 의 돋움 8pt: "두"의 ㄷ 아래 획, "점"의 ㅈ 윗 획).
+int restingMaskZoom(int percent) {
+    const int cache = pageCachePercent(percent);
+    return cache > 100 ? std::min(cache, 800) : maskZoomPercent(cache, false);
+}
 
 FrameCache::FrameCache() { registerCachePool(pool_, kTileCacheBudget); }
 
@@ -1345,7 +1350,7 @@ void FrameCache::plan(ViewPlan& plan, const std::vector<Node>& pages, const std:
                 srcPercent = 100;
             }
         }
-        const bool nearest = frame.kind >= 3;
+        const bool nearest = frame.kind >= 3 && !isObjectTileKind(frame.kind);
         if (!srcId) continue;
         int localX = frame.x;
         int localY = frame.y;
@@ -1999,7 +2004,7 @@ std::vector<PageSprite> readyPageSprites(const FrameCache& frames, int page, int
         item.h = frame.h;
         item.sw = ready.bitmap->width;
         item.sh = ready.bitmap->height;
-        item.nearest = frame.kind >= 3;
+        item.nearest = frame.kind >= 3 && !isObjectTileKind(frame.kind);
         item.percent = framePercent;
         item.rgba = hasBitmap ? ready.bitmap->rgba.data() : nullptr;
         item.layer = std::clamp(frame.layer, 0, 3);

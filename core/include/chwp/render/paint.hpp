@@ -101,6 +101,14 @@ struct FrameDesc {
 // 칸 테두리 여백. 픽셀로 고정이라 배율에 따라 커지지 않는다.
 constexpr int kFramePad = 8;
 
+// 큰 개체(쪽 너비만 한 선·다각형 등)의 조각 칸. 한 칸으로 구우면 확대 칸 한도(웹 2048 픽셀)를 넘어 100% 칸을
+// 늘려 붙이게 되고, 대각선이 계단처럼 깨진다. 표 테두리처럼 조각으로 나눠 지금 배율로 굽는다.
+// kind 는 kObjectTileKind + 조각 번호다. 조각은 자기 상자 밖을 칠하지 않는다(이웃 조각과 겹쳐 진해지지 않게).
+constexpr int kObjectTileKind = 300;
+constexpr int kObjectTileLimit = 200;
+constexpr std::int32_t kObjectTileHu = 12000;  // 1000% 에서도 한 변이 2048 픽셀 안이다
+constexpr bool isObjectTileKind(int kind) { return kind >= kObjectTileKind && kind < kObjectTileKind + kObjectTileLimit; }
+
 // 다른 배율로 그린 칸을 지금 배율의 내용 상자에 맞춘다. 여백까지 같이 늘리지 않는다.
 void placeZoomedFrame(int dstX, int dstY, int dstPixelHeight, int srcPixelHeight, int srcW, int srcH, int& x, int& y,
                       int& w, int& h);
@@ -275,6 +283,7 @@ struct CaretStatus {
     bool cellStart = false;  // 블록 없이 캐럿이 표 칸 맨 앞이다(Ctrl+Backspace 가 줄을 뺀다)
     int note = 0;            // 캐럿이 각주(1)·미주(2) 안이다(셸은 주석 탭을 보인다)
     bool master = false;     // 바탕쪽 편집 중이다(셸은 바탕쪽 탭을 보인다)
+    std::string object;      // 고른 개체 갈래(selectedObjectKind). picture 면 셸은 그림 탭을 보인다
     bool operator==(const CaretStatus&) const = default;
 };
 
@@ -379,6 +388,8 @@ void selectionEdgePoint(double& viewX, double& viewY);
 std::string pointerPropertyText();
 // 개체 크기 조절을 문서에 반영한다. 바뀐 것이 있으면 true.
 bool commitObjectResize(model::Document& doc);
+// commitObjectResize 를 되돌리기 한 칸으로 한다(그림 손잡이 늘리기). 되돌리면 늘린 그림을 다시 고른다.
+bool editCommitObjectResize(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
 // 처음 크기는 두고 배율만 새 상자에 맞춘다. 배율 1이면 지금 크기가 처음 크기다.
 void applyObjectResize(model::Placement& place, std::uint32_t newWidth, std::uint32_t newHeight);
 
@@ -398,7 +409,9 @@ std::string pointerEventText();
 // 커서·블록이 바뀌면 늘어난다. 화면 루프가 다시 그릴지 볼 때 쓴다.
 int pointerPicture();
 // 고른 개체의 갈래: picture(그림), shape(도형·묶음·글상자·OLE), table, equation. 고른 개체가 없으면 빈 글.
-std::string selectedObjectKind(model::Document& doc);
+std::string selectedObjectKind(const model::Document& doc);
+// 고른 개체가 붙은 자리(문서의 그 컨트롤). 고른 개체가 없으면 거짓.
+bool selectedObjectAnchor(int& story, int& paragraph, int& item);
 // 깜빡일 커서가 있으면 true다.
 bool caretShown();
 // 커서·조합 상자의 현재 깜빡임 주기(0: 켜짐, 1: 꺼짐, -1: 없음).
@@ -694,10 +707,17 @@ EditResult editApplyPageSetup(model::Document& doc, std::vector<Node>& pages, co
 // - fitParagraph: 너비 문단에 맞춤. 단에 맞춤 폭에서 캐럿 문단의 왼쪽·오른쪽 여백을 빼고, 가로 기준은 문단이다.
 //   아니면 단에 맞춤(문단 여백과 상관없이 단 폭, 가로 기준 단)이다.
 // - treatAsChar: 글자처럼 취급. 끄면 같은 자리(문단 기준 세로, 본문과의 배치 자리 차지)에 띄운 표다.
+// - width·height: 너비·높이 임의 값(HWPUNIT, 0 이면 맞춤·자동). 표 폭·높이는 그 값이고, 칸은 누적 버림으로 나눈다
+//   (100 mm = 28346 → 3칸 9448·9449·9449, 30 mm = 8503 → 3줄 2834·2834·2835). 가로 기준은 단이다.
 struct TableCreateOptions {
     bool fitParagraph = false;
     bool treatAsChar = true;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
 };
+
+// 표 만들기 대화 상자의 mm 값을 HWPUNIT 으로. 한글은 버린다(100 mm → 28346, 30 mm → 8503).
+std::int32_t tableCreateUnitFromMm(double mm);
 
 // 캐럿 자리에 줄 rows·칸 cols 표를 넣는다. 기본은 한글 표 만들기(너비 단에 맞춤, 글자처럼 취급)와 같은 표이고,
 // 캐럿은 첫 칸으로 간다. 블록이 있으면 지우고 넣는다.
@@ -709,6 +729,7 @@ enum class TableEditKind {
     InsertRows, InsertColumns, DeleteRows, DeleteColumns, Merge, Split,
     CellBorder,   // 셀 테두리 단추(border)
     CellFill,     // 셀 배경색(color)
+    CellShade,    // 셀 음영: count 1~6 증가, -1~-6 감소, 0 음영 없음(model::shadeTableCells)
     CellBorderFill,  // 셀 테두리/배경 대화 상자(borderSides, setFill·color)
     EqualWidth,   // 셀 너비를 같게
     EqualHeight,  // 셀 높이를 같게
@@ -1079,6 +1100,26 @@ EditResult editObjectProperties(model::Document& doc, std::vector<Node>& pages, 
 // 개체를 지운다(표면 칸 글까지). 캐럿은 개체가 있던 자리로 간다. 되돌리기 한 칸이다.
 EditResult editDeleteObject(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
                             bool useStoredLineHeight = false, std::string* error = nullptr);
+// 그림 글머리표: 그림 파일(png·jpg·gif·bmp)을 문서에 넣고 블록(캐럿) 문단의 글머리표로 건다. 되돌리기 한 칸이다.
+EditResult editPictureBullet(model::Document& doc, std::vector<Node>& pages, const Bytes& image,
+                             bool useStoredLineHeight = false);
+// 개체 회전(한글 회전 단추의 개체 회전)을 켜고 끈다. 켜면 고른 개체의 손잡이를 끌어 돌린다. 켰으면 참.
+bool toggleObjectRotateMode();
+// 손잡이를 끌어 돌린 각을 넣는다. 끌어 돌리지 않았으면 handled 가 거짓이다. 되돌리기 한 칸이다.
+EditResult editRotateObject(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
+// 개체 자리(글 묶음·문단·문단 안 항목 순번).
+struct ObjectSpot {
+    int story = -1;
+    int paragraph = -1;
+    int item = -1;
+};
+// 개체 묶기(한글 Group): 띄운 그림·도형·묶음 둘 이상을 한 묶음으로. 묶음은 문서 차례로 첫 개체 자리에 놓이고 고른다.
+// spots 가 비면 지금 고른 개체들(여러 개체 고르기)이다. 되돌리기 한 칸이다.
+EditResult editGroupObjects(model::Document& doc, std::vector<Node>& pages, const std::vector<ObjectSpot>& spots,
+                            bool useStoredLineHeight = false, std::string* error = nullptr);
+// 개체 풀기(한글 Ungroup): 묶음 안 개체를 묶음 자리에 꺼내 모두 고른다. spot 이 없으면 지금 고른 개체다.
+EditResult editUngroupObject(model::Document& doc, std::vector<Node>& pages, const ObjectSpot* spot,
+                             bool useStoredLineHeight = false, std::string* error = nullptr);
 
 // 수식(equation_commands.cpp). 한글 2024 수식 넣기(Ctrl+N,M)·고치기와 같다.
 // 수식 편집기에 채울 값: editing(고른 수식을 고치는지), script, baseUnit(1000 = 10pt).

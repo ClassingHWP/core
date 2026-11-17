@@ -944,6 +944,16 @@ struct Painter {
     // 세로쓰기 본문(turned). 돌린 틀의 비트맵에 그린 뒤 시계 방향으로 돌려 붙인다.
     void walkTurned(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin);
     bool turning = false;
+    // 돌린 개체(회전각). 돌리기 전 상자를 따로 비트맵에 모두 그린 뒤(글자·그림·테두리 칸 없이) 그 가운데를 중심으로
+    // 돌려 붙인다.
+    void walkRotated(const Node& node, std::int32_t ox, std::int32_t oy, bool inObject, int borderJoin);
+    bool rotating = false;
+    // 돌린 개체에서 이 노드의 자식 가운데 개체만(true) 또는 개체가 아닌 것만(false) 그린다. 한글은 글상자 글을 돌리지 않는다.
+    const Node* childFilterNode = nullptr;
+    bool childFilterObjects = true;
+    bool skipRotatedText = false;  // 칸 굽기: 돌린 개체 칸(9)은 글을 줄 칸에 맡긴다
+    // 돌린 개체의 글(개체가 아닌 자식)만 돌리지 않고 그린다.
+    void paintUnrotatedText(const Node& node, std::int32_t x, std::int32_t y);
     // 돌린 틀 안에서 만난 세운 개체. 틀을 종이로 돌려 놓은 뒤 종이 자리(x, y)에 그대로 그린다.
     struct UprightLater {
         const Node* node = nullptr;
