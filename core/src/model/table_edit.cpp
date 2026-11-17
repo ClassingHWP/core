@@ -654,6 +654,53 @@ TableEdit setTableCellBorders(Table& table, int row0, int col0, int row1, int co
     return out;
 }
 
+TableEdit setTableCellBorderFill(Table& table, int row0, int col0, int row1, int col1, const CellBorderFillSpec& spec,
+                                 const BorderFillAccess& fills) {
+    TableEdit out;
+    if (out.error = checkBlock(table, row0, col0, row1, col1); !out.ok()) return out;
+    const auto inside = [&](const TableCell& c) {
+        return static_cast<int>(c.row) >= row0 && lastRow(c) <= row1 && static_cast<int>(c.col) >= col0 && lastCol(c) <= col1;
+    };
+    // 칸 한 변(0 위, 1 아래, 2 왼쪽, 3 오른쪽)이 놓인 선. setTableCellBorders 와 같은 갈래다.
+    const auto lineOf = [&](const TableCell& c, int side) -> const std::optional<BorderSide>* {
+        const bool in = inside(c);
+        if (side <= 1) {
+            if (static_cast<int>(c.col) > col1 || lastCol(c) < col0) return nullptr;
+            const int y = side == 0 ? static_cast<int>(c.row) : lastRow(c) + 1;
+            if (y == row0) return (in && side == 0) || (!in && side == 1) ? &spec.top : nullptr;
+            if (y == row1 + 1) return (in && side == 1) || (!in && side == 0) ? &spec.bottom : nullptr;
+            return in ? &spec.insideHorz : nullptr;
+        }
+        if (static_cast<int>(c.row) > row1 || lastRow(c) < row0) return nullptr;
+        const int x = side == 2 ? static_cast<int>(c.col) : lastCol(c) + 1;
+        if (x == col0) return (in && side == 2) || (!in && side == 3) ? &spec.left : nullptr;
+        if (x == col1 + 1) return (in && side == 3) || (!in && side == 2) ? &spec.right : nullptr;
+        return in ? &spec.insideVert : nullptr;
+    };
+    for (TableCell& c : table.cells) {
+        BorderFill f = fills.read(c.borderFillId);
+        bool touched = false;
+        for (int side = 0; side < 4; ++side) {
+            const std::optional<BorderSide>* line = lineOf(c, side);
+            if (!line || !line->has_value()) continue;
+            BorderSide& s = side == 0 ? f.top : side == 1 ? f.bottom : side == 2 ? f.left : f.right;
+            if ((*line)->type == "NONE") {
+                s.type = "NONE";
+            } else {
+                s = **line;
+            }
+            touched = true;
+        }
+        if (spec.faceColor && inside(c)) {
+            f.faceColor = spec.faceColor->empty() ? "none" : *spec.faceColor;
+            touched = true;
+        }
+        if (touched) c.borderFillId = fills.intern(f);
+    }
+    out.focusCell = firstBlockCell(table, row0, col0);
+    return out;
+}
+
 TableEdit fillTableCells(Table& table, int row0, int col0, int row1, int col1, const std::string& faceColor,
                          const BorderFillAccess& fills) {
     TableEdit out;

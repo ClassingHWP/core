@@ -345,6 +345,65 @@ EditResult insertHyperlinkNow(model::Document& doc, std::vector<Node>& pages, co
     return makeEditResult(doc, true, true, cur.story, paraIdx, &relayout);
 }
 
+// 날짜/시간 코드 넣기(한글 InsertFieldDateTime, Ctrl+K,C). 숨긴 한글 2024 로 본 것: 캐럿 자리에 DATE 필드(%dte,
+// 명령 ":1년 2월 3일", DateNation KOR, DateFormat "YYYY년 M월 D일", 기타 속성 8, 고칠 수 없음)를 넣고 그 안에 오늘
+// 날짜 글(shown)을 캐럿 글자 모양으로 둔다. 고른 글이 있으면 지우고 넣는다. 캐럿은 필드 끝 뒤다.
+EditResult insertDateFieldNow(model::Document& doc, std::vector<Node>& pages, const std::string& shown,
+                              bool useStoredLineHeight) {
+    if (readOnly() || shown.empty()) return {};
+    PointerHold& hold = pointerHold();
+    const PointerCursor cur = pointerCursor();
+    if (!cur.active || cur.story <= 0) return {};
+    if (!storyParagraph(doc, cur.story, cur.paragraph)) return {};
+    clearComposition(hold);
+    int paraIdx = cur.paragraph;
+    int charIndex = 0;
+    if (cur.hasSelection) {
+        deleteSelectionRange(doc, pages, cur.story, cur.startParagraph, cur.startOffset, cur.endParagraph,
+                             cur.endOffset, paraIdx, charIndex);
+    } else {
+        charIndex = offsetToCharIndex(doc, pages, cur.story, paraIdx, cur.offset);
+    }
+    model::Paragraph* host = storyParagraph(doc, cur.story, paraIdx);
+    if (!host) return {};
+    const std::uint32_t baseShape = charShapeAtParagraphChar(*host, charIndex, false);
+
+    model::Control begin;
+    begin.kind = model::ControlKind::Field;
+    begin.ctrlId = "%dte";
+    begin.fieldType = "DATE";
+    begin.command = ":1년 2월 3일";
+    begin.fieldStrings = {{"DateNation", "KOR"}, {"DateFormat", "YYYY년 M월 D일"}};
+    begin.fieldExtra = 8;
+    model::Control end;
+    end.kind = model::ControlKind::FieldEnd;
+    end.ctrlId = "fend";
+
+    model::Paragraph right = splitParagraphAt(*host, charIndex);
+    model::Run run;
+    run.charShapeId = baseShape;
+    run.items.push_back(model::InlineItem::makeControl(std::move(begin)));
+    run.items.push_back(model::InlineItem::makeText(shown));
+    run.items.push_back(model::InlineItem::makeControl(std::move(end)));
+    host->runs.push_back(std::move(run));
+    for (model::Run& r : right.runs) {
+        if (!r.items.empty()) host->runs.push_back(std::move(r));
+    }
+    host->lineSegs.clear();
+    hold.preferredX = -1;
+    model::ensureParagraphIds(doc);
+    rebuildStoryMap(doc);
+    invalidateLinePlaces({}, true);
+    pages = layoutPages(doc, -1, useStoredLineHeight, useStoredLineHeight);
+    EditRelayoutResult relayout;
+    relayout.fullInvalidation = true;
+    relayout.pageListChanged = true;
+    const int after = charIndex + utf8CodePointCount(shown);
+    const int afterOff = charIndexToOffset(doc, pages, cur.story, paraIdx, after);
+    setPointerCursor(doc, pages, model::CursorPos{cur.story, paraIdx, afterOff});
+    return makeEditResult(doc, true, true, cur.story, paraIdx, &relayout);
+}
+
 EditResult leaveNoteNow(model::Document& doc, std::vector<Node>& pages) {
     const PointerCursor cur = pointerCursor();
     if (!cur.active || cur.story <= 0) return {};

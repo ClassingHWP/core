@@ -616,9 +616,9 @@ render::EditResult DocSession::applyFormat(const render::FormatPatch& asked) {
     return result;
 }
 
-render::EditResult DocSession::insertTable(int rows, int cols) {
+render::EditResult DocSession::insertTable(int rows, int cols, const render::TableCreateOptions& options) {
     const render::EditScope scope = wholeScope();
-    render::EditResult result = render::editInsertTable(doc, pages, rows, cols, storedLineHeight);
+    render::EditResult result = render::editInsertTable(doc, pages, rows, cols, storedLineHeight, options);
     noteEdit(result);
     return result;
 }
@@ -932,6 +932,13 @@ render::EditResult DocSession::insertNote(bool endnote, std::string* error) {
 render::EditResult DocSession::insertHyperlink(const std::string& text, const std::string& url, std::string* error) {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editInsertHyperlink(doc, pages, text, url, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::insertDateField(const std::string& shown) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editInsertDateField(doc, pages, shown, storedLineHeight);
     noteEdit(result);
     return result;
 }

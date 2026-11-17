@@ -115,7 +115,7 @@ public:
     render::EditResult resolveChanges(bool accept, const std::string& scope, std::string* why = nullptr);
     render::EditResult moveToChange(bool forward);
     render::EditResult applyFormat(const render::FormatPatch& patch);
-    render::EditResult insertTable(int rows, int cols);
+    render::EditResult insertTable(int rows, int cols, const render::TableCreateOptions& options = {});
     // 표 구조 편집(줄·칸 넣기·지우기, 합치기, 나누기). 고치지 못하면 error 에 이유를 적는다.
     render::EditResult editTable(const render::TableEditCommand& cmd, std::string* error = nullptr);
     // 쪽·단·구역·단 설정 나누기. 캐럿 자리에서 나눈다.
@@ -194,6 +194,7 @@ public:
     // 각주·미주 넣기. 하지 못하면 error 에 이유를 적는다.
     render::EditResult insertNote(bool endnote, std::string* error = nullptr);
     render::EditResult insertHyperlink(const std::string& text, const std::string& url, std::string* error = nullptr);
+    render::EditResult insertDateField(const std::string& shown);
     // 수식 넣기·고치기(render::editInsertEquation·editEquation). baseUnit 1000 = 10pt.
     render::FormatFields equationView();
     render::EditResult insertEquation(const std::string& script, std::int32_t baseUnit, std::string* error = nullptr);

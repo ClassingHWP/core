@@ -2809,6 +2809,20 @@ std::string pointerEventText() { return pointerHold().eventText; }
 
 int pointerPicture() { return pointerPictureClock; }
 
+std::string selectedObjectKind(model::Document& doc) {
+    const Node* node = pointerHold().selectedObject;
+    if (!node || node->kind != NodeKind::Object) return {};
+    const ObjectExtra& o = node->ext().obj();
+    const model::Control* ctrl = anchoredControl(doc, o.anchorStory, o.anchorParagraph, o.anchorItem);
+    if (!ctrl) return "shape";
+    switch (ctrl->kind) {
+        case model::ControlKind::Picture: return "picture";
+        case model::ControlKind::Table: return "table";
+        case model::ControlKind::Equation: return "equation";
+        default: return "shape";
+    }
+}
+
 bool caretShown() {
     const PointerHold& hold = pointerHold();
     if (!hold.boxes.empty()) return false;

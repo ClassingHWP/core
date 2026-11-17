@@ -35,6 +35,7 @@
 #include "chwp/input/pointer.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/unit.hpp"
+#include "chwp/model/memo.hpp"
 #include "chwp/writer.hpp"
 #include "chwp/render/cache_budget.hpp"
 #include "chwp/render/frame_cache.hpp"
@@ -2219,6 +2220,20 @@ EditReport editInsertHyperlink(const std::string& text, const std::string& url) 
     return report;
 }
 
+// 날짜/시간 코드(Ctrl+K,C, 한글 InsertFieldDateTime): 오늘 날짜를 보이는 날짜 필드.
+EditReport editInsertDateField() {
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    const chwp::render::EditResult res = gDoc.insertDateField(chwp::model::koreanDateText(chwp::model::filetimeNow()));
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) {
+        resumeCrewAfterEdit(res);
+    }
+    frameAfterEdit();
+    return makeEditReport(res);
+}
+
 render::FormatFields equationViewNow() {
     // 미리 보기를 그릴 수식 글꼴을 편집기를 열 때 받는다(이미 있으면 받지 않는다).
     std::vector<std::string> wants;
@@ -2379,7 +2394,53 @@ EditReport editClickHere(const render::FormatFields& fields) {
     return report;
 }
 
+// 한글 2024 지우기 명령. 지울 범위는 이동 키로 블록을 잡아 정하고 Delete 하나로 지운다(되돌리기 한 칸).
+// 숨긴 한글 2024 로 확인한 규칙이다.
+// - deleteWord(DeleteWord): 캐럿부터 다음 단어 앞까지(Ctrl+→ 와 같은 자리). 문단 끝이면 다음 문단을 붙인다.
+// - deleteWordBack(DeleteWordBack): 앞 단어 처음(Ctrl+← 자리)부터 캐럿까지. 문단 처음이면 앞 문단에 붙인다.
+//   블록이 있으면 둘 다 블록을 지운다.
+// - deleteLine(DeleteLine): 캐럿 줄. 한 줄짜리 문단은 문단째 지우고(마지막 문단이면 비운다), 여러 줄 문단은 그 줄 글만.
+// - deleteLineEnd(DeleteLineCurEnd): 캐럿부터 줄 끝까지. 문단 나눔은 남긴다.
+//   블록이 있으면 줄 지우기 둘은 아무것도 하지 않는다.
+EditReport deleteByMoves(const std::string& command) {
+    using chwp::render::EditKey;
+    const auto key = [](EditKey k) { return static_cast<int>(k); };
+    const bool word = command == "deleteWord" || command == "deleteWordBack";
+    if (chwp::render::pointerCursor().hasSelection) {
+        if (!word) return makeEditReport(chwp::render::EditResult{});
+        return editKey(key(EditKey::Delete), false, false, false);
+    }
+    if (command == "deleteWord") {
+        editKey(key(EditKey::ArrowRight), true, true, false);
+    } else if (command == "deleteWordBack") {
+        editKey(key(EditKey::ArrowLeft), true, true, false);
+    } else {
+        if (command == "deleteLine") editKey(key(EditKey::Home), false, false, false);
+        const chwp::render::PointerCursor lineStart = chwp::render::pointerCursor();
+        editKey(key(EditKey::End), true, false, false);
+        if (command == "deleteLine") {
+            // 줄 끝이 문단 끝이면 한 칸 더 가면 다음 문단이다. 줄 처음도 문단 처음이면 문단째 지운다.
+            const chwp::render::PointerCursor lineEnd = chwp::render::pointerCursor();
+            editKey(key(EditKey::ArrowRight), true, false, false);
+            const chwp::render::PointerCursor next = chwp::render::pointerCursor();
+            const bool paraEnd = next.focusParagraph != lineEnd.focusParagraph;
+            if (paraEnd && lineStart.offset != 0) editKey(key(EditKey::ArrowLeft), true, false, false);
+            if (!paraEnd && next.focusOffset != lineEnd.focusOffset) editKey(key(EditKey::ArrowLeft), true, false, false);
+        }
+    }
+    if (!chwp::render::pointerCursor().hasSelection) return makeEditReport(chwp::render::EditResult{});
+    return editKey(key(EditKey::Delete), false, false, false);
+}
+
 EditReport editShortcut(const std::string& command) {
+    if (command == "deleteWord" || command == "deleteWordBack" || command == "deleteLine" ||
+        command == "deleteLineEnd") {
+        return deleteByMoves(command);
+    }
+    // 날짜/시간 문자열(Ctrl+K,D, 한글 InsertStringDateTime)은 오늘 날짜 글을 친 것과 같다(숨긴 한글 2024: 필드 없이
+    // "2026년 11월 17일"). 날짜/시간 코드(Ctrl+K,C)는 같은 글을 담은 날짜 필드다.
+    if (command == "dateString") return editText(chwp::model::koreanDateText(chwp::model::filetimeNow()), false);
+    if (command == "dateField") return editInsertDateField();
     // Hangul StyleShortcut1..10 (Ctrl+1..0, Ctrl+Alt+1..0): the Nth style in the document style list.
     if (command.rfind("styleShortcut", 0) == 0) {
         const int index = std::atoi(command.c_str() + 13) - 1;
@@ -2619,6 +2680,18 @@ EditReport editTableFields(const std::string& kind, const render::FormatFields& 
     cmd.formulaFunc = static_cast<int>(number("formulaFunc", 0));
     cmd.formulaText = text("formula");
     cmd.formulaFormat = text("format");
+    // 셀 테두리/배경: 변마다 "<변>.type"·"<변>.width"(HWPUNIT)·"<변>.color". type 이 없는 변은 그대로 둔다.
+    for (const char* side : {"top", "bottom", "left", "right", "insideHorz", "insideVert"}) {
+        const std::string prefix = side;
+        const std::string type = text((prefix + ".type").c_str());
+        if (type.empty()) continue;
+        const std::string color = text((prefix + ".color").c_str());
+        const double width = number((prefix + ".width").c_str(), 0);
+        cmd.borderSides.emplace_back(side, model::BorderSide{type, color.empty() ? std::string("#000000") : color,
+                                                             width > 0 ? static_cast<std::int32_t>(width)
+                                                                       : chwp::mmToHu(0.12)});
+    }
+    cmd.setFill = number("setFill", 0) != 0;
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
     chwp::render::PageFillGuard guard;
@@ -2635,12 +2708,20 @@ EditReport editTableFields(const std::string& kind, const render::FormatFields& 
 }
 
 // 표 넣기. 줄·칸 개수만 받고 표 모양은 코어가 정한다.
-EditReport editInsertTable(int rows, int cols) {
+EditReport editInsertTable(int rows, int cols, const render::FormatFields& fields) {
+    render::TableCreateOptions options;
+    for (const auto& [name, value] : fields) {
+        if (name == "widthFit") {
+            if (const std::string* s = std::get_if<std::string>(&value)) options.fitParagraph = *s == "paragraph";
+        } else if (name == "treatAsChar") {
+            if (const bool* b = std::get_if<bool>(&value)) options.treatAsChar = *b;
+        }
+    }
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
     chwp::render::PageFillGuard guard;
     const chwp::render::EditResult res =
-        gDoc.insertTable(rows, cols);
+        gDoc.insertTable(rows, cols, options);
     if (res.documentChanged) syncEditedDocument(res);
     if (wasCrew) {
         resumeCrewAfterEdit(res);
@@ -5522,6 +5603,8 @@ bool paperPoint(double vx, double vy, bool clampToNearest, int& page, int& x, in
 
 // 마지막으로 누른 포인터가 Shift 와 함께였는지(InputPointer::shift).
 bool gPointerShift = false;
+// 오른쪽 단추를 누를 때 고른 것(블록·칸 블록·개체)이 있었는지. 있으면 그 누름·뗌은 아무것도 바꾸지 않는다.
+bool gRightKeeps = false;
 
 SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     SelectionReport out;
@@ -5665,6 +5748,18 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     return out;
 }
 
+std::string contextMenuKind() {
+    const std::string object = chwp::render::selectedObjectKind(gDoc.doc);
+    if (object == "picture") return "picture";
+    if (object == "table") return "table";
+    if (!object.empty()) return "shape";
+    const chwp::render::CaretStatus status = chwp::render::caretStatus(gDoc.doc, gDoc.pages);
+    if (status.cellBlock) return "cellBlock";
+    if (chwp::render::pointerCursor().hasSelection) return "block";
+    if (status.table) return "table";
+    return "body";
+}
+
 // 뷰포트 장치 픽셀 한 칸이 그 쪽에서 몇 HWPUNIT 인지. 논리 픽셀 기준이라 dpr 을 곱한다.
 double huPerLogicalAt(int page) {
     if (page < 0 || page >= static_cast<int>(gDoc.pages.size())) return 0;
@@ -5733,6 +5828,10 @@ const std::vector<KeyBinding>& keyBindings() {
     // 편집 키 번호는 render::EditKey 차례다.
     static const std::vector<KeyBinding> table = [] {
         std::vector<KeyBinding> out;
+        // 한글 2024: Ctrl+Insert 복사, Shift+Delete 오려 두기, Shift+Insert 붙이기. 같은 키의 편집 키보다 앞이다.
+        out.push_back(KeyBinding{"Insert", 0, true, false, "copy", 0, false});
+        out.push_back(KeyBinding{"Delete", 1, false, false, "cut", 0, false});
+        out.push_back(KeyBinding{"Insert", 1, false, false, "paste", 0, false});
         const std::pair<const char*, int> edit[] = {{"Backspace", 1}, {"Delete", 2}, {"Enter", 3}, {"ArrowLeft", 4},
                                                    {"ArrowRight", 5}, {"ArrowUp", 6}, {"ArrowDown", 7}, {"Home", 8},
                                                    {"End", 9}, {"Tab", 10}, {"Insert", 13}};
@@ -5778,6 +5877,16 @@ const std::vector<KeyBinding>& keyBindings() {
         out.push_back(KeyBinding{"Enter", 0, true, true, "breakColumnDef", 0, false});
         out.push_back(KeyBinding{"Enter", 1, false, true, "breakSection", 0, false});
         out.push_back(KeyBinding{"Backspace", 0, true, false, "subtractRow", 0, false, "cellStart"});
+        // 표 안 Alt+Insert 줄/칸 추가하기, Alt+Delete 줄/칸 지우기 대화 상자(한글 InsertTableRowColumnDlg·DeleteTableRowColumnDlg).
+        out.push_back(KeyBinding{"Insert", 0, false, true, "insertRowColDialog", 0, false, "table"});
+        out.push_back(KeyBinding{"Delete", 0, false, true, "deleteRowColDialog", 0, false, "table"});
+        // 한글 2024 지우기 단축키: DeleteWordBack(Ctrl+Backspace), DeleteWord(Ctrl+Delete·Ctrl+T),
+        // DeleteLine(Ctrl+Y), DeleteLineCurEnd(Alt+Y). 브라우저는 Ctrl+T 를 막지 못해 웹에서는 Ctrl+Delete 를 쓴다.
+        out.push_back(KeyBinding{"Backspace", 0, true, false, "deleteWordBack", 0, false});
+        out.push_back(KeyBinding{"Delete", 0, true, false, "deleteWord", 0, false});
+        out.push_back(KeyBinding{"KeyT", 0, true, false, "deleteWord", 0, false});
+        out.push_back(KeyBinding{"KeyY", 0, true, false, "deleteLine", 0, false});
+        out.push_back(KeyBinding{"KeyY", 0, false, true, "deleteLineEnd", 0, false});
         // 찾기
         out.push_back(KeyBinding{"KeyF", 0, true, false, "findDialog", 0, false});
         out.push_back(KeyBinding{"KeyH", 0, true, false, "replaceDialog", 0, false});
@@ -5856,6 +5965,8 @@ const std::vector<KeyBinding>& keyBindings() {
         chord("KeyQ", "KeyR", "linkForward");      // HyperlinkNext
         chord("KeyK", "KeyA", "updateAllToc");     // UpdateAllTOC
         chord("KeyK", "KeyH", "hyperlinkDialog");  // HyperlinkDlg
+        chord("KeyK", "KeyD", "dateString");       // DateTimeString(날짜/시간 문자열)
+        chord("KeyK", "KeyC", "dateField");        // InsertDateTimeField(날짜/시간 코드)
         chord("KeyN", "KeyN", "footnote");         // Footnotes
         chord("KeyN", "KeyE", "endnote");          // Endnotes
         chord("KeyN", "KeyT", "tableDialog");      // InsertTableDlg
@@ -6090,6 +6201,21 @@ chwp::input::Camera applyEmbed(const EmbedCommand& command, bool glide) {
 
 InputReport input(const InputMessage& msg) {
     const std::string& type = msg.type;
+    // 마우스 오른쪽 단추(상황 메뉴): 고른 것이 있으면 그대로 둔다(메뉴가 그것에 걸린다). 없으면 왼쪽 누름처럼 그 자리에
+    // 캐럿을 두거나 개체를 고른다. 누른 채 끌기는 하지 않는다. 메뉴 갈래는 뗀 뒤 contextMenuKind 가 정한다.
+    if (type == "pointer" && msg.pointer.button == 2 &&
+        static_cast<chwp::input::Device>(msg.pointer.device) == chwp::input::Device::Mouse) {
+        const int phase = msg.pointer.phase.value_or(1);
+        if (phase == 1) {
+            gRightKeeps = chwp::render::pointerCursor().hasSelection ||
+                          chwp::render::caretStatus(gDoc.doc, gDoc.pages).cellBlock ||
+                          !chwp::render::selectedObjectKind(gDoc.doc).empty();
+        }
+        if (gRightKeeps || phase == 2) return InputReport{};
+        InputMessage left = msg;
+        left.pointer.button = 0;
+        return input(left);
+    }
     chwp::input::Camera camera;
     chwp::input::PointerOutcome outcome;
     if (type == "pointer") {

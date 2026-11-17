@@ -206,6 +206,7 @@ const char* tableEditName(TableEditKind kind) {
         case TableEditKind::Split: return "splitCell";
         case TableEditKind::CellBorder: return "cellBorder";
         case TableEditKind::CellFill: return "cellFill";
+        case TableEditKind::CellBorderFill: return "cellBorderFill";
         case TableEditKind::EqualWidth: return "equalWidth";
         case TableEditKind::EqualHeight: return "equalHeight";
         case TableEditKind::CellAlign: return "cellAlign";
@@ -228,7 +229,8 @@ const char* tableEditName(TableEditKind kind) {
 bool tableEditKindOf(const std::string& name, TableEditKind& kind) {
     for (const TableEditKind k : {TableEditKind::InsertRows, TableEditKind::InsertColumns, TableEditKind::DeleteRows,
                                   TableEditKind::DeleteColumns, TableEditKind::Merge, TableEditKind::Split,
-                                  TableEditKind::CellBorder, TableEditKind::CellFill, TableEditKind::EqualWidth,
+                                  TableEditKind::CellBorder, TableEditKind::CellFill, TableEditKind::CellBorderFill,
+                                  TableEditKind::EqualWidth,
                                   TableEditKind::EqualHeight, TableEditKind::CellAlign, TableEditKind::CellDirection,
                                   TableEditKind::TableMargin, TableEditKind::TreatAsChar, TableEditKind::Wrap,
                                   TableEditKind::Caption, TableEditKind::SplitTable, TableEditKind::MergeTable,
@@ -612,10 +614,27 @@ EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& p
         case TableEditKind::DeleteColumns: edit = model::deleteTableColumns(table, col0, col1); break;
         case TableEditKind::Merge: edit = model::mergeTableCells(table, row0, col0, row1, col1); break;
         case TableEditKind::CellBorder:
-        case TableEditKind::CellFill: {
+        case TableEditKind::CellFill:
+        case TableEditKind::CellBorderFill: {
             model::BorderFillAccess fills;
             fills.read = [&doc](std::uint32_t id) { return borderFillOf(doc, id); };
             fills.intern = [&doc](const model::BorderFill& f) { return internBorderFillOf(doc, f); };
+            if (cmd.kind == TableEditKind::CellBorderFill) {
+                model::CellBorderFillSpec spec;
+                for (const auto& [side, line] : cmd.borderSides) {
+                    std::optional<model::BorderSide>* slot = side == "top"          ? &spec.top
+                                                           : side == "bottom"     ? &spec.bottom
+                                                           : side == "left"       ? &spec.left
+                                                           : side == "right"      ? &spec.right
+                                                           : side == "insideHorz" ? &spec.insideHorz
+                                                           : side == "insideVert" ? &spec.insideVert
+                                                                                  : nullptr;
+                    if (slot) *slot = line;
+                }
+                if (cmd.setFill) spec.faceColor = cmd.color == "none" ? std::string() : cmd.color;
+                edit = model::setTableCellBorderFill(table, row0, col0, row1, col1, spec, fills);
+                break;
+            }
             if (cmd.kind == TableEditKind::CellFill) {
                 const std::string color = cmd.color == "none" ? std::string() : cmd.color;
                 edit = model::fillTableCells(table, row0, col0, row1, col1, color, fills);
@@ -807,6 +826,7 @@ EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& p
     clearComposition(pointerHold());
     // 테두리·배경은 칸 자리를 바꾸지 않는다. 칸 블록을 남겨 이어서 고치게 한다.
     const bool keepBlock = cmd.kind == TableEditKind::CellBorder || cmd.kind == TableEditKind::CellFill ||
+                           cmd.kind == TableEditKind::CellBorderFill ||
                            cmd.kind == TableEditKind::CellAlign || cmd.kind == TableEditKind::CellDirection ||
                            cmd.kind == TableEditKind::Comma || cmd.kind == TableEditKind::AutoFill ||
                            cmd.kind == TableEditKind::Sort ||

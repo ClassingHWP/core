@@ -86,6 +86,16 @@ struct BorderFillAccess {
 };
 TableEdit setTableCellBorders(Table& table, int row0, int col0, int row1, int col1, CellBorderKind kind,
                               const BorderSide& line, const BorderFillAccess& fills);
+// 셀 테두리/배경 대화 상자(한글 CellBorderFill·CellZoneBorderFill, 숨긴 한글 2024 로 확인). 블록의 바깥 네 변
+// (top·bottom·left·right)과 안쪽 가로·세로 선(insideHorz·insideVert)을 변마다 정한다. 값이 없는 변은 그대로,
+// type 이 NONE 이면 지운다(굵기·색은 남긴다). 바깥 변은 블록 밖 맞닿은 이웃 칸의 마주 보는 변도, 안쪽 선은 양쪽
+// 칸 모두 같은 선이 된다. faceColor 가 있으면 블록 칸의 배경도 그 색(빈 글이나 "none" 이면 없앰)으로 칠한다.
+struct CellBorderFillSpec {
+    std::optional<BorderSide> top, bottom, left, right, insideHorz, insideVert;
+    std::optional<std::string> faceColor;
+};
+TableEdit setTableCellBorderFill(Table& table, int row0, int col0, int row1, int col1, const CellBorderFillSpec& spec,
+                                 const BorderFillAccess& fills);
 // 블록 칸의 배경을 한 색으로 칠한다. faceColor 가 비었거나 "none" 이면 배경을 없앤다.
 TableEdit fillTableCells(Table& table, int row0, int col0, int row1, int col1, const std::string& faceColor,
                          const BorderFillAccess& fills);

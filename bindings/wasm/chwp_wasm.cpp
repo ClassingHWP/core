@@ -976,7 +976,10 @@ val editField(const val& event) {
 }
 val editUndo() { return packEditReport(app::editUndo()); }
 val editRedo() { return packEditReport(app::editRedo()); }
-val editInsertTable(int rows, int cols) { return packEditReport(app::editInsertTable(rows, cols)); }
+chwp::render::FormatFields fieldsOf(const val& object);
+val editInsertTable(int rows, int cols, const val& fields) {
+    return packEditReport(app::editInsertTable(rows, cols, fieldsOf(fields)));
+}
 val editInsertBreak(const std::string& kind) { return packEditReport(app::editInsertBreak(kind)); }
 val editShortcut(const std::string& command) { return packEditReport(app::editShortcut(command)); }
 val editFindReplace(const std::string& mode, const std::string& text, const std::string& replacement, bool matchCase) {
@@ -1267,6 +1270,7 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("pointerEvent", &pointerEvent);
     emscripten::function("cursorStyle", &cursorStyleNow);
     emscripten::function("hoverCursor", &app::hoverCursor);
+    emscripten::function("contextMenuKind", &app::contextMenuKind);
     emscripten::function("editText", &editText);
     emscripten::function("editKey", &editKey);
     emscripten::function("editUndo", &editUndo);

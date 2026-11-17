@@ -160,6 +160,12 @@ std::string memoCreateDateTime(std::uint64_t filetime) {
     return buf;
 }
 
+std::string koreanDateText(std::uint64_t filetime) {
+    const std::tm t = localOf(filetime);
+    return std::to_string(t.tm_year + 1900) + "년 " + std::to_string(t.tm_mon + 1) + "월 " + std::to_string(t.tm_mday) +
+           "일";
+}
+
 std::uint64_t filetimeNow() {
     const auto since = std::chrono::system_clock::now().time_since_epoch();
     const std::int64_t unix100ns = std::chrono::duration_cast<std::chrono::microseconds>(since).count() * 10;

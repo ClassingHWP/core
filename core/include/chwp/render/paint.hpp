@@ -397,6 +397,8 @@ bool restoreResizedObject(const model::Document& doc, const std::vector<Node>& p
 std::string pointerEventText();
 // 커서·블록이 바뀌면 늘어난다. 화면 루프가 다시 그릴지 볼 때 쓴다.
 int pointerPicture();
+// 고른 개체의 갈래: picture(그림), shape(도형·묶음·글상자·OLE), table, equation. 고른 개체가 없으면 빈 글.
+std::string selectedObjectKind(model::Document& doc);
 // 깜빡일 커서가 있으면 true다.
 bool caretShown();
 // 커서·조합 상자의 현재 깜빡임 주기(0: 켜짐, 1: 꺼짐, -1: 없음).
@@ -688,16 +690,26 @@ FormatFields pageSetupAtCursor(const model::Document& doc);
 EditResult editApplyPageSetup(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
                               bool wholeDocument, bool useStoredLineHeight = false);
 
-// 캐럿 자리에 줄 rows·칸 cols 표를 넣는다. 한글 표 만들기(너비 단에 맞춤, 글자처럼 취급)와 같은 표이고,
+// 표 만들기 대화 상자에서 고른 것(한글 TableCreate, 숨긴 한글 2024 로 확인).
+// - fitParagraph: 너비 문단에 맞춤. 단에 맞춤 폭에서 캐럿 문단의 왼쪽·오른쪽 여백을 빼고, 가로 기준은 문단이다.
+//   아니면 단에 맞춤(문단 여백과 상관없이 단 폭, 가로 기준 단)이다.
+// - treatAsChar: 글자처럼 취급. 끄면 같은 자리(문단 기준 세로, 본문과의 배치 자리 차지)에 띄운 표다.
+struct TableCreateOptions {
+    bool fitParagraph = false;
+    bool treatAsChar = true;
+};
+
+// 캐럿 자리에 줄 rows·칸 cols 표를 넣는다. 기본은 한글 표 만들기(너비 단에 맞춤, 글자처럼 취급)와 같은 표이고,
 // 캐럿은 첫 칸으로 간다. 블록이 있으면 지우고 넣는다.
 EditResult editInsertTable(model::Document& doc, std::vector<Node>& pages, int rows, int cols,
-                           bool useStoredLineHeight = false);
+                           bool useStoredLineHeight = false, const TableCreateOptions& options = {});
 
 // 표 구조 편집. 칸은 표 칸 story 번호로 가리킨다. 규칙은 한글 2024 와 같다(model/table_edit.hpp).
 enum class TableEditKind {
     InsertRows, InsertColumns, DeleteRows, DeleteColumns, Merge, Split,
     CellBorder,   // 셀 테두리 단추(border)
     CellFill,     // 셀 배경색(color)
+    CellBorderFill,  // 셀 테두리/배경 대화 상자(borderSides, setFill·color)
     EqualWidth,   // 셀 너비를 같게
     EqualHeight,  // 셀 높이를 같게
     CellAlign,    // 내용 정렬: vertAlign(TOP·CENTER·BOTTOM), horzAlign(LEFT·CENTER·RIGHT, 비면 그대로)
@@ -732,6 +744,9 @@ struct TableEditCommand {
     std::int32_t lineWidth = 0;
     std::string lineColor = "#000000";
     std::string color;  // 배경: "#RRGGBB". 비었거나 "none" 이면 배경을 없앤다
+    // 셀 테두리/배경(cellBorderFill): 바꿀 변(top·bottom·left·right·insideHorz·insideVert)과 그 선. 없는 변은 그대로.
+    std::vector<std::pair<std::string, model::BorderSide>> borderSides;
+    bool setFill = false;  // cellBorderFill: 참이면 color 로 배경을 바꾼다
     std::string vertAlign;  // 내용 정렬
     std::string horzAlign;
     int direction = 0;      // 글자 방향
@@ -869,6 +884,9 @@ EditResult editSyncClickHereGuide(model::Document& doc, std::vector<Node>& pages
 bool clickHereGuideHidden();
 // 숨긴 안내문을 되돌린다(편집·이동·저장을 안내문이 보이는 문서에서 하도록 그 앞에). 캐럿은 같은 논리 자리다.
 EditResult editRevealClickHereGuide(model::Document& doc, std::vector<Node>& pages);
+// 날짜/시간 코드(한글 InsertFieldDateTime). shown 은 필드 안에 보일 오늘 날짜 글(model::todayDateText).
+EditResult editInsertDateField(model::Document& doc, std::vector<Node>& pages, const std::string& shown,
+                               bool useStoredLineHeight = false);
 EditResult editInsertHyperlink(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                                const std::string& url, bool useStoredLineHeight = false, std::string* error = nullptr);
 

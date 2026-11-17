@@ -43,5 +43,7 @@ std::string memoHeadDate(std::uint64_t filetime);
 std::string memoCreateDateTime(std::uint64_t filetime);
 // 지금 시각의 FILETIME(UTC).
 std::uint64_t filetimeNow();
+// 한글 날짜/시간 문자열·코드의 기본 형식 "YYYY년 M월 D일"(숨긴 한글 2024: "2026년 11월 17일"). 현지 날짜다.
+std::string koreanDateText(std::uint64_t filetime);
 
 }  // namespace chwp::model

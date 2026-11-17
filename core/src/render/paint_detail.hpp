@@ -655,6 +655,8 @@ bool paragraphsAlike(const model::Paragraph& a, const model::Paragraph& b);
 // 누름틀 안내문·메모(필드 매개변수나 명령에서).
 std::string clickHereGuide(const model::Control& field);
 std::string clickHereMemo(const model::Control& field);
+EditResult insertDateFieldNow(model::Document& doc, std::vector<Node>& pages, const std::string& shown,
+                              bool useStoredLineHeight);
 EditResult insertHyperlinkNow(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                              const std::string& url, bool useStoredLineHeight, std::string& error);
 EditResult insertNoteNow(model::Document& doc, std::vector<Node>& pages, bool endnote, bool useStoredLineHeight,
@@ -672,7 +674,8 @@ EditResult applyFormatToCellsNow(model::Document& doc, std::vector<Node>& pages,
                                  bool useStoredLineHeight);
 EditResult applyPageSetupNow(model::Document& doc, std::vector<Node>& pages, const FormatFields& fields,
                              bool wholeDocument, bool useStoredLineHeight);
-EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int rows, int cols, bool useStoredLineHeight);
+EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int rows, int cols, bool useStoredLineHeight,
+                          const TableCreateOptions& options = {});
 EditResult insertBreakNow(model::Document& doc, std::vector<Node>& pages, BreakKind kind, bool useStoredLineHeight);
 EditResult replaceTextNow(model::Document& doc, std::vector<Node>& pages, const std::string& text,
                           const std::string& replacement, bool matchCase, bool useStoredLineHeight);

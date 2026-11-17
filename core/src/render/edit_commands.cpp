@@ -3542,7 +3542,7 @@ std::int32_t columnWidthAt(const model::Document& doc, const std::vector<Node>& 
 // 캐럿 앞 글은 그 문단에 남고 표는 제 문단, 캐럿 뒤 글은 다음 문단이다. 앞 글이 없으면 그 문단에 표를 둔다.
 // 캐럿은 첫 칸으로 간다.
 EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int rows, int cols,
-                          bool useStoredLineHeight) {
+                          bool useStoredLineHeight, const TableCreateOptions& options) {
     if (readOnly()) return {};
     if (EditResult blocked; blockedByLicenseFonts(doc, blocked)) return blocked;
     rows = std::clamp(rows, 1, kTableMaxRows);
@@ -3566,9 +3566,15 @@ EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int ro
     } else {
         charIndex = offsetToCharIndex(doc, pages, story, paraIdx, cur.offset);
     }
-    const std::int32_t columnWidth = columnWidthAt(doc, pages, story, paraIdx);
+    std::int32_t columnWidth = columnWidthAt(doc, pages, story, paraIdx);
 
     model::Paragraph& host = (*paras)[static_cast<std::size_t>(paraIdx)];
+    // 문단에 맞춤: 문단 왼쪽·오른쪽 여백만큼 좁다(숨긴 한글: 단 41954, 여백 2835·2835 → 36284).
+    if (options.fitParagraph) {
+        if (const model::ParaShape* shape = Painter::findParaShape(doc, host.paraShapeId)) {
+            columnWidth -= std::max<std::int32_t>(0, shape->marginLeft) + std::max<std::int32_t>(0, shape->marginRight);
+        }
+    }
     const std::uint32_t charShape = charShapeAtParagraphChar(host, charIndex, false);
     std::int32_t lineHeight = 1000;
     if (const model::CharShape* shape = Painter::findCharShape(doc, charShape)) {
@@ -3579,12 +3585,12 @@ EditResult insertTableNow(model::Document& doc, std::vector<Node>& pages, int ro
     control.kind = model::ControlKind::Table;
     control.ctrlId = "tbl ";
     model::Placement placement;
-    placement.treatAsChar = true;
+    placement.treatAsChar = options.treatAsChar;
     placement.flowWithText = true;
     placement.allowOverlap = false;
     placement.textWrap = "TOP_AND_BOTTOM";
     placement.vertRelTo = "PARA";
-    placement.horzRelTo = "COLUMN";
+    placement.horzRelTo = options.fitParagraph ? "PARA" : "COLUMN";
     placement.marginLeft = 283;
     placement.marginRight = 283;
     placement.marginTop = 283;

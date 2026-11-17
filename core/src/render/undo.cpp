@@ -583,6 +583,7 @@ struct PendingInsert {
     int rows = 0;  // 그림이면 정한 너비(HWPUNIT, 0 이면 그림 크기)
     int cols = 0;  // 그림이면 정한 높이
     Bytes image;
+    TableCreateOptions table;
 };
 
 PendingInsert& pendingInsert() {
@@ -593,11 +594,11 @@ PendingInsert& pendingInsert() {
 }  // namespace
 
 EditResult editInsertTable(model::Document& doc, std::vector<Node>& pages, int rows, int cols,
-                           bool useStoredLineHeight) {
+                           bool useStoredLineHeight, const TableCreateOptions& options) {
     UndoTrack track(doc, pages, UndoKind::Other);
-    EditResult result = insertTableNow(doc, pages, rows, cols, useStoredLineHeight);
+    EditResult result = insertTableNow(doc, pages, rows, cols, useStoredLineHeight, options);
     track.finish(doc, pages, result, useStoredLineHeight);
-    if (result.needsFontSwap) pendingInsert() = PendingInsert{1, rows, cols, {}};
+    if (result.needsFontSwap) pendingInsert() = PendingInsert{1, rows, cols, {}, options};
     return result;
 }
 
@@ -641,6 +642,14 @@ EditResult editInsertHyperlink(model::Document& doc, std::vector<Node>& pages, c
     EditResult result = insertHyperlinkNow(doc, pages, text, url, useStoredLineHeight, why);
     track.finish(doc, pages, result, useStoredLineHeight);
     if (error) *error = why;
+    return result;
+}
+
+EditResult editInsertDateField(model::Document& doc, std::vector<Node>& pages, const std::string& shown,
+                               bool useStoredLineHeight) {
+    UndoTrack track(doc, pages, UndoKind::Other);
+    EditResult result = insertDateFieldNow(doc, pages, shown, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 
@@ -1006,7 +1015,9 @@ namespace paint_detail {
 EditResult resumePendingInsert(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
     PendingInsert pending = std::move(pendingInsert());
     pendingInsert() = PendingInsert{};
-    if (pending.kind == 1) return editInsertTable(doc, pages, pending.rows, pending.cols, useStoredLineHeight);
+    if (pending.kind == 1) {
+        return editInsertTable(doc, pages, pending.rows, pending.cols, useStoredLineHeight, pending.table);
+    }
     if (pending.kind == 2) {
         return editInsertPicture(doc, pages, pending.image, useStoredLineHeight, pending.rows, pending.cols);
     }

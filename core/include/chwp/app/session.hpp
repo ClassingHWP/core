@@ -286,7 +286,8 @@ struct FieldResult {
 FieldResult editField(const chwp::input::FieldEvent& event);
 EditReport editUndo();
 EditReport editRedo();
-EditReport editInsertTable(int rows, int cols);
+// fields: widthFit("column" 단에 맞춤 기본, "paragraph" 문단에 맞춤), treatAsChar(기본 참).
+EditReport editInsertTable(int rows, int cols, const render::FormatFields& fields = {});
 // 나누기. kind 는 page, column, columnDef, section 이다. 구역 본문 밖이면 문서를 고치지 않는다.
 EditReport editInsertBreak(const std::string& kind);
 // 쪽 탭 컨트롤. kind 는 header, footer, deleteBand, pageNumber, newNumber, pageHiding 이고 값 이름은
@@ -543,6 +544,10 @@ struct InputReport {
     SelectionReport selection;
 };
 InputReport input(const InputMessage& msg);
+// 오른쪽 클릭 뒤 띄울 상황 메뉴의 갈래(한글 hwp_context_menus.xml): picture(IDC_Picture), shape(IDC_Drawing_Object),
+// cellBlock(IDC_Cell_Block), block(IDC_Body_Block), table(IDC_Table), body(IDC_Edit_Body). 셸은 오른쪽 단추 누름·뗌을
+// 그대로 input 으로 넘기고, 뗀 뒤 이것을 물어 그 갈래의 메뉴를 띄운다.
+std::string contextMenuKind();
 
 // 단축키 표. 키를 누른 그 순간 기본 동작을 막아야 하는 셸이 이 표를 받아 두고 찾아본다.
 // key 는 플랫폼 키 이름이다(웹: 글자 키는 KeyboardEvent.code 인 KeyZ, 나머지는 key 인 ArrowLeft·F7).
