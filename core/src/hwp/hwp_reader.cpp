@@ -179,6 +179,7 @@ constexpr std::uint32_t kCtrlBookmark = makeCtrlId('b', 'o', 'k', 'm');
 constexpr std::uint32_t kCtrlHiddenComment = makeCtrlId('t', 'c', 'm', 't');
 constexpr std::uint32_t kCtrlDutmal = makeCtrlId('t', 'd', 'u', 't');
 constexpr std::uint32_t kCtrlCompose = makeCtrlId('t', 'c', 'p', 's');
+constexpr std::uint32_t kCtrlForm = makeCtrlId('f', 'o', 'r', 'm');
 
 constexpr std::size_t kLineSegSize = 36;
 constexpr std::size_t kPictureBinIdOffset = 71;
@@ -382,6 +383,28 @@ bool shapeHasInk(const std::string& type) {
 }
 
 // 테두리 13바이트 다음의 채우기. 단색만 색을 남긴다.
+// 그리기 개체 그림자는 개체 요소 끝 22 바이트다: 종류 u32, 색 u32, 간격 X·Y i32, instance id u32, u8, 투명도 u8
+// (한글 2024 로 저장해 확인). 채우기 정보는 꼴이 여럿이라 앞에서 세지 않고 끝에서 읽는다.
+void readShapeShadow(ByteView data, std::size_t inkStart, Control& control) {
+    if (data.size() < inkStart + 13 + 4 + 22) return;
+    ByteReader s(data);
+    s.seek(data.size() - 22);
+    const std::uint32_t type = s.u32();
+    const Color color = fromColorRef(s.u32());
+    const std::int32_t x = s.i32();
+    const std::int32_t y = s.i32();
+    s.u32();
+    s.u8();
+    const std::uint8_t alpha = s.u8();
+    if (!s.ok() || type > 14) return;
+    control.shadow.type = shapeShadowName(static_cast<int>(type));
+    control.shadow.color = hexColor(color);
+    if (control.shadow.color == "none") control.shadow.color = "#B2B2B2";
+    control.shadow.offsetX = x;
+    control.shadow.offsetY = y;
+    control.shadow.alpha = alpha;
+}
+
 void readShapeInk(ByteReader& r, Control& control) {
     if (!shapeHasInk(control.shapeType) || r.remaining() < 13) return;
     const Color color = fromColorRef(r.u32());
@@ -1655,6 +1678,8 @@ Placement Parser::readPlacement(ByteReader& r) {
     static const char* numberings[] = {"NONE", "PICTURE", "TABLE", "EQUATION"};
     const std::uint32_t numbering = (attr >> 26) & 0x3;
     p.numberingType = numbering < std::size(numberings) ? numberings[numbering] : "NONE";
+    p.sizeProtect = (attr & (1u << 20)) != 0;
+    p.locked = (attr & (1u << 30)) != 0;
     p.attrKeep = attr & ~kObjectKnownBits;
     if (r.remaining() >= 8) {
         p.marginLeft = r.i16();
@@ -1877,12 +1902,32 @@ Control Parser::parseControl(const RecordTree& tree, std::size_t index) {
         case kCtrlGso:
             c.kind = ControlKind::Shape;
             c.placement = readPlacement(r);
+            // 문단 첫 글자 장식 상자: 컨트롤 데이터 매개변수 묶음 539 의 0x7001(종류 UINT).
+            if (const Record* data = findChild(tree, node, tag::CtrlData);
+                data && data->data.size() >= 24 && data->data[0] == 0x1B && data->data[1] == 0x02) {
+                const auto& d = data->data;
+                for (std::size_t i = 0; i + 8 <= d.size(); ++i) {
+                    if (d[i] == 0x01 && d[i + 1] == 0x70 && d[i + 2] == 0x09 && d[i + 3] == 0x00) {
+                        const std::uint32_t v = d[i + 4] | (d[i + 5] << 8) | (d[i + 6] << 16) | (static_cast<std::uint32_t>(d[i + 7]) << 24);
+                        c.placement->dropCap = v == 1 ? "DoubleLine" : v == 2 ? "TripleLine" : v == 3 ? "Margin" : "";
+                        break;
+                    }
+                }
+            }
             parseCaption(tree, node, c);
             for (std::size_t child : node.children) {
                 if (tree.at(child).record->tag == tag::ShapeComponent) {
                     parseShapeComponent(tree, child, c);
                     break;
                 }
+            }
+            break;
+        case kCtrlForm:
+            c.kind = ControlKind::Form;
+            c.placement = readPlacement(r);
+            if (const Record* data = findChild(tree, node, tag::FormObject)) {
+                model::FormObject form;
+                if (detail::readFormRecord(data->data, form)) c.form = std::move(form);
             }
             break;
         case kCtrlEquation:
@@ -2327,6 +2372,7 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
             control.placement = place;
             pointsW = initW;
             pointsH = initH;
+            if (shapeHasInk(control.shapeType)) readShapeShadow(node.record->data, r.position(), control);
             readShapeInk(r, control);
         }
     } else if (control.placement) {
@@ -2355,7 +2401,10 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
         control.placement->scaleY = scaleY;
         control.placement->matrixX = static_cast<std::int32_t>(std::llround(shiftX));
         control.placement->matrixY = static_cast<std::int32_t>(std::llround(shiftY));
-        if (shapeHasInk(control.shapeType)) readShapeInk(r, control);
+        if (shapeHasInk(control.shapeType)) {
+            readShapeShadow(node.record->data, r.position(), control);
+            readShapeInk(r, control);
+        }
     }
 
     auto keepRecord = [&](std::uint16_t tagId, ByteView data) {
@@ -2487,7 +2536,18 @@ void Parser::parseShapeComponent(const RecordTree& tree, std::size_t index, Cont
         control.boxPadTop = box.i16();
         control.boxPadBottom = box.i16();
         if (rec.data.size() >= 20) control.boxTextWidth = box.u32();
-        break;
+        std::uint32_t linkId = 0;
+        std::uint32_t linkNextId = 0;
+        if (rec.data.size() >= 28) {
+            linkId = box.u32();
+            linkNextId = box.u32();
+        }
+        collectSubLists(tree, node, control.subLists);
+        if (!control.subLists.empty()) {
+            control.subLists.front().linkId = linkId;
+            control.subLists.front().linkNextId = linkNextId;
+        }
+        return;
     }
     collectSubLists(tree, node, control.subLists);
 }

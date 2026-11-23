@@ -18,6 +18,7 @@ set(_chwp_core_sources
     src/model/collate_data.cpp
     src/model/hangul_jamo_data.cpp
     src/hwp/records.cpp
+    src/hwp/hwp_form.cpp
     src/hwp/hwp_reader.cpp
     src/hwp/hwp_writer.cpp
     src/hwpx/hwpx_reader.cpp
@@ -43,6 +44,7 @@ set(_chwp_core_sources
     src/render/track_commands.cpp
     src/render/table_props.cpp
     src/render/object_commands.cpp
+    src/render/object_extra_commands.cpp
     src/render/equation_commands.cpp
     src/render/glyph_group.cpp
     src/render/glyph_group_commands.cpp

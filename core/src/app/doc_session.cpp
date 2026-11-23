@@ -1144,6 +1144,79 @@ render::EditResult DocSession::groupObjects(const std::vector<render::ObjectSpot
     return result;
 }
 
+render::EditResult DocSession::unlockAllObjects() {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editUnlockAllObjects(doc, pages, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::dropCap(int style, std::int32_t spacing, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editDropCap(doc, pages, style, spacing, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::linkTextBox(const render::ObjectSpot& from, const render::ObjectSpot& to,
+                                           std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editLinkTextBox(doc, pages, from, to, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::unlinkTextBox(const render::ObjectSpot& spot, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editUnlinkTextBox(doc, pages, spot, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::insertForm(const std::string& type, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editInsertForm(doc, pages, type, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::pointerExtras(std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editPointerExtras(doc, pages, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::setPassword(const std::string& current, const std::string& next,
+                                           const std::string& confirm, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editDocumentPassword(doc, pages, current, next, confirm, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::alignObjects(const std::vector<render::ObjectSpot>& spots, const std::string& mode,
+                                            std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editAlignObjects(doc, pages, spots, mode, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::replacePicture(const render::ObjectSpot& spot, const Bytes& image, std::string* error) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editReplacePicture(doc, pages, spot, image, storedLineHeight, error);
+    noteEdit(result);
+    return result;
+}
+
+render::EditResult DocSession::pressForm(const render::ObjectSpot& spot) {
+    const render::EditScope scope = wholeScope();
+    render::EditResult result = render::editPressForm(doc, pages, spot, storedLineHeight);
+    noteEdit(result);
+    return result;
+}
+
 render::EditResult DocSession::ungroupObject(const render::ObjectSpot* spot, std::string* error) {
     const render::EditScope scope = wholeScope();
     render::EditResult result = render::editUngroupObject(doc, pages, spot, storedLineHeight, error);

@@ -48,6 +48,8 @@ struct CameraNote {
     double dpr = 1;
     bool ownsScroll = false;
     bool settled = true;
+    // 문서 위에 뜬 도구줄(input "topBar")을 보일지. 셸은 이 값대로 막대를 내리거나 올린다.
+    bool topBarShown = true;
 };
 
 // 플랫폼이 채운다. 비어 있으면 코어 기본값(스레드 없음, steady_clock)을 쓴다.
@@ -364,6 +366,10 @@ EditReport editTable(const std::string& kind, bool after, int count, int rows, i
 // lineType, lineWidth, lineColor, vertAlign, horzAlign, direction, margin, preset, wrap, caption, comma)이다.
 EditReport editTableFields(const std::string& kind, const render::FormatFields& fields);
 EditReport editInsertPicture(const Bytes& image);
+EditReport editReplacePicture(const Bytes& image);
+// 문서 암호 걸기·바꾸기·풀기(next 가 비면 푼다). 암호가 있으면 current 가 맞아야 한다.
+EditReport editDocumentPassword(const std::string& current, const std::string& next, const std::string& confirm);
+bool documentHasPassword();
 // 그림 글머리표: 고른 그림 파일 바이트를 블록(캐럿) 문단의 글머리표로 건다(한글 그림 글머리표 사용자 정의 모양).
 EditReport editPictureBullet(const Bytes& image);
 EditReport editStyle(const render::FormatPatch& patch);
@@ -468,7 +474,10 @@ struct InputPointer {
     bool shift = false;  // Shift 를 누른 채인지(여러 개체 고르기)
 };
 // type: pointer, pointers, wheel, wheelRaw, gesture, tick, scroll, viewport, revealPage, zoom, zoomStep, pageStep, pageUp, pageDown,
-// fit, grid, pins, readOnly, rulers, embed, embedOpen. 각 종류는 쓰는 칸만 읽는다.
+// fit, grid, pins, mode, readOnly, rulers, embed, embedOpen. 각 종류는 쓰는 칸만 읽는다.
+// mode: 보기·편집 모드("view"·"edit"). readOnly(on) 는 mode 의 옛 이름이다.
+// topBar: 문서 위에 뜬 도구줄(휴대폰). cssH 는 그 높이(0 이면 없음), on 은 메뉴 판이 열려 막대를 붙들어 둠,
+// keyboard 는 화면 자판이 떠 있음. 숨길지는 core 가 스크롤 방향을 보고 정한다(topBarShown).
 struct InputMessage {
     std::string type;
     InputPointer pointer;
@@ -505,6 +514,7 @@ struct InputMessage {
     int rows = 1;
     std::optional<bool> fit;
     bool on = false;
+    bool keyboard = false;
 };
 // 포인터가 글을 고르거나 개체를 다룬 결과.
 struct SelectionReport {
@@ -541,7 +551,21 @@ struct InputReport {
     // 사용자가 켠 눈금자 값(처음은 켬). 보기 전용이면 이 값과 달리 숨긴다. 셸은 이 값을 메뉴에 보이고 저장한다.
     bool rulersWanted = true;
     // 보기 화면에 편집 단추를 보인다. 처음은 숨기고, 임베드 명령 edit 로 켠다.
+    // 켜져 있으면 보기 모드에서 두 번 눌러 그 자리에 캐럿을 두고 편집 모드로 들어간다.
     bool editButton = false;
+    // 보기·편집 모드("view"·"edit"). 셸은 이 값대로 도구줄을 그린다.
+    std::string mode = "edit";
+    // 이 입력(보기 모드의 두 번 누르기)이 모드를 바꿨다. 셸은 이때 제 기록(주소)을 따라 적는다.
+    bool modeByInput = false;
+    // 보기 모드에서 다음 누르기가 편집으로 들어갈 수 있는 자리(화면 장치 픽셀)와 끝 시각(포인터 t 시계).
+    // until 이 0 이면 없다. 화면 자판은 손을 뗀 그 순간 준 초점에만 뜨므로(iOS), 셸은 손을 뗄 때
+    // 이 자리·시각 안이면 core 답을 기다리지 않고 입력칸에 초점을 준다. 답이 보기 모드면 초점을 거둔다.
+    double editTapUntil = 0;
+    double editTapX = 0;
+    double editTapY = 0;
+    double editTapReach = 0;
+    // 문서 위에 뜬 도구줄을 보일지(topBar). 아래로 스크롤하면 숨고, 위로 스크롤하거나 맨 위면 보인다.
+    bool topBarShown = true;
     bool pointer = false;  // pointer·pointers 면 selection 을 붙인다
     SelectionReport selection;
 };

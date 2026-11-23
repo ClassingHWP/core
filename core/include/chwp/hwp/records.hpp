@@ -81,7 +81,8 @@ inline constexpr std::uint32_t kSecdKnownBits = 0x1u | 0x2u | 0x4u | 0x8u | 0x10
 // 개체 공통 속성 중 모델이 푸는 비트: 글자처럼, 세로·가로 기준과 정렬, 본문 제한, 겹침, 폭·높이 기준, 배치,
 // 좌우 배치, 번호 범주(26~27), 캡션 있음(29). 나머지 비트는 읽은 그대로 다시 쓴다(Placement::attrKeep).
 // 한글은 캡션이 있는데 29 비트가 없거나, 번호 범주가 캡션 번호와 맞지 않으면 파일을 열지 않는다.
-inline constexpr std::uint32_t kObjectKnownBits = 0x1u | (0x1FFFFu << 3) | (0x7Fu << 21) | (1u << 29);
+// 20번 비트 크기 보호, 30번 비트 개체 보호(한글 2024 로 저장해 확인).
+inline constexpr std::uint32_t kObjectKnownBits = 0x1u | (0x1FFFFu << 3) | (1u << 20) | (0x7Fu << 21) | (1u << 29) | (1u << 30);
 
 const char* tagName(std::uint16_t tagId);
 

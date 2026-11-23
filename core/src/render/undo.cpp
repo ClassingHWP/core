@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "chwp/common/unicode.hpp"
 #include "chwp/render/scene.hpp"
 #include "chwp/render/style_commands.hpp"
 #include "chwp/render/toc_commands.hpp"
@@ -197,6 +198,7 @@ public:
             sections_ = doc.sections;
             fonts_ = doc.header.fonts;
             styles_ = doc.header.styles;
+            password_ = doc.format.password;
             armed_ = true;
             return;
         }
@@ -252,6 +254,7 @@ private:
             record.sections = std::move(sections_);
             record.fonts = std::move(fonts_);
             record.styles = std::move(styles_);
+            record.password = std::move(password_);
             push(h, std::move(record));
             return whole;
         }
@@ -317,6 +320,7 @@ private:
     std::vector<model::Section> sections_;
     model::PerLang<std::vector<model::Font>> fonts_;
     std::vector<model::Style> styles_;
+    std::string password_;
     CaretMark caretBefore_;
 };
 
@@ -353,6 +357,8 @@ UndoRecord applyRecord(model::Document& doc, std::vector<Node>& pages, UndoRecor
         doc.sections = std::move(record.sections);
         inverse.fonts = std::move(doc.header.fonts);
         doc.header.fonts = std::move(record.fonts);
+        inverse.password = doc.format.password;
+        doc.format.password = record.password;
         // 스타일 표(추가·편집·지우기·차례). 예전 기록에 없으면 그대로 둔다.
         if (!record.styles.empty()) {
             inverse.styles = std::move(doc.header.styles);
@@ -1141,6 +1147,121 @@ EditResult editGroupObjects(model::Document& doc, std::vector<Node>& pages, cons
     EditResult result = groupObjectsNow(doc, pages, picked, useStoredLineHeight, why);
     track.finish(doc, pages, result, useStoredLineHeight);
     if (error) *error = why;
+    return result;
+}
+
+EditResult editPointerExtras(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight,
+                             std::string* error) {
+    PointerHold& hold = pointerHold();
+    if (!hold.linkPending && !hold.formPressPending && !hold.pointPending && !hold.tableLinePending) return {};
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = pointerExtrasNow(doc, pages, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editUnlockAllObjects(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = unlockAllObjectsNow(doc, pages, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    return result;
+}
+
+EditResult editDropCap(model::Document& doc, std::vector<Node>& pages, int style, std::int32_t spacing,
+                       bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = dropCapNow(doc, pages, style, spacing, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editLinkTextBox(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& from, const ObjectSpot& to,
+                           bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = linkTextBoxNow(doc, pages, from, to, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editUnlinkTextBox(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                             bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = unlinkTextBoxNow(doc, pages, spot, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editInsertForm(model::Document& doc, std::vector<Node>& pages, const std::string& type,
+                          bool useStoredLineHeight, std::string* error) {
+    UndoTrack track(doc, pages, UndoKind::Other);
+    std::string why;
+    EditResult result = insertFormNow(doc, pages, type, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+// 문서 암호(한글 FilePasswordDlg·FilePasswordChangeDlg). 숨긴 한글 2024 열기 암호 창: 암호는 5자 이상이다.
+// 이미 암호가 있으면 지금 암호가 맞아야 바꾸거나(next) 푼다(next 가 빈 글). 저장할 때 HWP·HWPX 모두 이 암호로 잠근다.
+EditResult editDocumentPassword(model::Document& doc, std::vector<Node>& pages, const std::string& current,
+                                const std::string& next, const std::string& confirm, bool useStoredLineHeight,
+                                std::string* error) {
+    std::string why;
+    const auto fail = [&](const char* text) {
+        if (error) *error = text;
+        return EditResult{};
+    };
+    if (readOnly()) return fail("읽기 전용 문서입니다.");
+    if (doc.format.distribution) return fail("배포용 문서에는 문서 암호를 걸 수 없습니다.");
+    if (!doc.format.password.empty() && current != doc.format.password) return fail("지금 암호가 틀렸습니다.");
+    if (next.empty() && doc.format.password.empty()) return fail("암호가 걸려 있지 않은 문서입니다.");
+    if (!next.empty() && utf8CodePointCount(next) < 5) return fail("암호는 5자 이상 입력하세요.");
+    if (next != confirm) return fail("새 암호와 암호 확인이 다릅니다.");
+    if (next == doc.format.password) return fail("지금 암호와 같습니다.");
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    doc.format.password = next;
+    EditResult result;
+    result.documentChanged = true;
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) error->clear();
+    return result;
+}
+
+EditResult editAlignObjects(model::Document& doc, std::vector<Node>& pages, const std::vector<ObjectSpot>& spots,
+                            const std::string& mode, bool useStoredLineHeight, std::string* error) {
+    const std::vector<ObjectSpot> picked = spots.empty() ? selectedObjectSpots() : spots;
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = alignObjectsNow(doc, pages, picked, mode, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editReplacePicture(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                              const Bytes& image, bool useStoredLineHeight, std::string* error) {
+    // 문단 비교(sameParagraph)는 개체 안 그림 값을 보지 않는다. 구역째 담아야 되돌리기 칸이 남는다.
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    std::string why;
+    EditResult result = replacePictureNow(doc, pages, spot, image, useStoredLineHeight, why);
+    track.finish(doc, pages, result, useStoredLineHeight);
+    if (error) *error = why;
+    return result;
+}
+
+EditResult editPressForm(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                         bool useStoredLineHeight) {
+    UndoTrack track(doc, pages, UndoKind::Sections);
+    EditResult result = pressFormNow(doc, pages, spot, useStoredLineHeight);
+    track.finish(doc, pages, result, useStoredLineHeight);
     return result;
 }
 

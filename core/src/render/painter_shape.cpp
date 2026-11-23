@@ -508,8 +508,214 @@ void Painter::textArt(const Node& node, std::int32_t x, std::int32_t y, PaintLay
     }
 }
 
+namespace {
+
+// 도형 윤곽(상자 안 좌표). 둥근 사각형·타원은 점으로 편다.
+std::vector<std::pair<double, double>> shapeOutline(const Node& node) {
+    const ObjectExtra& obj = node.ext().obj();
+    const double w = node.width;
+    const double h = node.height;
+    std::vector<std::pair<double, double>> out;
+    constexpr double kPi = 3.14159265358979323846;
+    if (obj.shapeType == "ellipse") {
+        for (int i = 0; i < 96; ++i) {
+            const double a = 2 * kPi * i / 96;
+            out.emplace_back(w / 2 + w / 2 * std::cos(a), h / 2 + h / 2 * std::sin(a));
+        }
+        return out;
+    }
+    if (obj.points.size() >= 2) {
+        const std::vector<model::ShapePoint> pts =
+            obj.shapeType == "curve" ? hangulCurvePoints(obj.points)
+                                     : obj.shapeType == "arc" ? hangulArcPoints(obj.points) : obj.points;
+        for (const auto& p : pts) out.emplace_back(p.x, p.y);
+        return out;
+    }
+    const int ratio = obj.cornerRatio > 50 ? 0 : obj.cornerRatio;
+    if (ratio > 0) {
+        const double r = std::min(w, h) * ratio / 100.0;
+        const double cx[4] = {w - r, r, r, w - r};
+        const double cy[4] = {r, r, h - r, h - r};
+        for (int q = 0; q < 4; ++q) {
+            for (int i = 0; i <= 12; ++i) {
+                const double a = kPi / 2 * q + kPi / 2 * i / 12;
+                out.emplace_back(cx[q] + r * std::cos(a), cy[q] - r * std::sin(a));
+            }
+        }
+        return out;
+    }
+    out = {{0, 0}, {w, 0}, {w, h}, {0, h}};
+    return out;
+}
+
+}  // namespace
+
+void Painter::shapeShadow(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place) {
+    const ObjectExtra& obj = node.ext().obj();
+    if (obj.shadowType == 0 || !show(place)) return;
+    SkCanvas* canvas = this->canvas();
+    if (!canvas) return;
+    const std::vector<std::pair<double, double>> outline = shapeOutline(node);
+    if (outline.size() < 2) return;
+    SkPathBuilder builder;
+    bool first = true;
+    for (auto [sx, sy] : outline) {
+        model::shadowPoint(obj.shadowType, obj.shadowX, obj.shadowY, node.width, node.height, sx, sy);
+        const SkPoint at =
+            SkPoint::Make(glyphPx(x) + static_cast<float>(sx) * scale, glyphPx(y) + static_cast<float>(sy) * scale);
+        if (first) builder.moveTo(at);
+        else builder.lineTo(at);
+        first = false;
+    }
+    std::uint8_t r = 0xB2, g = 0xB2, b = 0xB2;
+    if (!obj.shadowColor.empty() && obj.shadowColor != "none") parseHex(obj.shadowColor, r, g, b);
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setColor(
+        SkColorSetARGB(static_cast<std::uint8_t>(255 - std::min<std::uint32_t>(obj.shadowAlpha, 255u)), r, g, b));
+    const bool open = obj.shapeType == "line" ||
+                      (obj.shapeType == "curve" && (node.ext().fillColor.empty() || node.ext().fillColor == "none"));
+    if (open) {
+        // 선·채우지 않은 곡선은 선 그림자다.
+        paint.setStyle(SkPaint::kStroke_Style);
+        paint.setStrokeWidth(std::max(1.f, static_cast<float>(node.ext().borderLeft.width) * scale));
+    } else {
+        builder.close();
+    }
+    canvas->drawPath(builder.detach(), paint);
+}
+
+void Painter::formBox(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place) {
+    const ObjectExtra& obj = node.ext().obj();
+    if (!obj.form || !show(place)) return;
+    SkCanvas* canvas = this->canvas();
+    if (!canvas) return;
+    const FormLook& look = *obj.form;
+    const model::FormObject& f = look.form;
+    const float left = glyphPx(x);
+    const float top = glyphPx(y);
+    const float right = glyphPx(x + node.width);
+    const float bottom = glyphPx(y + node.height);
+    // 윈도 3D 테두리 색(시스템 색): 밝음 #FFFFFF, 연함 #E3E3E3, 그림자 #A0A0A0, 짙은 그림자 #696969.
+    const float onePx = std::max(1.f, 75.f * scale);
+    const auto fill = [&](float l, float t, float r, float b, SkColor c) {
+        SkPaint p;
+        p.setColor(c);
+        canvas->drawRect(SkRect::MakeLTRB(l, t, r, b), p);
+    };
+    const auto colorOf = [](const std::string& hex, SkColor dflt) {
+        if (hex.empty() || hex == "none") return dflt;
+        std::uint8_t r, g, b;
+        parseHex(hex, r, g, b);
+        return SkColorSetARGB(255, r, g, b);
+    };
+    const SkColor kHi = SkColorSetRGB(0xFF, 0xFF, 0xFF);
+    const SkColor kLight = SkColorSetRGB(0xE3, 0xE3, 0xE3);
+    const SkColor kShadow = SkColorSetRGB(0xA0, 0xA0, 0xA0);
+    const SkColor kDark = SkColorSetRGB(0x69, 0x69, 0x69);
+    // 두 겹 테두리. 돋움은 바깥 왼쪽·위 연함, 오른쪽·아래 짙은 그림자, 안 왼쪽·위 밝음, 오른쪽·아래 그림자다.
+    const auto edge = [&](float l, float t, float r, float b, bool raised) {
+        const SkColor outTL = raised ? kLight : kShadow;
+        const SkColor outBR = raised ? kDark : kHi;
+        const SkColor inTL = raised ? kHi : kDark;
+        const SkColor inBR = raised ? kShadow : kLight;
+        fill(l, t, r, t + onePx, outTL);
+        fill(l, t, l + onePx, b, outTL);
+        fill(l, b - onePx, r, b, outBR);
+        fill(r - onePx, t, r, b, outBR);
+        l += onePx;
+        t += onePx;
+        r -= onePx;
+        b -= onePx;
+        fill(l, t, r, t + onePx, inTL);
+        fill(l, t, l + onePx, b, inTL);
+        fill(l, b - onePx, r, b, inBR);
+        fill(r - onePx, t, r, b, inBR);
+    };
+    const SkColor back = colorOf(f.backColor, SkColorSetRGB(0xF0, 0xF0, 0xF0));
+    if (f.type == "btn") {
+        fill(left, top, right, bottom, back);
+        if (f.drawFrame) edge(left, top, right, bottom, true);
+    } else if (f.type == "edit" || f.type == "comboBox" || f.type == "listBox") {
+        fill(left, top, right, bottom, back);
+        if (f.drawFrame) edge(left, top, right, bottom, false);
+        if (f.type == "comboBox") {
+            // 오른쪽 내림 단추: 안쪽 테두리 안에 돋운 단추와 검은 삼각형.
+            const float inset = 2 * onePx;
+            const float bh = bottom - top - 2 * inset;
+            const float bl = right - inset - std::min(bh, 17.f * onePx);
+            fill(bl, top + inset, right - inset, bottom - inset, SkColorSetRGB(0xF0, 0xF0, 0xF0));
+            edge(bl, top + inset, right - inset, bottom - inset, true);
+            const float cx = (bl + right - inset) / 2;
+            const float cy = (top + bottom) / 2;
+            const float t = 2.5f * onePx;
+            SkPathBuilder tri;
+            tri.moveTo(cx - t, cy - t / 2);
+            tri.lineTo(cx + t, cy - t / 2);
+            tri.lineTo(cx, cy + t / 2);
+            tri.close();
+            SkPaint p;
+            p.setAntiAlias(true);
+            p.setColor(SK_ColorBLACK);
+            canvas->drawPath(tri.detach(), p);
+        }
+    } else if (f.type == "checkBtn" || f.type == "radioBtn") {
+        if (f.backStyle != 0) fill(left, top, right, bottom, back);
+        // 단추 그림은 글자 크기에 맞춘 정사각이고 세로 가운데다(한글 PDF: 9pt 글자 상자 900).
+        const std::int32_t glyphSize = !look.glyphs.empty() ? look.glyphs.front().size : 900;
+        const float s = static_cast<float>(glyphSize) * scale * 13.f / 15.f;
+        const float bl = left + onePx;
+        const float bt = (top + bottom - s) / 2;
+        if (f.type == "checkBtn") {
+            fill(bl, bt, bl + s, bt + s, kHi);
+            edge(bl, bt, bl + s, bt + s, false);
+            if (f.value != 0) {
+                SkPathBuilder mark;
+                mark.moveTo(bl + s * 0.25f, bt + s * 0.5f);
+                mark.lineTo(bl + s * 0.42f, bt + s * 0.68f);
+                mark.lineTo(bl + s * 0.76f, bt + s * 0.3f);
+                SkPaint p;
+                p.setAntiAlias(true);
+                p.setStyle(SkPaint::kStroke_Style);
+                p.setStrokeWidth(std::max(1.f, s * 0.13f));
+                p.setColor(f.value == 2 ? kShadow : SK_ColorBLACK);
+                canvas->drawPath(mark.detach(), p);
+            }
+        } else {
+            const float cx = bl + s / 2;
+            const float cy = bt + s / 2;
+            SkPaint p;
+            p.setAntiAlias(true);
+            p.setColor(kHi);
+            canvas->drawCircle(cx, cy, s / 2, p);
+            p.setStyle(SkPaint::kStroke_Style);
+            p.setStrokeWidth(onePx);
+            const SkRect ring = SkRect::MakeLTRB(bl + onePx / 2, bt + onePx / 2, bl + s - onePx / 2, bt + s - onePx / 2);
+            p.setColor(kShadow);
+            canvas->drawArc(ring, 135, 180, false, p);
+            p.setColor(kLight);
+            canvas->drawArc(ring, 315, 180, false, p);
+            if (f.value != 0) {
+                SkPaint dot;
+                dot.setAntiAlias(true);
+                dot.setColor(SK_ColorBLACK);
+                canvas->drawCircle(cx, cy, s * 0.18f, dot);
+            }
+        }
+    }
+    for (const FormLook::Glyph& g : look.glyphs) {
+        if (g.x >= node.width) break;
+        glyph(g.cp, g.font, g.size, g.ratio, false, look.italic, look.color, x + g.x, y + look.baseline);
+    }
+}
+
 void Painter::objectBox(const Node& node, std::int32_t x, std::int32_t y) {
     const PaintLayer place = objectPlace(node);
+    if (node.role == "form") {
+        formBox(node, x, y, place);
+        return;
+    }
+    if (node.ext().obj().shadowType != 0) shapeShadow(node, x, y, place);
     if (node.ext().obj().shapeType == "textart") {
         if (show(place)) textArt(node, x, y, place);
         return;

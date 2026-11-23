@@ -653,6 +653,10 @@ struct Painter {
                     const BorderEdge& edge, PaintLayer place);
 
     void objectBox(const Node& node, std::int32_t x, std::int32_t y);
+    // 그리기 개체 그림자(model::shadowPoint). 도형 윤곽을 그림자 자리로 옮겨 칠한다.
+    void shapeShadow(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
+    // 양식 개체(명령 단추·선택 상자·라디오 단추·콤보 상자·입력 상자). 윈도 기본 컨트롤 모양이다.
+    void formBox(const Node& node, std::int32_t x, std::int32_t y, PaintLayer place);
 
     int edgeThickPx(const BorderEdge& edge) const;
 

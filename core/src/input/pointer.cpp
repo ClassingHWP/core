@@ -63,12 +63,37 @@ void PointerInput::holdSelection(int id) {
     view_.releaseTracking();
     tapId_ = -1;
     tapMoved_ = false;
+    ignored_.erase(std::remove(ignored_.begin(), ignored_.end(), id), ignored_.end());
     if (!containsId(selecting_, id)) selecting_.push_back(id);
+}
+
+void PointerInput::ignorePointer(int id) {
+    view_.releaseTracking();
+    if (tapId_ == id) tapId_ = -1;
+    selecting_.erase(std::remove(selecting_.begin(), selecting_.end(), id), selecting_.end());
+    if (!containsId(ignored_, id)) ignored_.push_back(id);
+}
+
+bool PointerInput::pressWaiting() const {
+    return tapId_ >= 0 && !tapMoved_ && !pressFired_ && touches_.size() == 1 && !pair_ && !held_ && !platformPinch_ &&
+           !view_.draggingScroll() && !view_.draggingBar();
+}
+
+bool PointerInput::takeLongPress(int& id, double& x, double& y) {
+    if (!pressWaiting() || pressMs_ < kLongPressMs) return false;
+    pressFired_ = true;
+    id = tapId_;
+    x = tapX_;
+    y = tapY_;
+    return true;
 }
 
 void PointerInput::stop() {
     touches_.clear();
     selecting_.clear();
+    ignored_.clear();
+    pressMs_ = 0;
+    pressFired_ = false;
     tapId_ = -1;
     tapX_ = 0;
     tapY_ = 0;
@@ -268,6 +293,8 @@ PointerOutcome PointerInput::pointer(render::PageView& view, const PointerEvent&
             tapX_ = event.x;
             tapY_ = event.y;
             tapMoved_ = false;
+            pressMs_ = 0;
+            pressFired_ = false;
         } else {
             tapId_ = -1;
             tapMoved_ = true;
@@ -276,6 +303,19 @@ PointerOutcome PointerInput::pointer(render::PageView& view, const PointerEvent&
     }
 
     const int index = findTouch(event.id);
+    if (containsId(ignored_, event.id)) {
+        if (event.phase == Phase::Move && index >= 0) {
+            touches_[static_cast<std::size_t>(index)].second.x = event.x;
+            touches_[static_cast<std::size_t>(index)].second.y = event.y;
+        }
+        if (event.phase == Phase::Up || event.phase == Phase::Cancel) {
+            ignored_.erase(std::remove(ignored_.begin(), ignored_.end(), event.id), ignored_.end());
+            if (index >= 0) touches_.erase(touches_.begin() + index);
+            if (touches_.empty()) platformPinch_ = false;
+        }
+        out.camera = quiet(view, true);
+        return out;
+    }
     if (event.phase == Phase::Move) {
         if (index >= 0) {
             touches_[static_cast<std::size_t>(index)].second.x = event.x;
@@ -399,7 +439,10 @@ Camera PointerInput::gesture(render::PageView& view, const GestureEvent& event) 
     return finish(view_.gesture(view, event));
 }
 
-Camera PointerInput::tick(render::PageView& view, double dtMs) { return finish(view_.tick(view, dtMs)); }
+Camera PointerInput::tick(render::PageView& view, double dtMs) {
+    if (pressWaiting() && dtMs > 0) pressMs_ += dtMs;
+    return finish(view_.tick(view, dtMs));
+}
 
 Camera PointerInput::setScroll(render::PageView& view, int x, int y) {
     stop();

@@ -284,6 +284,7 @@ struct CaretStatus {
     int note = 0;            // 캐럿이 각주(1)·미주(2) 안이다(셸은 주석 탭을 보인다)
     bool master = false;     // 바탕쪽 편집 중이다(셸은 바탕쪽 탭을 보인다)
     std::string object;      // 고른 개체 갈래(selectedObjectKind). picture 면 셸은 그림 탭을 보인다
+    bool formEditing = true;  // 양식 편집 상태(한글 EditFormState). 꺼지면 양식 개체를 눌러 값을 바꾼다
     bool operator==(const CaretStatus&) const = default;
 };
 
@@ -362,6 +363,7 @@ struct PointerSample {
     double viewX = 0;
     double viewY = 0;
     double huPerLogical = 0;
+    bool longPress = false;  // 터치를 오래 누른 것이다. 글 위면 낱말을 고르고, 개체 위면 그 개체를 고른다
 };
 
 // kind: 0 배율, 1 누름, 2 누른 채 이동, 3 뗌, 4 해제.
@@ -372,6 +374,10 @@ void setSelectionPins(bool on);
 bool selectionPins();
 // (page, x, y)가 마커 위면 true. 셸이 터치를 스크롤 대신 마커 끌기로 보낼 때 쓴다. radius 는 HWPUNIT 이다.
 bool pinUnder(int page, int x, int y, double radius);
+// 터치로 잡을 자리. 1 은 고른 개체 가운데의 옮기기 아이콘, 2 는 크기·회전 손잡이, 0 은 없음(스크롤이 된다).
+// 터치는 아이콘을 끌 때만 개체를 옮긴다. 확대해서 개체가 화면을 채워도 개체 위를 끌면 스크롤이다.
+// huPerLogical 은 화면 CSS 1px 의 HWPUNIT 이다.
+int touchGrabAt(int page, int x, int y, double huPerLogical);
 // 마커를 끌지 않고 눌렀다 뗐으면 한 번만 true 다. 셸은 이때 복사·잘라내기 메뉴를 띄운다.
 bool takePinTap();
 // 두 번 누르기로 연 고치기 대화 상자 이름(rubyEdit·composeEdit). 한 번 가져가면 비운다.
@@ -382,6 +388,18 @@ std::string hoverCursor(const model::Document& doc, const std::vector<Node>& pag
                         double handleRadius);
 // 터치의 두 번째 누르기면 true. 시계는 바꾸지 않는다.
 bool repeatedTouchDown(double viewX, double viewY, double timeMs, double dpr, int device, int id);
+// 다음 누르기가 두 번째 누르기로 이어질 수 있는 첫 누르기 자리(화면 장치 픽셀)와 그 끝 시각.
+// open 이 거짓이면 이어질 누르기가 없다. 판단은 repeatedTouchDown 과 같다.
+struct ClickChainSpot {
+    bool open = false;
+    double until = 0;
+    double x = 0;
+    double y = 0;
+    double reach = 0;
+};
+ClickChainSpot clickChainSpot(double dpr);
+// 누르기 이어 세기를 처음부터 한다(다음 누르기는 한 번 누르기다).
+void forgetClickChain();
 // 블록을 끄는 동안 화면 가장자리면 스크롤할 장치 픽셀. 없으면 false.
 bool selectionEdgeScroll(double dtMs, int viewW, int viewH, int& dx, int& dy);
 void selectionEdgePoint(double& viewX, double& viewY);
@@ -1120,6 +1138,49 @@ EditResult editGroupObjects(model::Document& doc, std::vector<Node>& pages, cons
 // 개체 풀기(한글 Ungroup): 묶음 안 개체를 묶음 자리에 꺼내 모두 고른다. spot 이 없으면 지금 고른 개체다.
 EditResult editUngroupObject(model::Document& doc, std::vector<Node>& pages, const ObjectSpot* spot,
                              bool useStoredLineHeight = false, std::string* error = nullptr);
+// 양식 편집 상태(한글 EditFormState). 켜져 있으면(기본) 양식 개체를 눌러 고르고, 꺼져 있으면 눌러 값을 바꾼다.
+bool formEditing();
+void setFormEditing(bool on);
+// 고른 글상자에서 글상자 연결 고르기를 켠다. 다음에 누른 글상자로 잇는다. 켰으면 참.
+bool startLinkTextBoxPick();
+// 고른 다각형·곡선의 점 편집(한글 다각형 편집)을 켜고 끈다. 켰으면 참.
+bool togglePointEdit();
+bool pointEditing();
+// 뗀 뒤 남은 포인터 일(글상자 연결, 양식 누르기, 점 옮기기)을 넣는다. 되돌리기 한 칸이다.
+EditResult editPointerExtras(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false,
+                             std::string* error = nullptr);
+// 모든 보호 개체 해제하기(한글 UnLockShapeObjectAll). 되돌리기 한 칸이다.
+EditResult editUnlockAllObjects(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight = false);
+// 문단 첫 글자 장식(한글 DropCap). style 0 없음, 1 두 줄, 2 세 줄, 3 여백. spacing 은 본문과의 간격(HU, 한글 기본 850).
+// 캐럿 문단에 건다. 되돌리기 한 칸이다.
+EditResult editDropCap(model::Document& doc, std::vector<Node>& pages, int style, std::int32_t spacing = 850,
+                       bool useStoredLineHeight = false, std::string* error = nullptr);
+// 글상자 연결(한글 LinkTextBox): from 의 넘치는 글이 to 로 이어진다. 연결 끊기는 from 의 다음 연결을 지운다.
+EditResult editLinkTextBox(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& from, const ObjectSpot& to,
+                           bool useStoredLineHeight = false, std::string* error = nullptr);
+EditResult editUnlinkTextBox(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                             bool useStoredLineHeight = false, std::string* error = nullptr);
+// 양식 개체 넣기(한글 InsertFormCommandButton·Check·List·Radio·Edit). type 은 btn·checkBtn·comboBox·radioBtn·edit.
+EditResult editInsertForm(model::Document& doc, std::vector<Node>& pages, const std::string& type,
+                          bool useStoredLineHeight = false, std::string* error = nullptr);
+// 양식 개체 누르기(양식 편집 상태가 꺼졌을 때): 선택 상자는 켜고 끄고, 라디오 단추는 고른다. 되돌리기 한 칸이다.
+EditResult editPressForm(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                         bool useStoredLineHeight = false);
+// 문서 암호 걸기·바꾸기·풀기(한글 문서 암호 설정·변경/해제). 암호가 있으면 current 가 맞아야 하고, next 가 비면 푼다.
+// confirm 은 암호 확인 칸이고 next 와 같아야 한다.
+EditResult editDocumentPassword(model::Document& doc, std::vector<Node>& pages, const std::string& current,
+                                const std::string& next, const std::string& confirm, bool useStoredLineHeight = false,
+                                std::string* error = nullptr);
+// 표 그리기(1)·표 지우개(2)를 켜고 끈다(같은 도구면 끈다). pen 이 있으면 펜 선 모양을 바꾼다. 켜진 도구를 돌려준다.
+int toggleTableTool(int tool, const model::BorderSide* pen = nullptr);
+int tableTool();
+// 여러 개체 맞춤(한글 도형 탭 맞춤·크기 같게). spots 가 비면 고른 개체들이고, 마지막 개체가 기준이다.
+// mode: left·center·right·top·middle·bottom·hspace·vspace·width·height·size.
+EditResult editAlignObjects(model::Document& doc, std::vector<Node>& pages, const std::vector<ObjectSpot>& spots,
+                            const std::string& mode, bool useStoredLineHeight = false, std::string* error = nullptr);
+// 그림 바꾸기(한글 ChangePictureDlg): 고른 그림의 크기·효과는 두고 그림 파일만 바꾼다.
+EditResult editReplacePicture(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot, const Bytes& image,
+                              bool useStoredLineHeight = false, std::string* error = nullptr);
 
 // 수식(equation_commands.cpp). 한글 2024 수식 넣기(Ctrl+N,M)·고치기와 같다.
 // 수식 편집기에 채울 값: editing(고른 수식을 고치는지), script, baseUnit(1000 = 10pt).

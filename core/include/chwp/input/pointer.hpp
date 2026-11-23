@@ -18,11 +18,13 @@ struct PointerOutcome {
     int id = 0;
     int device = 0;
     double time = 0;
+    bool longPress = false;  // 터치를 움직이지 않고 오래 눌렀다(tick 이 알린다)
 };
 
 // 포인터 id 와 마우스·터치·펜, 그리고 플랫폼 제스처를 여기서 가른다.
 // 터치와 펜은 끌면 스크롤이고 탭하면 커서를 놓는다. 둘이면 가운데가 움직이면 스크롤이고, 간격이 벌어지면 핀치다.
 // 스크롤하다 손을 떼면 마지막 속도로 감속한다. 마우스를 끌면 선택이다.
+// 한 손가락을 움직이지 않고 kLongPressMs 동안 누르고 있으면 오래 누르기다(tick 이 시간을 센다).
 class PointerInput {
  public:
     PointerOutcome pointer(render::PageView& view, const PointerEvent& event);
@@ -39,6 +41,12 @@ class PointerInput {
     Camera setGridMode(render::PageView& view, render::PageGridMode mode, int cols = 1, int rows = 1, bool fit = false);
     void stop();
     void holdSelection(int id);
+    // 이 손가락은 뗄 때까지 아무것도 하지 않는다(오래 눌러 개체를 고른 뒤 움직임).
+    void ignorePointer(int id);
+    // 오래 누르기를 기다리는 중인가(셸이 tick 을 계속 보내야 한다), 지금 오래 누르기가 됐는가(한 번만 참).
+    bool pressWaiting() const;
+    bool takeLongPress(int& id, double& x, double& y);
+    static constexpr double kLongPressMs = 500.0;
     int touchCount() const { return static_cast<int>(touches_.size()); }
     bool pinchActive() const;
     bool touchLive() const;
@@ -68,6 +76,9 @@ class PointerInput {
     ViewportInput view_;
     std::vector<std::pair<int, Contact>> touches_;
     std::vector<int> selecting_;
+    std::vector<int> ignored_;
+    double pressMs_ = 0;
+    bool pressFired_ = false;
     int tapId_ = -1;
     double tapX_ = 0;
     double tapY_ = 0;

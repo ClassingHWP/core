@@ -702,8 +702,8 @@ void writeSubListNode(pugi::xml_node parent, const SubList& sub, const BinRegist
     subList.append_attribute("lineWrap") = "BREAK";
     subList.append_attribute("vertAlign") =
         sub.vertAlign.empty() ? "TOP" : sub.vertAlign.c_str();
-    subList.append_attribute("linkListIDRef") = 0;
-    subList.append_attribute("linkListNextIDRef") = 0;
+    subList.append_attribute("linkListIDRef") = sub.linkId;
+    subList.append_attribute("linkListNextIDRef") = sub.linkNextId;
     subList.append_attribute("textWidth") = sub.textWidth;
     subList.append_attribute("textHeight") = sub.textHeight;
     subList.append_attribute("hasTextRef") = 0;
@@ -730,8 +730,8 @@ void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinR
     }
     objNode.append_attribute("textFlow") =
         p.textFlow.empty() ? "BOTH_SIDES" : p.textFlow.c_str();
-    objNode.append_attribute("lock") = 0;
-    objNode.append_attribute("dropcapstyle") = "None";
+    objNode.append_attribute("lock") = p.locked ? 1 : 0;
+    objNode.append_attribute("dropcapstyle") = p.dropCap.empty() ? "None" : p.dropCap.c_str();
 
     auto sz = objNode.append_child("hp:sz");
     // 돌린 개체의 sz 는 돌린 상자다(숨긴 한글 2024).
@@ -747,7 +747,7 @@ void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinR
     sz.append_attribute("widthRelTo") = "ABSOLUTE";
     sz.append_attribute("height") = boxH;
     sz.append_attribute("heightRelTo") = "ABSOLUTE";
-    sz.append_attribute("protect") = 0;
+    sz.append_attribute("protect") = p.sizeProtect ? 1 : 0;
 
     // 묶음 자식은 쪽 기준 위치가 없다. pos 를 붙이면 저장 뒤에 묶음 밖으로 나간다.
     if (!grouped) {
@@ -781,6 +781,95 @@ void writePlacementNodes(pugi::xml_node objNode, const Control& ctrl, const BinR
         capNode.append_attribute("lastWidth") = cap.lastWidth;
         writeSubListNode(capNode, cap.content, bins);
     }
+}
+
+// 양식 개체(한글 2024 가 쓰는 hp:btn·hp:checkBtn·hp:radioBtn·hp:comboBox·hp:edit 꼴).
+void writeFormNode(pugi::xml_node runNode, const Control& ctrl) {
+    const FormObject f = ctrl.form.value_or(FormObject{});
+    const std::string tag = "hp:" + (f.type.empty() ? std::string("btn") : f.type);
+    auto n = runNode.append_child(tag.c_str());
+    const bool button = f.type == "btn" || f.type == "checkBtn" || f.type == "radioBtn";
+    if (button) n.append_attribute("caption") = f.caption.c_str();
+    if (f.type == "checkBtn" || f.type == "radioBtn") {
+        n.append_attribute("value") = f.value == 1 ? "CHECKED" : f.value == 2 ? "INDETERMINATE" : "UNCHECKED";
+    }
+    if (button) {
+        n.append_attribute("radioGroupName") = f.radioGroupName.c_str();
+        n.append_attribute("triState") = f.triState ? 1 : 0;
+    }
+    if (f.type == "checkBtn" || f.type == "radioBtn") n.append_attribute("backStyle") = f.backStyle == 0 ? "TRANSPARENT" : "OPAQUE";
+    if (f.type == "comboBox") {
+        n.append_attribute("listBoxRows") = f.listBoxRows;
+        n.append_attribute("listBoxWidth") = f.listBoxWidth;
+        n.append_attribute("editEnable") = f.editEnable ? 1 : 0;
+        n.append_attribute("selectedValue") = f.text.c_str();
+    }
+    if (f.type == "edit") {
+        static const char* bars[] = {"NONE", "HORIZONTAL", "VERTICAL", "BOTH"};
+        static const char* aligns[] = {"LEFT", "CENTER", "RIGHT"};
+        n.append_attribute("multiLine") = f.multiLine ? 1 : 0;
+        n.append_attribute("passwordChar") = f.passwordChar.c_str();
+        n.append_attribute("maxLength") = f.maxLength;
+        n.append_attribute("scrollBars") = bars[std::clamp(f.scrollBars, 0, 3)];
+        n.append_attribute("tabKeyBehavior") = f.tabKeyBehavior == 1 ? "INSERT_TAB" : "NEXT_OBJECT";
+        n.append_attribute("numOnly") = f.numOnly ? 1 : 0;
+        n.append_attribute("readOnly") = f.readOnly ? 1 : 0;
+        n.append_attribute("alignText") = aligns[std::clamp(f.alignText, 0, 2)];
+    }
+    n.append_attribute("name") = f.name.c_str();
+    n.append_attribute("foreColor") = f.foreColor.c_str();
+    n.append_attribute("backColor") = f.backColor.c_str();
+    n.append_attribute("groupName") = f.groupName.c_str();
+    n.append_attribute("tabStop") = f.tabStop ? 1 : 0;
+    n.append_attribute("editable") = f.editable ? 1 : 0;
+    n.append_attribute("tabOrder") = f.tabOrder;
+    n.append_attribute("enabled") = f.enabled ? 1 : 0;
+    n.append_attribute("borderTypeIDRef") = f.borderType;
+    n.append_attribute("drawFrame") = f.drawFrame ? 1 : 0;
+    n.append_attribute("printable") = f.printable ? 1 : 0;
+    n.append_attribute("command") = f.command.c_str();
+    auto pr = n.append_child("hp:formCharPr");
+    pr.append_attribute("charPrIDRef") = f.charShapeId;
+    pr.append_attribute("followContext") = f.followContext ? 1 : 0;
+    pr.append_attribute("autoSz") = f.autoSize ? 1 : 0;
+    pr.append_attribute("wordWrap") = f.wordWrap ? 1 : 0;
+    if (f.type == "comboBox") {
+        if (f.items.empty()) {
+            auto item = n.append_child("hp:listItem");
+            item.append_attribute("displayText") = "";
+            item.append_attribute("value") = "";
+        }
+        for (const auto& [shown, value] : f.items) {
+            auto item = n.append_child("hp:listItem");
+            item.append_attribute("displayText") = shown.c_str();
+            item.append_attribute("value") = value.c_str();
+        }
+    }
+    if (f.type == "edit") n.append_child("hp:text").text().set(f.text.c_str());
+    const Placement p = ctrl.placement.value_or(Placement{});
+    auto sz = n.append_child("hp:sz");
+    sz.append_attribute("width") = p.width;
+    sz.append_attribute("widthRelTo") = "ABSOLUTE";
+    sz.append_attribute("height") = p.height;
+    sz.append_attribute("heightRelTo") = "ABSOLUTE";
+    sz.append_attribute("protect") = p.sizeProtect ? 1 : 0;
+    auto pos = n.append_child("hp:pos");
+    pos.append_attribute("treatAsChar") = p.treatAsChar ? 1 : 0;
+    pos.append_attribute("affectLSpacing") = 0;
+    pos.append_attribute("flowWithText") = p.flowWithText ? 1 : 0;
+    pos.append_attribute("allowOverlap") = p.allowOverlap ? 1 : 0;
+    pos.append_attribute("holdAnchorAndSO") = 0;
+    pos.append_attribute("vertRelTo") = p.vertRelTo.empty() ? "PARA" : p.vertRelTo.c_str();
+    pos.append_attribute("horzRelTo") = p.horzRelTo.empty() ? "COLUMN" : p.horzRelTo.c_str();
+    pos.append_attribute("vertAlign") = p.vertAlign.empty() ? "TOP" : p.vertAlign.c_str();
+    pos.append_attribute("horzAlign") = p.horzAlign.empty() ? "LEFT" : p.horzAlign.c_str();
+    pos.append_attribute("vertOffset") = p.vertOffset;
+    pos.append_attribute("horzOffset") = p.horzOffset;
+    auto outMargin = n.append_child("hp:outMargin");
+    outMargin.append_attribute("left") = p.marginLeft;
+    outMargin.append_attribute("right") = p.marginRight;
+    outMargin.append_attribute("top") = p.marginTop;
+    outMargin.append_attribute("bottom") = p.marginBottom;
 }
 
 void writeSecPrNode(pugi::xml_node runNode, const Control* secCtrl, const Section* secPtr,
@@ -1502,6 +1591,15 @@ void writeObjectNode(pugi::xml_node parent, const Control& ctrl, const BinRegist
 
         writeFillBrushNode(node, ctrl.fillColor, ctrl.gradColor, ctrl.gradAngle, ctrl.binItemId,
                            ctrl.binItemId.empty() ? -1 : 5, bins);
+        // 그리기 개체 그림자. 글맵시는 아래에서 따로 쓴다.
+        if (tag != "hp:textart") {
+            auto shadow = node.append_child("hp:shadow");
+            shadow.append_attribute("type") = ctrl.shadow.on() ? ctrl.shadow.type.c_str() : "NONE";
+            shadow.append_attribute("color") = ctrl.shadow.color.empty() ? "#B2B2B2" : ctrl.shadow.color.c_str();
+            shadow.append_attribute("offsetX") = ctrl.shadow.offsetX;
+            shadow.append_attribute("offsetY") = ctrl.shadow.offsetY;
+            shadow.append_attribute("alpha") = ctrl.shadow.alpha;
+        }
     }
 
     const Placement p = ctrl.placement.value_or(Placement{});
@@ -1907,6 +2005,9 @@ void writeControlInRun(pugi::xml_node runNode, const Control& ctrl, const BinReg
             fe.append_attribute("beginIDRef") = begin;
             break;
         }
+        case ControlKind::Form:
+            writeFormNode(runNode, ctrl);
+            break;
         case ControlKind::Unknown:
             break;
     }

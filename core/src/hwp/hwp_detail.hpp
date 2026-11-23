@@ -44,4 +44,10 @@ private:
     std::size_t mismatches_ = 0;
 };
 
+// 양식 개체 레코드(FORM_OBJECT). 종류 id 4 바이트 두 번, 글 길이 u32, 속성 글(HWP 문자열). 속성 글은
+// "CommonSet:set:길이:Name:wstring:길이:글 TabStop:bool:1 ... " 꼴이다(한글 2024 로 저장해 확인).
+// 종류 id 는 +pbt(명령 단추), +cbt(선택 상자), +rbt(라디오 단추), +cob(콤보 상자), +edt(입력 상자)다.
+bool readFormRecord(ByteView data, model::FormObject& out);
+Bytes formRecordBytes(const model::FormObject& form);
+
 }  // namespace chwp::hwp::detail

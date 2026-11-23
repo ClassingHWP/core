@@ -1261,4 +1261,233 @@ TableEdit flipTable(Table& table, TableFlip flip, bool swapMargins, const Border
     return out;
 }
 
+namespace {
+
+// 표 그리기·지우개의 축. horizontal 이면 선을 따라가는 축이 칸(열), 가로지르는 축이 줄이다.
+struct LineAxes {
+    std::vector<std::int64_t> along;   // 그린 열(가로선) 또는 줄(세로선) 경계
+    std::vector<std::int64_t> across;  // 그린 줄(가로선) 또는 열(세로선) 경계
+};
+
+LineAxes lineAxes(const Table& table, const TableLine& line) {
+    const std::vector<std::int32_t> rows = line.rows.empty() ? tableRowHeights(table) : line.rows;
+    const std::vector<std::int32_t> cols = line.cols.empty() ? tableColumnWidths(table) : line.cols;
+    LineAxes axes;
+    axes.along = edges(line.horizontal ? cols : rows);
+    axes.across = edges(line.horizontal ? rows : cols);
+    return axes;
+}
+
+int alongFirst(const TableCell& c, bool horizontal) { return static_cast<int>(horizontal ? c.col : c.row); }
+int alongLast(const TableCell& c, bool horizontal) { return horizontal ? lastCol(c) : lastRow(c); }
+int acrossFirst(const TableCell& c, bool horizontal) { return static_cast<int>(horizontal ? c.row : c.col); }
+int acrossLast(const TableCell& c, bool horizontal) { return horizontal ? lastRow(c) : lastCol(c); }
+
+std::int64_t edgeAt(const std::vector<std::int64_t>& e, int index) {
+    return e.empty() ? 0 : e[static_cast<std::size_t>(std::clamp(index, 0, static_cast<int>(e.size()) - 1))];
+}
+
+// 칸이 선 구간(from~to)과 겹치는 길이가 있는지.
+bool crossesSpan(const TableCell& c, const TableLine& line, const LineAxes& axes) {
+    const std::int64_t a = edgeAt(axes.along, alongFirst(c, line.horizontal));
+    const std::int64_t b = edgeAt(axes.along, alongLast(c, line.horizontal) + 1);
+    return std::min(b, std::max(line.from, line.to)) - std::max(a, std::min(line.from, line.to)) > 0;
+}
+
+// 칸 테두리의 한 변을 고친다. after 면 선 뒤(아래·오른쪽) 변, 아니면 앞(위·왼쪽) 변이다.
+void setCellSide(TableCell& c, bool horizontal, bool farSide, const BorderSide& side, const BorderFillAccess& fills) {
+    if (!fills.read || !fills.intern) return;
+    BorderFill fill = fills.read(c.borderFillId);
+    BorderSide& slot = horizontal ? (farSide ? fill.bottom : fill.top) : (farSide ? fill.right : fill.left);
+    slot = side;
+    c.borderFillId = fills.intern(fill);
+}
+
+// 가장 가까운 경계 번호. near 밖이면 -1.
+int nearEdge(const std::vector<std::int64_t>& e, std::int64_t at, std::int64_t near) {
+    int best = -1;
+    std::int64_t bestDist = near;
+    for (std::size_t k = 0; k < e.size(); ++k) {
+        const std::int64_t dist = std::llabs(e[k] - at);
+        if (dist <= bestDist) {
+            bestDist = dist;
+            best = static_cast<int>(k);
+        }
+    }
+    return best;
+}
+
+// 칸 index 를 경계 번호 split(그 칸 안의 줄·칸 경계)에서 둘로 나눈다. 앞 칸이 글을 갖고, 뒤 칸은 빈 칸이다.
+void splitCellAtLine(Table& table, int index, int split, bool horizontal, const std::vector<std::int32_t>& sizes,
+                     const BorderSide& pen, const BorderFillAccess& fills) {
+    TableCell& cell = table.cells[static_cast<std::size_t>(index)];
+    const int first = acrossFirst(cell, horizontal);
+    const int last = acrossLast(cell, horizontal);
+    if (split <= first || split > last) return;
+    TableCell tail = emptyCellLike(cell);
+    std::uint32_t& oldSize = horizontal ? cell.height : cell.width;
+    const std::int32_t head = sumRange(sizes, first, split - 1);
+    const std::int32_t rest = std::max<std::int32_t>(1, static_cast<std::int32_t>(oldSize) - head);
+    if (horizontal) {
+        tail.row = static_cast<std::uint32_t>(split);
+        tail.rowSpan = static_cast<std::uint32_t>(last + 1 - split);
+        tail.col = cell.col;
+        tail.colSpan = cell.colSpan;
+        tail.height = static_cast<std::uint32_t>(rest);
+        cell.rowSpan = static_cast<std::uint32_t>(split - first);
+        cell.height = static_cast<std::uint32_t>(std::max<std::int32_t>(1, head));
+    } else {
+        tail.col = static_cast<std::uint32_t>(split);
+        tail.colSpan = static_cast<std::uint32_t>(last + 1 - split);
+        tail.row = cell.row;
+        tail.rowSpan = cell.rowSpan;
+        tail.width = static_cast<std::uint32_t>(rest);
+        cell.colSpan = static_cast<std::uint32_t>(split - first);
+        cell.width = static_cast<std::uint32_t>(std::max<std::int32_t>(1, head));
+    }
+    setCellSide(cell, horizontal, true, pen, fills);
+    setCellSide(tail, horizontal, false, pen, fills);
+    clearLines(cell);
+    table.cells.push_back(std::move(tail));
+}
+
+}  // namespace
+
+TableEdit drawTableLine(Table& table, const TableLine& line, const BorderSide& pen, const BorderFillAccess& fills) {
+    TableEdit out;
+    if (out.error = checkTable(table, 0); !out.ok()) return out;
+    const LineAxes axes = lineAxes(table, line);
+    const bool h = line.horizontal;
+    std::vector<std::int32_t> sizes = h ? tableRowHeights(table) : tableColumnWidths(table);
+    const std::vector<std::int64_t> model = edges(sizes);
+    const int edge = nearEdge(axes.across, line.at, line.near);
+    std::vector<int> crossed;
+    bool changed = false;
+    if (edge >= 0) {
+        // 경계 위. 그 경계가 칸 사이 선이면 앞 칸(없으면 뒤 칸)의 선을 펜으로 긋고, 경계를 품은 칸은 그 경계에서 나눈다.
+        std::vector<int> before;
+        std::vector<int> after;
+        for (std::size_t i = 0; i < table.cells.size(); ++i) {
+            const TableCell& c = table.cells[i];
+            if (!crossesSpan(c, line, axes)) continue;
+            if (acrossLast(c, h) + 1 == edge) before.push_back(static_cast<int>(i));
+            else if (acrossFirst(c, h) == edge) after.push_back(static_cast<int>(i));
+            else if (acrossFirst(c, h) < edge && acrossLast(c, h) >= edge) crossed.push_back(static_cast<int>(i));
+        }
+        for (int i : before.empty() ? after : before) {
+            setCellSide(table.cells[static_cast<std::size_t>(i)], h, !before.empty(), pen, fills);
+            changed = true;
+        }
+        for (int i : crossed) splitCellAtLine(table, i, edge, h, sizes, pen, fills);
+        changed = changed || !crossed.empty();
+    } else {
+        // 경계가 없는 자리. 그린 크기의 그 자리를 칸 크기 값의 자리로 옮겨 새 경계를 긋는다.
+        int j = -1;
+        for (std::size_t k = 0; k + 1 < axes.across.size(); ++k) {
+            if (axes.across[k] < line.at && line.at < axes.across[k + 1]) j = static_cast<int>(k);
+        }
+        if (j < 0 || j >= static_cast<int>(sizes.size())) {
+            out.error = "표 안에 선을 그으세요.";
+            return out;
+        }
+        for (std::size_t i = 0; i < table.cells.size(); ++i) {
+            const TableCell& c = table.cells[i];
+            if (crossesSpan(c, line, axes) && acrossFirst(c, h) <= j && acrossLast(c, h) >= j) {
+                crossed.push_back(static_cast<int>(i));
+            }
+        }
+        if (crossed.empty()) {
+            out.error = "선이 지나는 칸이 없습니다.";
+            return out;
+        }
+        const std::int64_t drawn = std::max<std::int64_t>(1, axes.across[static_cast<std::size_t>(j) + 1] -
+                                                               axes.across[static_cast<std::size_t>(j)]);
+        const std::int64_t size = sizes[static_cast<std::size_t>(j)];
+        const std::int64_t offset =
+            std::clamp<std::int64_t>((line.at - axes.across[static_cast<std::size_t>(j)]) * size / drawn, 1, std::max<std::int64_t>(1, size - 1));
+        const int split = addLine(table, sizes, model[static_cast<std::size_t>(j)] + offset, h);
+        for (int i : crossed) splitCellAtLine(table, i, split, h, sizes, pen, fills);
+        changed = true;
+    }
+    if (!changed) {
+        out.error = "그을 선이 없습니다.";
+        return out;
+    }
+    out.focusCell = finish(table, -1);
+    return out;
+}
+
+TableEdit eraseTableLine(Table& table, const TableLine& line, const BorderFillAccess& fills) {
+    TableEdit out;
+    if (out.error = checkTable(table, 0); !out.ok()) return out;
+    const LineAxes axes = lineAxes(table, line);
+    const bool h = line.horizontal;
+    const int edge = nearEdge(axes.across, line.at, line.near);
+    if (edge < 0) {
+        out.error = "지울 선 위를 끌어 주세요.";
+        return out;
+    }
+    std::vector<int> before;
+    std::vector<int> after;
+    for (std::size_t i = 0; i < table.cells.size(); ++i) {
+        const TableCell& c = table.cells[i];
+        if (!crossesSpan(c, line, axes)) continue;
+        if (acrossLast(c, h) + 1 == edge) before.push_back(static_cast<int>(i));
+        else if (acrossFirst(c, h) == edge) after.push_back(static_cast<int>(i));
+    }
+    if (before.empty() && after.empty()) {
+        out.error = "지울 선이 없습니다.";
+        return out;
+    }
+    // 앞 칸 하나와 뒤 칸 하나가 같은 폭으로 맞닿으면 합칠 짝이다. 짝이 아닌 칸은 그 선만 지운다.
+    struct Pair {
+        int row0, col0, row1, col1;
+    };
+    std::vector<Pair> pairs;
+    std::vector<bool> paired(table.cells.size(), false);
+    for (int a : before) {
+        const TableCell& ca = table.cells[static_cast<std::size_t>(a)];
+        int match = -1;
+        int touching = 0;
+        for (std::size_t i = 0; i < table.cells.size(); ++i) {
+            const TableCell& cb = table.cells[i];
+            if (acrossFirst(cb, h) != edge) continue;
+            const bool overlap = alongFirst(cb, h) <= alongLast(ca, h) && alongLast(cb, h) >= alongFirst(ca, h);
+            if (!overlap) continue;
+            ++touching;
+            if (alongFirst(cb, h) == alongFirst(ca, h) && alongLast(cb, h) == alongLast(ca, h)) match = static_cast<int>(i);
+        }
+        if (touching != 1 || match < 0) continue;
+        const TableCell& cb = table.cells[static_cast<std::size_t>(match)];
+        paired[static_cast<std::size_t>(a)] = true;
+        paired[static_cast<std::size_t>(match)] = true;
+        pairs.push_back(Pair{static_cast<int>(ca.row), static_cast<int>(ca.col), lastRow(cb), lastCol(cb)});
+    }
+    const BorderSide none{"NONE", "#000000", 0};
+    for (int i : before) {
+        if (paired[static_cast<std::size_t>(i)]) continue;
+        TableCell& c = table.cells[static_cast<std::size_t>(i)];
+        BorderSide side = fills.read ? (h ? fills.read(c.borderFillId).bottom : fills.read(c.borderFillId).right) : none;
+        side.type = "NONE";
+        setCellSide(c, h, true, side, fills);
+    }
+    for (int i : after) {
+        if (paired[static_cast<std::size_t>(i)]) continue;
+        TableCell& c = table.cells[static_cast<std::size_t>(i)];
+        BorderSide side = fills.read ? (h ? fills.read(c.borderFillId).top : fills.read(c.borderFillId).left) : none;
+        side.type = "NONE";
+        setCellSide(c, h, false, side, fills);
+    }
+    // 짝을 합친다. 합쳐도 다른 짝이 쓰는 경계는 남으므로 미리 적은 줄·칸 번호가 그대로다.
+    for (const Pair& p : pairs) {
+        TableEdit merged = mergeTableCells(table, p.row0, p.col0, p.row1, p.col1);
+        if (!merged.ok()) {
+            out.error = merged.error;
+            return out;
+        }
+    }
+    out.focusCell = finish(table, -1);
+    return out;
+}
+
 }  // namespace chwp::model

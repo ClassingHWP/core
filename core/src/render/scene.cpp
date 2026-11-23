@@ -1,6 +1,7 @@
 #include "chwp/render/scene.hpp"
 #include "chwp/render/paint.hpp"
 #include "chwp/model/table_edit.hpp"
+#include "chwp/common/unicode.hpp"
 
 #include "render/column_geom.hpp"
 #include "render/line_breaker.hpp"
@@ -488,7 +489,8 @@ bool visualObject(const Control& control) {
     return control.placement &&
            (control.kind == ControlKind::Shape || control.kind == ControlKind::Picture ||
             control.kind == ControlKind::Table || control.kind == ControlKind::Container ||
-            control.kind == ControlKind::Equation || control.kind == ControlKind::Ole);
+            control.kind == ControlKind::Equation || control.kind == ControlKind::Ole ||
+            control.kind == ControlKind::Form);
 }
 
 // 머리말·꼬리말·각주·미주·쪽 번호는 여백에 따로 그리지만, 본문 문단의 그 자리도 빈 줄이 아니다.
@@ -881,6 +883,197 @@ void attachCaption(Node& object, const Control& control, const Document& doc, in
     else if (cap.side == "LEFT") object.x -= x;
 }
 
+// 글상자 연결(한글 LinkTextBox). 글은 모두 첫 글상자에 있고, 넘치는 줄이 다음 글상자 맨 위부터 이어진다.
+// 줄이 들어가는지는 줄 간격까지 넣어 잰다(숨긴 한글 2024: 안 높이 7400 에 간격 1600 줄 넷, 다섯째는 다음 상자).
+void collectLinkBoxes(const std::vector<Paragraph>& paragraphs, std::vector<const Control*>& out, int depth = 0) {
+    if (depth > 8) return;
+    const auto linked = [](const Control& c) {
+        return !c.subLists.empty() && (c.subLists.front().linkId != 0 || c.subLists.front().linkNextId != 0);
+    };
+    for (const Paragraph& para : paragraphs) {
+        for (const Run& run : para.runs) {
+            for (const InlineItem& item : run.items) {
+                if (item.type != InlineItem::Type::Control) continue;
+                const Control& c = item.control;
+                if (linked(c)) out.push_back(&c);
+                for (const SubList& list : c.subLists) collectLinkBoxes(list.paragraphs, out, depth + 1);
+                if (c.table) {
+                    for (const TableCell& cell : c.table->cells) collectLinkBoxes(cell.content.paragraphs, out, depth + 1);
+                }
+                for (const Control& child : c.children) {
+                    if (linked(child)) out.push_back(&child);
+                }
+            }
+        }
+    }
+}
+
+std::vector<const Control*> linkChain(const Document& doc, const Control& control) {
+    std::vector<const Control*> boxes;
+    for (const Section& section : doc.sections) collectLinkBoxes(section.paragraphs, boxes);
+    const auto byId = [&](std::uint32_t id) -> const Control* {
+        if (id == 0) return nullptr;
+        for (const Control* c : boxes) {
+            if (c->subLists.front().linkId == id) return c;
+        }
+        return nullptr;
+    };
+    // 앞 상자를 거슬러 처음 상자를 찾는다.
+    const Control* head = &control;
+    for (int guard = 0; guard < 64; ++guard) {
+        const Control* prev = nullptr;
+        const std::uint32_t id = head->subLists.front().linkId;
+        for (const Control* c : boxes) {
+            if (id != 0 && c->subLists.front().linkNextId == id) prev = c;
+        }
+        if (!prev || prev == &control) break;
+        head = prev;
+    }
+    std::vector<const Control*> chain;
+    for (const Control* at = head; at && chain.size() < 64; at = byId(at->subLists.front().linkNextId)) {
+        if (std::find(chain.begin(), chain.end(), at) != chain.end()) break;
+        chain.push_back(at);
+    }
+    return chain;
+}
+
+// keep 이 거짓인 줄과 줄이 하나도 남지 않은 문단은 뺀다.
+bool keepLinkedLines(Node& node, const std::function<bool()>& keep) {
+    if (node.kind == NodeKind::Line) return keep();
+    bool any = false;
+    std::vector<Node> kept;
+    for (Node& child : node.children) {
+        if (keepLinkedLines(child, keep)) {
+            any = true;
+            kept.push_back(std::move(child));
+        }
+    }
+    node.children = std::move(kept);
+    return any || node.kind == NodeKind::Body || node.kind == NodeKind::Column;
+}
+
+bool fillLinkedBox(Node& object, const Control& control, const Document& doc, int depth, std::int32_t defaultTab,
+                   bool useStoredLineHeight, bool deferSpans) {
+    const SubList& own = control.subLists.front();
+    if (own.linkId == 0 && own.linkNextId == 0) return false;
+    const std::vector<const Control*> chain = linkChain(doc, control);
+    if (chain.size() < 2) return false;
+    const auto at = std::find(chain.begin(), chain.end(), &control);
+    if (at == chain.end()) return false;
+    const std::size_t index = static_cast<std::size_t>(at - chain.begin());
+    const SubList& list = chain.front()->subLists.front();
+    // 상자마다 제 글자 방향과 크기로 줄을 나눈다(숨긴 한글 2024: 첫 상자만 세로쓰기면 그 상자는 높이 5100 줄 8개,
+    // 이어진 가로 상자는 제 폭 13604 줄로 남은 글을 잇는다). 줄 길이는 가로면 글 폭(lastWidth)에서, 세로면 상자
+    // 높이에서 여백을 뺀 값이고, 줄을 쌓을 자리는 그 반대쪽이다.
+    struct Room {
+        std::uint8_t dir = 0;
+        std::int32_t line = 0;
+        std::int32_t stack = 0;
+    };
+    const auto roomOf = [](const Control& c) {
+        Room room;
+        room.dir = c.subLists.empty() ? 0 : c.subLists.front().textDirection;
+        const std::int32_t boxW = static_cast<std::int32_t>(c.placement ? c.placement->width : 0);
+        const std::int32_t boxH = static_cast<std::int32_t>(c.placement ? c.placement->height : 0);
+        if (room.dir != 0) {
+            room.line = std::max<std::int32_t>(200, boxH - c.boxPadTop - c.boxPadBottom);
+            room.stack = std::max<std::int32_t>(200, boxW - c.boxPadLeft - c.boxPadRight);
+            return room;
+        }
+        const std::int32_t width = c.boxTextWidth > 0 && c.boxTextWidth <= 0x7FFFFFFFu
+                                       ? static_cast<std::int32_t>(c.boxTextWidth)
+                                       : boxW;
+        room.line = std::max<std::int32_t>(200, width - c.boxPadLeft - c.boxPadRight);
+        room.stack = std::max<std::int32_t>(200, boxH - c.boxPadTop - c.boxPadBottom);
+        return room;
+    };
+    int startParagraph = 0;
+    std::size_t startAtom = 0;
+    for (std::size_t k = 0; k <= index; ++k) {
+        if (startParagraph >= static_cast<int>(list.paragraphs.size())) return true;  // 앞 상자에서 글이 끝났다
+        const Room room = roomOf(*chain[k]);
+        Frame inner;
+        inner.doc = &doc;
+        inner.paragraphs = &list.paragraphs;
+        inner.pageDef.width = static_cast<std::uint32_t>(room.line);
+        inner.pageDef.height = static_cast<std::uint32_t>(room.stack);
+        inner.depth = depth + 1;
+        inner.defaultTab = defaultTab;
+        inner.useStoredLineHeight = useStoredLineHeight;
+        inner.deferSpans = deferSpans && room.dir == 0;
+        inner.textDirection = room.dir;
+        inner.story = takeStory(&list.paragraphs);
+        Node content = layoutFrame(inner, startParagraph, startAtom, nullptr);
+        // 상자 안 쌓을 자리에 줄 간격까지 들어가야 그 상자다. 첫 줄은 넘쳐도 둔다. 마지막 상자는 남은 줄을 모두 둔다.
+        const bool last = k + 1 == chain.size();
+        std::int32_t base = 0;
+        bool started = false;
+        bool over = false;
+        std::size_t kept = 0;
+        std::int32_t used = 0;
+        int nextParagraph = -1;
+        int nextPos = 0;
+        const std::function<void(const Node&, std::int32_t, int)> walk = [&](const Node& n, std::int32_t y, int para) {
+            if (over) return;
+            if (n.kind == NodeKind::Line) {
+                if (!started) {
+                    base = y;
+                    started = true;
+                }
+                if (!last && y > base && y - base + n.height > room.stack) {
+                    over = true;
+                    nextParagraph = para;
+                    nextPos = std::max(0, n.start);
+                    return;
+                }
+                ++kept;
+                const std::int32_t text = n.lineData().textHeight > 0 ? n.lineData().textHeight : n.fontSize;
+                used = std::max(used, y - base + std::max(text, 0));
+                return;
+            }
+            const int at = n.kind == NodeKind::Paragraph ? n.paragraph : para;
+            for (const Node& child : n.children) walk(child, y + child.y, at);
+        };
+        walk(content, 0, startParagraph);
+        if (k < index) {
+            if (!over) return true;  // 남은 글이 이 상자에서 끝났다
+            // 다음 상자는 넘친 줄의 첫 글자부터 짠다.
+            startParagraph = nextParagraph;
+            startAtom = 0;
+            if (nextPos > 0 && nextParagraph >= 0 && nextParagraph < static_cast<int>(list.paragraphs.size())) {
+                const Paragraph& para = list.paragraphs[static_cast<std::size_t>(nextParagraph)];
+                AtomOptions options;
+                options.storedPositions = useStoredLineHeight && !para.lineSegs.empty();
+                const std::vector<Atom> atoms = buildAtoms(doc, para, findParaShape(doc, para.paraShapeId), options);
+                while (startAtom < atoms.size() && atoms[startAtom].pos < nextPos) ++startAtom;
+            }
+            continue;
+        }
+        std::size_t cursor = 0;
+        keepLinkedLines(content, [&]() { return cursor++ < kept; });
+        // 상자마다 제 세로 정렬로 남은 줄을 놓는다(숨긴 한글 2024: 이어진 둘째 상자의 두 줄이 가운데).
+        // 세로쓰기는 그 정렬이 줄을 쌓는 쪽으로 간다.
+        const SubList& mine = control.subLists.front();
+        const std::int32_t spare = room.stack - used;
+        std::int32_t shift = 0;
+        if (spare > 0 && mine.vertAlign == "CENTER") shift = spare / 2;
+        else if (spare > 0 && mine.vertAlign == "BOTTOM") shift = spare;
+        const std::int32_t lead = k == 0 ? 0 : base;  // 이어 받은 상자는 첫 줄을 맨 위에 둔다
+        if (room.dir != 0) {
+            content.turned = room.dir;
+            content.turnSpan = object.width;
+            content.x = control.boxPadTop;
+            content.y = control.boxPadRight + shift - lead;
+        } else {
+            content.x = control.boxPadLeft;
+            content.y = control.boxPadTop + shift - lead;
+        }
+        content.vertAlign = "TOP";
+        object.children.push_back(std::move(content));
+    }
+    return true;
+}
+
 void fillInside(Node& object, const Control& control, const Document& doc, int depth,
                 std::int32_t defaultTab, bool useStoredLineHeight, bool deferSpans) {
     if (depth >= kMaxDepth) return;
@@ -1099,9 +1292,12 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
                                              defaultTab, useStoredLineHeight, deferSpans));
     }
     if (control.subLists.empty()) return;
+    if (fillLinkedBox(object, control, doc, depth, defaultTab, useStoredLineHeight, deferSpans)) return;
     // 줄 폭은 저장된 글상자 폭에서 잡는다. 배율이 있으면 지금 크기보다 1 클 수 있다. 37109 상자에 37110이다.
+    // 한글은 문단 첫 글자 장식 상자에 0xFFFFFFFF 를 적는다. 그런 값은 없는 것으로 보고 개체 폭을 쓴다.
     const std::int32_t textWidth =
-        control.boxTextWidth > 0 ? static_cast<std::int32_t>(control.boxTextWidth) : object.width;
+        control.boxTextWidth > 0 && control.boxTextWidth <= 0x7FFFFFFFu ? static_cast<std::int32_t>(control.boxTextWidth)
+                                                                          : object.width;
     const std::int32_t innerW =
         std::max<std::int32_t>(200, textWidth - control.boxPadLeft - control.boxPadRight);
     const std::int32_t innerH =
@@ -1114,8 +1310,11 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             Frame inner;
             inner.doc = &doc;
             inner.paragraphs = &list.paragraphs;
+            // 세로쓰기면 한글은 글 폭(lastWidth)에 상자 높이를 적는다. 줄을 쌓는 너비는 상자 너비에서 잡는다.
+            const std::int32_t stackRoom =
+                std::max<std::int32_t>(200, object.width - control.boxPadLeft - control.boxPadRight);
             inner.pageDef.width = static_cast<std::uint32_t>(innerH);
-            inner.pageDef.height = static_cast<std::uint32_t>(innerW);
+            inner.pageDef.height = static_cast<std::uint32_t>(stackRoom);
             inner.depth = depth + 1;
             inner.defaultTab = defaultTab;
             inner.useStoredLineHeight = useStoredLineHeight;
@@ -1124,8 +1323,13 @@ void fillInside(Node& object, const Control& control, const Document& doc, int d
             Node content = layoutFrame(inner);
             content.turned = list.textDirection;
             content.turnSpan = object.width;
+            // 세로 정렬은 줄을 쌓는 쪽으로 간다(숨긴 한글 2024: 아래 정렬 세로쓰기는 줄이 상자 왼쪽에 붙는다).
+            const std::int32_t stacked = columnContentBottom(content);
+            std::int32_t shift = 0;
+            if (list.vertAlign == "CENTER" && stacked < stackRoom) shift = (stackRoom - stacked) / 2;
+            else if (list.vertAlign == "BOTTOM" && stacked < stackRoom) shift = stackRoom - stacked;
             content.x = control.boxPadTop;
-            content.y = control.boxPadRight;
+            content.y = control.boxPadRight + shift;
             content.vertAlign = "TOP";
             object.children.push_back(std::move(content));
             continue;
@@ -1165,6 +1369,84 @@ std::int32_t captionBelow(const Node& object) {
         if (child.role == "caption" && child.ext().obj().fileHorzRel == "BOTTOM") return columnContentBottom(child) + child.ext().obj().fileX;
     }
     return 0;
+}
+
+std::u32string formCodePoints(const std::string& text) {
+    const std::u16string units = chwp::utf8ToUtf16(text);
+    std::u32string out;
+    for (std::size_t i = 0; i < units.size(); ++i) {
+        char32_t c = units[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < units.size()) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (units[i + 1] - 0xDC00);
+            ++i;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+// 양식 개체의 글 자리(한글 2024 화면·PDF): 글자 모양(9pt)으로 재고 세로 가운데에 둔다. 명령 단추는 가운데,
+// 선택 상자·라디오 단추는 단추 그림(글자 크기 정사각) 뒤 빈칸 하나 뒤, 입력·콤보 상자는 안쪽 테두리 뒤다.
+// 비어 있는 입력·콤보 상자는 이름을 빨간 기울임으로 보인다.
+std::shared_ptr<const FormLook> formLook(const Document& doc, const model::FormObject& form, std::int32_t width,
+                                         std::int32_t height) {
+    auto look = std::make_shared<FormLook>();
+    look->form = form;
+    const CharShape* shape = nullptr;
+    for (const auto& cs : doc.header.charShapes) {
+        if (cs.id == form.charShapeId) shape = &cs;
+    }
+    CharShape fallback;
+    fallback.height = 900;
+    const CharShape& cs = shape ? *shape : fallback;
+    const std::int32_t size = cs.height > 0 ? cs.height : 900;
+    std::string text = form.type == "edit" || form.type == "comboBox" ? form.text : form.caption;
+    look->color = form.foreColor.empty() ? "#000000" : form.foreColor;
+    if (text.empty() && (form.type == "edit" || form.type == "comboBox")) {
+        text = form.name;
+        look->hint = true;
+        look->italic = true;
+        look->color = "#FF0000";
+    }
+    if (!form.passwordChar.empty() && form.type == "edit" && !look->hint) {
+        std::string masked;
+        for (const char32_t c : formCodePoints(text)) {
+            (void)c;
+            masked += form.passwordChar;
+        }
+        text = masked;
+    }
+    std::int32_t textW = 0;
+    std::vector<std::pair<char32_t, std::int32_t>> cps;
+    for (const char32_t cp : formCodePoints(text)) {
+        const std::int32_t w = glyphWidth(doc, cp, cs);
+        cps.emplace_back(cp, w);
+        textW += w;
+    }
+    const std::int32_t px = 75;  // 화면 1px(96dpi)
+    std::int32_t x = 0;
+    if (form.type == "btn") {
+        x = (width - textW) / 2;
+    } else if (form.type == "checkBtn" || form.type == "radioBtn") {
+        x = size + glyphWidth(doc, U' ', cs);
+    } else {
+        x = 3 * px;
+        if (form.type == "edit" && form.alignText == 1) x = (width - textW) / 2;
+        else if (form.type == "edit" && form.alignText == 2) x = width - 3 * px - textW;
+    }
+    for (const auto& [code, w] : cps) {
+        FormLook::Glyph g;
+        g.cp = code;
+        const GlyphFace face = glyphFace(doc, cs, code, true, true);
+        g.font = face.font;
+        g.size = size * face.relSize / 100;
+        g.ratio = face.ratio;
+        g.x = x;
+        look->glyphs.push_back(std::move(g));
+        x += w;
+    }
+    look->baseline = (height - size) / 2 + size * 85 / 100;
+    return look;
 }
 
 Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Document& doc, int depth,
@@ -1248,6 +1530,24 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
     node.extMut().objMut().textWrap = control.placement->textWrap;
     node.extMut().objMut().points = control.points;
     node.extMut().objMut().cornerRatio = control.cornerRatio;
+    node.extMut().objMut().locked = control.placement->locked;
+    if (control.kind == ControlKind::Shape && control.shadow.on()) {
+        ObjectExtra& o = node.extMut().objMut();
+        o.shadowType = model::shapeShadowCode(control.shadow.type);
+        o.shadowColor = control.shadow.color;
+        o.shadowX = control.shadow.offsetX;
+        o.shadowY = control.shadow.offsetY;
+        o.shadowAlpha = control.shadow.alpha;
+        // 그림자가 왼쪽·위로 나가면 한글은 도형을 그만큼 오른쪽·아래에 그린다(개체 자리는 그림자를 감싼 상자).
+        if (!control.placement->treatAsChar) {
+            std::int32_t left = 0;
+            std::int32_t top = 0;
+            model::shadowLead(o.shadowType, o.shadowX, o.shadowY, node.width, node.height, left, top);
+            node.x += left;
+            node.y += top;
+        }
+    }
+    if (control.kind == ControlKind::Form && control.form) node.extMut().objMut().form = formLook(doc, *control.form, node.width, node.height);
     if (control.textArt) {
         node.extMut().objMut().artText = control.text;
         node.extMut().objMut().artFont = control.textArt->fontName;
@@ -1267,6 +1567,10 @@ Node makeObject(const Control& control, std::int32_t x, std::int32_t y, const Do
     if (control.kind == ControlKind::Picture || previewed) node.role = "picture";
     else if (control.kind == ControlKind::Table) node.role = "table";
     else if (control.kind == ControlKind::Container) node.role = "container";
+    else if (control.kind == ControlKind::Form) {
+        node.role = "form";
+        return node;
+    }
     else if (control.kind == ControlKind::Equation) {
         node.role = "equation";
         node.extMut().objMut().script = control.script;

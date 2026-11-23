@@ -103,7 +103,8 @@ bool inlineObjectControl(const model::Control& ctrl) {
     using model::ControlKind;
     return ctrl.placement && ctrl.placement->treatAsChar &&
            (ctrl.kind == ControlKind::Shape || ctrl.kind == ControlKind::Picture || ctrl.kind == ControlKind::Table ||
-            ctrl.kind == ControlKind::Container || ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole);
+            ctrl.kind == ControlKind::Container || ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole ||
+            ctrl.kind == ControlKind::Form);
 }
 
 int controlCharOffset(const model::Paragraph& para, const model::Control* control) {
@@ -621,6 +622,8 @@ bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int
                 continue;
             }
             if (child.ext().obj().textWrap == "BEHIND_TEXT" && !allowBehind) continue;
+            // 개체 보호(한글 개체 보호하기): 누른 자리가 개체를 지나 그 아래 글로 간다.
+            if (child.ext().obj().locked) continue;
             const std::int32_t hx = placed[static_cast<std::size_t>(i)].x + child.x;
             const std::int32_t hy = placed[static_cast<std::size_t>(i)].y + child.y;
             if (!boxHas(hx, hy, child.width, child.height, px, py)) continue;
@@ -650,6 +653,7 @@ bool objectUnder(const Node& node, std::int32_t ox, std::int32_t oy, int px, int
     if (node.kind == NodeKind::Object && node.role != "caption" && node.role != "pageBorder" && node.role != "pageFill") {
         const bool behind = node.ext().obj().textWrap == "BEHIND_TEXT";
         if (behind && !allowBehind) return false;
+        if (node.ext().obj().locked) return false;
         // 돌린 개체는 누른 자리를 거꾸로 돌려 돌리기 전 상자로 본다. 안의 글은 돌린 채라 캐럿을 두지 않고 개체를 고른다.
         // 글상자 글은 돌리지 않는다. 돌리기 전 상자 안 글 줄을 누르면 캐럿을 둔다(숨긴 한글 2024 와 같다).
         if (node.ext().obj().shaped && cellContentStory(node) > 0 && boxHas(x, y, node.width, node.height, px, py)) {
@@ -1683,6 +1687,23 @@ int objectHandleAt(const PointerHold& hold, int px, int py, double radius) {
     return -1;
 }
 
+
+// 터치 옮기기 아이콘을 둘 개체인가. 고른 띄운 개체이고(글자처럼 취급한 것은 옮기지 않는다) 회전·점 고치기 중이 아니다.
+bool touchMovable(const PointerHold& hold) {
+    return !readOnly() && hold.touchMode && hold.objectHandles && hold.selectedObject && !hold.boxes.empty() &&
+           !hold.selectedObject->treatAsChar && hold.selectedObject->ext().obj().anchorStory > 0 &&
+           hold.selectedObject->ext().obj().anchorItem >= 0 && !hold.rotateMode && !hold.pointEdit;
+}
+
+bool touchMoveIconAt(const PointerHold& hold, int page, int px, int py, double huPerLogical) {
+    if (!touchMovable(hold) || huPerLogical <= 0) return false;
+    const HeldBox& box = hold.boxes.front();
+    if (box.page != page) return false;
+    const double cx = box.x + box.width / 2.0;
+    const double cy = box.y + box.height / 2.0;
+    return std::hypot(px - cx, py - cy) <= kTouchMoveReach * huPerLogical;
+}
+
 void resizeObjectBox(PointerHold& hold, int px, int py) {
     const int handle = hold.resizeHandle;
     const bool corner = handle == 0 || handle == 2 || handle == 5 || handle == 7;
@@ -1953,9 +1974,13 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         return pointerViewOf(hold);
     }
     const double dpr = sample.dpr > 0 ? sample.dpr : 1;
-    const double handleRadius = sample.huPerLogical > 0 ? 10.0 * sample.huPerLogical : 400;
+    // 터치·펜은 손잡이를 손가락 크기로 잡는다. 개체는 가운데 옮기기 아이콘을 누를 때만 옮긴다.
+    const bool touch = sample.device != 0;
+    const double handleRadius =
+        sample.huPerLogical > 0 ? (touch ? kTouchHandleReach : 10.0) * sample.huPerLogical : 400;
+    const bool touchMove = touch && touchMoveIconAt(hold, page, x, y, sample.huPerLogical);
     // 그리기 안내선 위를 누르면 그 선을 끌어 옮긴다(한글: 마우스 포인터가 화살표로 바뀌는 자리).
-    if (!readOnly()) {
+    if (!readOnly() && !touchMove) {
         if (const int grab = drawGuideAt(pages, page, x, y, handleRadius * 0.4); grab != 0) {
             hold.guideDrag = grab;
             hold.movePage = page;
@@ -1966,7 +1991,7 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         }
     }
     // 읽기 전용이면 개체 손잡이를 잡지 않는다. 그 자리 누르기는 보통 클릭이 된다.
-    const int handle = readOnly() ? -1 : objectHandleAt(hold, x, y, handleRadius);
+    const int handle = readOnly() || touchMove ? -1 : objectHandleAt(hold, x, y, handleRadius);
     // 개체 회전 중이면 손잡이를 끌어 돌린다(한글 개체 회전). 각은 고른 상자의 가운데에서 잰다. 시계 방향이 + 다.
     if (handle >= 0 && !hold.boxes.empty() && hold.rotateMode && hold.selectedObject &&
         hold.selectedObject->ext().obj().anchorItem >= 0) {
@@ -2048,8 +2073,8 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
         if (hold.resizeRole != "picture") snapshotHeldObject(hold, doc, pages, page);
         return pointerViewOf(hold);
     }
-    // 표 칸 경계선을 누르면 끌어 칸 폭·줄 높이를 바꾼다.
-    if (!readOnly()) {
+    // 표 칸 경계선을 누르면 끌어 칸 폭·줄 높이를 바꾼다. 터치는 선을 끌지 않는다(스크롤과 부딪히고 잡기 어렵다).
+    if (!readOnly() && !touch) {
         TableBorderHit border;
         if (tableBorderAt(doc, pages, page, x, y, handleRadius * 0.3, border)) {
             hold.borderDrag = border.kind;
@@ -2088,8 +2113,8 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
             return pointerViewOf(hold);
         }
     }
-    // 고른 띄운 개체 안을 누르면 끌어 옮긴다. 글자처럼 취급한 개체는 옮기지 않는다.
-    if (!readOnly() && hold.objectHandles && hold.selectedObject && !hold.selectedObject->treatAsChar &&
+    // 고른 띄운 개체 안을 누르면 끌어 옮긴다. 글자처럼 취급한 개체는 옮기지 않는다. 터치는 옮기기 아이콘만이다.
+    if (!readOnly() && (!touch || touchMove) && hold.objectHandles && hold.selectedObject && !hold.selectedObject->treatAsChar &&
         hold.selectedObject->ext().obj().anchorStory > 0 && hold.selectedObject->ext().obj().anchorItem >= 0 && !hold.boxes.empty()) {
         const HeldBox& box = hold.boxes.front();
         if (box.page == page && x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height) {
@@ -2141,7 +2166,10 @@ PointerView applyTimedDown(const model::Document& doc, const std::vector<Node>& 
     const bool sameZone = hold.clickZone == static_cast<int>(hit.zone) || close;
     const bool sameFinger = hold.clickId == sample.id || (sample.device == 1 && hold.clickDevice == 1);
     const bool same = sameFinger && hold.clickPage == page && sameZone;
-    const int count = (timeOk && close && same && hold.clickCount > 0) ? hold.clickCount + 1 : 1;
+    // 오래 누르기: 글 위면 두 번 누르기처럼 낱말을 고르고(끌면 낱말씩 넓힌다), 개체 위면 한 번 누르기처럼 고른다.
+    const int count = sample.longPress ? (hit.zone == ClickZone::Object ? 1 : 2)
+                      : (timeOk && close && same && hold.clickCount > 0) ? hold.clickCount + 1
+                                                                          : 1;
     hold.clickId = sample.id;
     hold.clickPage = page;
     hold.clickZone = static_cast<int>(hit.zone);
@@ -2421,13 +2449,200 @@ PointerView applyTimedMove(const model::Document& doc, const std::vector<Node>& 
 
 }  // namespace paint_detail
 
+std::atomic<bool> gFormEditing{true};
+
+// 표 그리기(1)·표 지우개(2). 같은 도구를 다시 고르면 끈다. 펜 모양은 셀 테두리 선(종류·굵기 HU·색)이다.
+int toggleTableTool(int tool, const model::BorderSide* pen) {
+    PointerHold& hold = pointerHold();
+    hold.tableTool = hold.tableTool == tool ? 0 : std::clamp(tool, 0, 2);
+    if (pen) hold.tablePen = *pen;
+    hold.tableLineDrag = false;
+    bumpPointerPicture();
+    return hold.tableTool;
+}
+int tableTool() { return pointerHold().tableTool; }
+
+bool formEditing() { return gFormEditing.load(); }
+void setFormEditing(bool on) {
+    gFormEditing.store(on);
+    bumpPointerPicture();
+}
+
+// 글상자 연결 고르기·양식 누르기·점 끌기. 맡은 누름이면 그 뒤 끌기·뗌도 여기서 끝낸다.
+std::optional<PointerView> specialPointer(const model::Document& doc, const std::vector<Node>& pages, int kind, int page,
+                                          int x, int y) {
+    PointerHold& hold = pointerHold();
+    if (hold.specialPress && hold.tableLineDrag) {
+        if ((kind == 2 || kind == 3) && page == hold.tableLinePage) {
+            hold.tableLineX1 = x;
+            hold.tableLineY1 = y;
+        }
+        if (kind == 3 || kind == 4) {
+            hold.specialPress = false;
+            hold.tableLineDrag = false;
+            hold.tableLinePending = kind == 3;
+        }
+        bumpPointerPicture();
+        return pointerViewOf(hold);
+    }
+    if (hold.specialPress) {
+        if (kind == 2) {
+            if (hold.pointDrag >= 0 && page == hold.pointPage) {
+                hold.pointX = x;
+                hold.pointY = y;
+                bumpPointerPicture();
+            }
+            return pointerViewOf(hold);
+        }
+        if (kind == 3 || kind == 4) {
+            hold.specialPress = false;
+            if (hold.pointDrag >= 0) {
+                if (kind == 3 && page == hold.pointPage) {
+                    hold.pointX = x;
+                    hold.pointY = y;
+                }
+                hold.pointPending = kind == 3;
+                if (!hold.pointPending) hold.pointDrag = -1;
+            }
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
+    }
+    if (kind != 1 || page < 0 || page >= static_cast<int>(pages.size())) return std::nullopt;
+    const Node& paper = pages[static_cast<std::size_t>(page)];
+    if (hold.tableTool != 0) {
+        // 표 그리기·지우개: 가장 안쪽 표 안을 누르면 선을 끈다. 표 밖을 누르면 도구를 끄고 평소처럼 누른다.
+        const Node* table = nullptr;
+        std::int32_t tx = 0;
+        std::int32_t ty = 0;
+        const std::int32_t reach = std::max(60, 300 * 100 / std::max(hold.percent, 10));
+        auto visit = [&](const Node& node, std::int32_t nx, std::int32_t ny) {
+            if (node.turned != 0 || node.pageBand || node.upright) return false;
+            if (node.kind == NodeKind::Object && node.role == "table" && node.ext().obj().anchorItem >= 0 &&
+                x >= nx - reach && x <= nx + node.width + reach && y >= ny - reach && y <= ny + node.height + reach) {
+                table = &node;
+                tx = nx;
+                ty = ny;
+            }
+            return true;
+        };
+        walkPlacedNodes(doc, paper, 0, 0, visit);
+        if (!table) {
+            hold.tableTool = 0;
+            bumpPointerPicture();
+        } else {
+            // 그린 칸에서 줄 높이·칸 폭과 첫 칸 왼쪽 위를 얻는다.
+            std::vector<std::int32_t> right;
+            std::vector<std::int32_t> bottom;
+            std::int32_t left = table->width;
+            std::int32_t top = table->height;
+            for (const Node& cell : table->children) {
+                if (cell.kind != NodeKind::Cell || cell.ext().row < 0 || cell.ext().col < 0) continue;
+                const auto c = static_cast<std::size_t>(cell.ext().col + std::max(1, cell.ext().colSpan) - 1);
+                const auto r = static_cast<std::size_t>(cell.ext().row + std::max(1, cell.ext().rowSpan) - 1);
+                if (right.size() <= c) right.resize(c + 1, 0);
+                if (bottom.size() <= r) bottom.resize(r + 1, 0);
+                right[c] = std::max(right[c], cell.x + cell.width);
+                bottom[r] = std::max(bottom[r], cell.y + cell.height);
+                left = std::min(left, cell.x);
+                top = std::min(top, cell.y);
+            }
+            hold.tableCols.clear();
+            hold.tableRows.clear();
+            std::int32_t prev = left;
+            for (const std::int32_t edge : right) {
+                hold.tableCols.push_back(std::max<std::int32_t>(0, edge - prev));
+                prev = edge;
+            }
+            prev = top;
+            for (const std::int32_t edge : bottom) {
+                hold.tableRows.push_back(std::max<std::int32_t>(0, edge - prev));
+                prev = edge;
+            }
+            hold.tableOriginX = tx + left;
+            hold.tableOriginY = ty + top;
+            hold.tableStory = table->ext().obj().anchorStory;
+            hold.tableParagraph = table->ext().obj().anchorParagraph;
+            hold.tableItem = table->ext().obj().anchorItem;
+            hold.tableLinePage = page;
+            hold.tableLineX0 = hold.tableLineX1 = x;
+            hold.tableLineY0 = hold.tableLineY1 = y;
+            hold.tableLineDrag = true;
+            hold.specialPress = true;
+            bumpPointerPicture();
+            return pointerViewOf(hold);
+        }
+    }
+    if (hold.pointEdit) {
+        const Node* picked = hold.selectedObject;
+        if (picked && !hold.boxes.empty() && hold.boxes.front().page == page) {
+            const HeldBox& box = hold.boxes.front();
+            const std::vector<model::ShapePoint>& points = picked->ext().obj().points;
+            // 점 손잡이를 잡는 거리: 화면 6px(96dpi 100% 에서 75 HU 가 1px).
+            const std::int32_t reach = std::max(60, 450 * 100 / std::max(hold.percent, 10));
+            for (std::size_t i = 0; i < points.size(); ++i) {
+                if (std::abs(box.x + points[i].x - x) > reach || std::abs(box.y + points[i].y - y) > reach) continue;
+                hold.pointDrag = static_cast<int>(i);
+                hold.pointPage = page;
+                hold.pointX = box.x + points[i].x;
+                hold.pointY = box.y + points[i].y;
+                hold.pointBoxX = box.x;
+                hold.pointBoxY = box.y;
+                hold.pointStory = picked->ext().obj().anchorStory;
+                hold.pointParagraph = picked->ext().obj().anchorParagraph;
+                hold.pointItem = picked->ext().obj().anchorItem;
+                hold.specialPress = true;
+                bumpPointerPicture();
+                return pointerViewOf(hold);
+            }
+        }
+        // 점 밖을 누르면 점 편집을 끝내고 평소처럼 누른다(한글 2024).
+        hold.pointEdit = false;
+        bumpPointerPicture();
+    }
+    if (!hold.linkPick && gFormEditing.load()) return std::nullopt;
+    std::vector<ObjRef> chain;
+    LineRef line;
+    objectUnder(paper, 0, 0, x, y, true, &doc, chain, line);
+    if (hold.linkPick) {
+        hold.linkPick = false;
+        const Node* target = chain.empty() ? nullptr : chain.front().node;
+        if (target && target->kind == NodeKind::Object && target->ext().obj().anchorItem >= 0) {
+            hold.linkPending = true;
+            hold.linkToStory = target->ext().obj().anchorStory;
+            hold.linkToParagraph = target->ext().obj().anchorParagraph;
+            hold.linkToItem = target->ext().obj().anchorItem;
+        }
+        hold.specialPress = true;
+        bumpPointerPicture();
+        return pointerViewOf(hold);
+    }
+    for (const ObjRef& ref : chain) {
+        if (!ref.node || ref.node->role != "form" || ref.node->ext().obj().anchorItem < 0) continue;
+        const FormLook* look = ref.node->ext().obj().form.get();
+        if (!look || (look->form.type != "checkBtn" && look->form.type != "radioBtn")) continue;
+        hold.formPressPending = true;
+        hold.formStory = ref.node->ext().obj().anchorStory;
+        hold.formParagraph = ref.node->ext().obj().anchorParagraph;
+        hold.formItem = ref.node->ext().obj().anchorItem;
+        hold.specialPress = true;
+        return pointerViewOf(hold);
+    }
+    return std::nullopt;
+}
+
 PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pages, int kind, int page, int x, int y,
                          int percent, PointerSample sample) {
     PointerHold& hold = pointerHold();
     hold.eventText.clear();
     hold.property.clear();
     if (percent > 0) hold.percent = percent;
-    if (kind == 1) hold.shiftDown = sample.shift;
+    if (kind == 1) {
+        hold.shiftDown = sample.shift;
+        const bool touchNow = sample.device != 0;
+        if (touchNow != hold.touchMode) bumpPointerPicture();
+        hold.touchMode = touchNow;
+    }
     // 도형 그리기: 누른 자리부터 끈 자리까지가 도형 상자다. 그 쪽 밖으로 나가면 쪽 끝에서 멈춘다.
     if (hold.drawTool != 0 && !readOnly()) {
         const auto clampToPage = [&](std::int32_t& px, std::int32_t& py) {
@@ -2537,6 +2752,7 @@ PointerView applyPointer(const model::Document& doc, const std::vector<Node>& pa
         bumpPointerPicture();
         return pointerViewOf(hold);
     }
+    if (const std::optional<PointerView> special = specialPointer(doc, pages, kind, page, x, y)) return *special;
     if (sample.time > 0 && kind == 1) return applyTimedDown(doc, pages, page, x, y, sample);
     if (sample.time > 0 && kind == 2 &&
         (hold.clickPending || hold.pinDrag != 0 || hold.resizeHandle >= 0 || hold.moving || hold.borderDrag != 0 ||
@@ -2759,6 +2975,25 @@ bool repeatedTouchDown(double viewX, double viewY, double timeMs, double dpr, in
     return std::hypot(viewX - hold.clickDownX, viewY - hold.clickDownY) <= chain;
 }
 
+ClickChainSpot clickChainSpot(double dpr) {
+    const PointerHold& hold = pointerHold();
+    ClickChainSpot spot;
+    if (hold.clickUpTime <= 0 || hold.clickCount < 1 || hold.clickUpTime - hold.clickDownTime > 500.0) return spot;
+    spot.open = true;
+    spot.until = hold.clickUpTime + 500.0;
+    spot.x = hold.clickDownX;
+    spot.y = hold.clickDownY;
+    spot.reach = (hold.clickDevice == 1 ? 20.0 : 12.0) * (dpr > 0 ? dpr : 1);
+    return spot;
+}
+
+void forgetClickChain() {
+    PointerHold& hold = pointerHold();
+    hold.clickCount = 0;
+    hold.clickUpTime = 0;
+    hold.clickDownTime = 0;
+}
+
 bool selectionEdgeScroll(double dtMs, int viewW, int viewH, int& dx, int& dy) {
     dx = 0;
     dy = 0;
@@ -2820,6 +3055,14 @@ void setSelectionPins(bool on) {
 }
 
 bool selectionPins() { return gSelectionPins.load(std::memory_order_relaxed); }
+
+int touchGrabAt(int page, int x, int y, double huPerLogical) {
+    const PointerHold& hold = pointerHold();
+    if (readOnly() || !hold.touchMode || !hold.objectHandles || hold.boxes.empty() || huPerLogical <= 0) return 0;
+    if (touchMoveIconAt(hold, page, x, y, huPerLogical)) return 1;
+    if (hold.boxes.front().page != page) return 0;
+    return objectHandleAt(hold, x, y, kTouchHandleReach * huPerLogical) >= 0 ? 2 : 0;
+}
 
 bool pinUnder(int page, int x, int y, double radius) {
     const PointerHold& hold = pointerHold();

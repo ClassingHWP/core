@@ -286,6 +286,8 @@ private:
 };
 
 // 개체(그림·도형·수식·글상자·표)와 칸에만 쓰는 꼬리 값. 문단·종이 꼬리에는 없다.
+struct FormLook;
+
 struct ObjectExtra {
     // 띄운 개체가 붙은 문단(글 묶음 번호, 문단 번호). 개체를 끌어 옮길 때 문서의 그 개체를 찾는다.
     int anchorStory = -1;
@@ -355,6 +357,32 @@ struct ObjectExtra {
     Name shapeType;
     // 쪽/단 위 부유 개체의 페이지 내 일련번호 (트리 가지치기 시에도 z 순서가 고정되도록 유지)
     std::int32_t objectPageSerial = -1;
+    // 그리기 개체 그림자(model::shapeShadowCode). 0 이면 없다. 자리는 model::shadowPoint 다.
+    int shadowType = 0;
+    Name shadowColor;
+    std::int32_t shadowX = 0;
+    std::int32_t shadowY = 0;
+    std::uint32_t shadowAlpha = 0;
+    bool locked = false;  // 개체 보호. 눌러도 고르지 않는다
+    // 양식 개체(role "form"). 그리기와 양식 누르기가 이 값을 본다.
+    std::shared_ptr<const FormLook> form;
+};
+
+// 양식 개체를 그릴 값. 글자 자리는 조판(makeObject)이 글자 모양으로 재 둔다.
+struct FormLook {
+    model::FormObject form;
+    struct Glyph {
+        char32_t cp = 0;
+        std::string font;
+        int size = 0;
+        int ratio = 100;
+        std::int32_t x = 0;  // 개체 왼쪽에서
+    };
+    std::vector<Glyph> glyphs;
+    std::int32_t baseline = 0;  // 개체 위에서
+    std::string color = "#000000";
+    bool italic = false;
+    bool hint = false;  // 비어 있는 입력·콤보 상자에 이름을 보인다(한글 화면처럼 빨간 기울임)
 };
 
 struct NodeExtra {

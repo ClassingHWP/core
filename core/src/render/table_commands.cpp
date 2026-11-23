@@ -568,6 +568,58 @@ EditResult tableObjectNow(model::Document& doc, std::vector<Node>& pages, const 
 
 }  // namespace
 
+// 표 그리기·지우개로 끈 선을 넣는다. 끈 방향이 더 긴 쪽이 선의 방향이다. 선 자리는 누른 자리다.
+EditResult paint_detail::tableLineNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight,
+                                      std::string& why) {
+    PointerHold& hold = pointerHold();
+    if (!hold.tableLinePending) return {};
+    hold.tableLinePending = false;
+    if (readOnly()) return {};
+    model::Control* control = anchoredControl(doc, hold.tableStory, hold.tableParagraph, hold.tableItem);
+    if (!control || !control->table) {
+        why = "표를 찾지 못했습니다.";
+        return {};
+    }
+    const std::int32_t dx = hold.tableLineX1 - hold.tableLineX0;
+    const std::int32_t dy = hold.tableLineY1 - hold.tableLineY0;
+    // 화면 3px 보다 짧게 끌면 선이 아니다(96dpi 100% 에서 75 HU 가 1px).
+    const std::int32_t least = std::max(60, 225 * 100 / std::max(hold.percent, 10));
+    if (std::max(std::abs(dx), std::abs(dy)) < least) return {};
+    model::TableLine line;
+    line.horizontal = std::abs(dx) >= std::abs(dy);
+    line.at = line.horizontal ? hold.tableLineY0 - hold.tableOriginY : hold.tableLineX0 - hold.tableOriginX;
+    line.from = line.horizontal ? hold.tableLineX0 - hold.tableOriginX : hold.tableLineY0 - hold.tableOriginY;
+    line.to = line.horizontal ? hold.tableLineX1 - hold.tableOriginX : hold.tableLineY1 - hold.tableOriginY;
+    line.near = std::max(60, 300 * 100 / std::max(hold.percent, 10));
+    line.rows = hold.tableRows;
+    line.cols = hold.tableCols;
+    model::BorderFillAccess fills;
+    fills.read = [&doc](std::uint32_t id) { return borderFillOf(doc, id); };
+    fills.intern = [&doc](const model::BorderFill& f) { return internBorderFillOf(doc, f); };
+    model::Table& table = *control->table;
+    const model::TableEdit edit = hold.tableTool == 2 ? model::eraseTableLine(table, line, fills)
+                                                      : model::drawTableLine(table, line, hold.tablePen, fills);
+    if (!edit.ok()) {
+        why = edit.error;
+        return {};
+    }
+    const int hostStory = hold.tableStory;
+    const int hostParagraph = hold.tableParagraph;
+    rebuildStoryMap(doc);
+    EditRelayoutResult relayout;
+    if (!control->placement || control->placement->treatAsChar) {
+        relayout = relayoutObjectParagraph(doc, pages, hostStory, hostParagraph, useStoredLineHeight);
+    } else {
+        if (model::Paragraph* host = storyParagraph(doc, hostStory, hostParagraph)) host->lineSegs.clear();
+        invalidateLinePlaces({}, true);
+        model::ensureParagraphIds(doc);
+        pages = layoutPages(doc, -1, useStoredLineHeight, useStoredLineHeight);
+        relayout.fullInvalidation = true;
+        relayout.pageListChanged = true;
+    }
+    return makeEditResult(doc, true, true, hostStory, hostParagraph, &relayout);
+}
+
 EditResult paint_detail::tableEditNow(model::Document& doc, std::vector<Node>& pages, const TableEditCommand& cmd,
                                       bool useStoredLineHeight, std::string& error) {
     if (readOnly()) {

@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -16,6 +18,7 @@
 #include "chwp/render/paint.hpp"
 #include "chwp/render/scene.hpp"
 #include "render/paint_detail.hpp"
+#include "render/painter.hpp"
 
 namespace chwp::render {
 
@@ -77,6 +80,56 @@ bool oneOf(const std::string& value, std::initializer_list<const char*> names) {
     return false;
 }
 
+// 그림 효과 그림자 목록(숨긴 한글 2024 그림 탭 그림 효과 → 그림자: 바깥쪽 9, 안쪽 9, 원근감 5). 모두 투명도 0.5,
+// 흐림 600, 검정이다. 바깥쪽 다섯째는 가운데 1.04 배, 안쪽 다섯째는 흐림 1200 의 가운데 그림자다.
+struct PictureShadowPreset {
+    const char* name;
+    int style;  // 0 OUTSIDE, 1 INSIDE
+    float radius;
+    float direction;
+    float distance;
+    int align;  // 0 TOP_LEFT .. 4 CENTER .. 6 BOTTOM_LEFT, 7 BOTTOM, 8 BOTTOM_RIGHT
+    float skewX;
+    float scaleX;
+    float scaleY;
+};
+constexpr PictureShadowPreset kPictureShadows[] = {
+    {"outer1", 0, 600, 45, 600, 4, 0, 1, 1},       {"outer2", 0, 600, 90, 600, 4, 0, 1, 1},
+    {"outer3", 0, 600, 135, 600, 4, 0, 1, 1},      {"outer4", 0, 600, 0, 600, 4, 0, 1, 1},
+    {"outer5", 0, 600, 0, 0, 4, 0, 1.04f, 1.04f},  {"outer6", 0, 600, 180, 600, 4, 0, 1, 1},
+    {"outer7", 0, 600, 315, 600, 4, 0, 1, 1},      {"outer8", 0, 600, 270, 600, 4, 0, 1, 1},
+    {"outer9", 0, 600, 225, 600, 4, 0, 1, 1},      {"inner1", 1, 600, 225, 600, 0, 0, 0, 0},
+    {"inner2", 1, 600, 270, 600, 0, 0, 0, 0},      {"inner3", 1, 600, 315, 600, 0, 0, 0, 0},
+    {"inner4", 1, 600, 180, 600, 0, 0, 0, 0},      {"inner5", 1, 1200, 0, 0, 0, 0, 0, 0},
+    {"inner6", 1, 600, 0, 600, 0, 0, 0, 0},        {"inner7", 1, 600, 135, 600, 0, 0, 0, 0},
+    {"inner8", 1, 600, 90, 600, 0, 0, 0, 0},       {"inner9", 1, 600, 45, 600, 0, 0, 0, 0},
+    {"perspective1", 0, 600, 225, 0, 8, 25, 1, 0.25f},  {"perspective2", 0, 600, 315, 0, 6, -25, 1, 0.25f},
+    {"perspective3", 0, 600, 135, 0, 8, 25, 1, -0.25f}, {"perspective4", 0, 600, 45, 0, 6, -25, 1, -0.25f},
+    {"perspective5", 0, 600, 90, 2500, 7, 0, 1, -0.25f},
+};
+
+const PictureShadowPreset* pictureShadowPreset(const std::string& name) {
+    for (const PictureShadowPreset& p : kPictureShadows) {
+        if (name == p.name) return &p;
+    }
+    return nullptr;
+}
+
+// 지금 그림자가 목록의 어느 모양인지(색은 따지지 않는다). 없으면 "none", 목록에 없으면 "custom".
+std::string pictureShadowName(const model::PictureEffects& fx) {
+    if (!fx.shadow) return "none";
+    const auto& s = *fx.shadow;
+    const auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+    for (const PictureShadowPreset& p : kPictureShadows) {
+        if (s.style == p.style && near(s.radius, p.radius) && near(s.direction, p.direction) &&
+            near(s.distance, p.distance) && s.align == p.align && near(s.skewX, p.skewX) && near(s.scaleX, p.scaleX) &&
+            near(s.scaleY, p.scaleY)) {
+            return p.name;
+        }
+    }
+    return "custom";
+}
+
 // 개체를 고친 뒤: 고른 개체·조합을 비우고 문서 전체를 다시 짠다.
 EditResult relayoutAfterObjectEdit(model::Document& doc, std::vector<Node>& pages, int story, int paragraph,
                                    bool useStoredLineHeight) {
@@ -136,7 +189,32 @@ FormatFields objectPropertiesView(const model::Document& doc, int story, int par
         out.emplace_back("lineColor", control->strokeColor.empty() ? std::string("#000000") : control->strokeColor);
         out.emplace_back("lineWidth", static_cast<double>(control->strokeWidth));
         out.emplace_back("fillColor", control->fillColor.empty() ? std::string("none") : control->fillColor);
+        // 그림자(한글 도형 탭 그림자 모양·그림자 색·그림자 이동). 이름은 model::shapeShadowName 이다.
+        out.emplace_back("shadow", control->shadow.on() ? control->shadow.type : std::string("NONE"));
+        out.emplace_back("shadowColor", control->shadow.color.empty() ? std::string("#B2B2B2") : control->shadow.color);
+        out.emplace_back("shadowOffsetX", static_cast<double>(control->shadow.offsetX));
+        out.emplace_back("shadowOffsetY", static_cast<double>(control->shadow.offsetY));
+        out.emplace_back("shadowAlpha", static_cast<double>(control->shadow.alpha));
     }
+    // 글상자(한글 도형 탭 글상자 여백·글상자 정렬·글자 방향). 가로 정렬은 첫 문단 모양에서 읽는다(양쪽은 LEFT).
+    if (control->kind == model::ControlKind::Shape && !control->subLists.empty()) {
+        const model::SubList& list = control->subLists.front();
+        out.emplace_back("textMarginLeft", static_cast<double>(control->boxPadLeft));
+        out.emplace_back("textMarginRight", static_cast<double>(control->boxPadRight));
+        out.emplace_back("textMarginTop", static_cast<double>(control->boxPadTop));
+        out.emplace_back("textMarginBottom", static_cast<double>(control->boxPadBottom));
+        out.emplace_back("textVertAlign", list.vertAlign.empty() ? std::string("TOP") : list.vertAlign);
+        std::string horz = "LEFT";
+        if (!list.paragraphs.empty()) {
+            if (const model::ParaShape* ps = Painter::findParaShape(doc, list.paragraphs.front().paraShapeId)) {
+                if (ps->align == "CENTER" || ps->align == "RIGHT") horz = ps->align;
+            }
+        }
+        out.emplace_back("textHorzAlign", horz);
+        out.emplace_back("textDirection", static_cast<double>(list.textDirection));
+    }
+    out.emplace_back("locked", p.locked);
+    if (!p.dropCap.empty()) out.emplace_back("dropCap", p.dropCap);
     out.emplace_back("flipHorizontal", p.flipHorizontal);
     out.emplace_back("flipVertical", p.flipVertical);
     out.emplace_back("rotation", static_cast<double>(p.rotation % 360));
@@ -146,6 +224,13 @@ FormatFields objectPropertiesView(const model::Document& doc, int story, int par
         out.emplace_back("bright", static_cast<double>(control->picture.bright));
         out.emplace_back("contrast", static_cast<double>(control->picture.contrast));
         out.emplace_back("effect", static_cast<double>(control->picture.effect));
+        // 그림 효과 그림자: 목록 이름(outer1~9, inner1~9, perspective1~5), 없음 none, 그 밖 custom. 색은 #RRGGBB.
+        out.emplace_back("pictureShadow", pictureShadowName(control->picture.effects));
+        if (const auto& shadow = control->picture.effects.shadow) {
+            char hex[8];
+            std::snprintf(hex, sizeof hex, "#%06X", static_cast<unsigned>(shadow->color & 0xFFFFFFu));
+            out.emplace_back("pictureShadowColor", std::string(hex));
+        }
         // 자르기(한글 개체 속성 그림 자르기 SkipLeft·Top·Right·Bottom, 숨긴 한글 2024: 원본 그림 단위로 imgClip 의
         // 왼쪽·위는 그 값, 오른쪽·아래는 원본 크기에서 뺀 값이다).
         const model::PictureView& pv = control->picture;
@@ -169,6 +254,7 @@ std::string selectedObjectKind(const model::Document& doc) {
         case model::ControlKind::Picture: return "picture";
         case model::ControlKind::Table: return "table";
         case model::ControlKind::Equation: return "equation";
+        case model::ControlKind::Form: return "form";
         default: return "shape";
     }
 }
@@ -261,11 +347,18 @@ EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, i
     }
     model::Placement next = *control->placement;
     model::PictureView pictureLook = control->picture;
+    bool pictureShadowEdited = false;
     model::Control shapeLook;
     shapeLook.strokeType = control->strokeType;
     shapeLook.strokeColor = control->strokeColor;
     shapeLook.strokeWidth = control->strokeWidth;
     shapeLook.fillColor = control->fillColor;
+    model::ShapeShadow shadowLook = control->shadow;
+    // 글상자 안쪽 여백·정렬·글자 방향. 없음은 -1·빈 값이다.
+    std::int32_t boxPad[4] = {control->boxPadLeft, control->boxPadRight, control->boxPadTop, control->boxPadBottom};
+    std::string textVert;
+    std::string textHorz;
+    int textDir = -1;
     std::string order;
     std::string flip;
     int turnTo = -1;  // 회전각을 이 값으로
@@ -337,6 +430,58 @@ EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, i
             }
         } else if (key == "order") {
             ok = text(value, s) && oneOf(s, {"front", "forward", "back", "backward"}) && (order = s, true);
+        } else if (key == "textMarginLeft" || key == "textMarginRight" || key == "textMarginTop" ||
+                   key == "textMarginBottom" || key == "textVertAlign" || key == "textHorzAlign" || key == "textDirection") {
+            // 글상자(한글 도형 탭 글상자 여백·글상자 정렬·글자 방향).
+            if (control->kind != model::ControlKind::Shape || control->subLists.empty()) {
+                why = "개체 속성 " + key + " 은 글상자에만 있습니다.";
+                return {};
+            }
+            if (key == "textVertAlign") {
+                ok = text(value, s) && oneOf(s, {"TOP", "CENTER", "BOTTOM"}) && (textVert = s, true);
+            } else if (key == "textHorzAlign") {
+                ok = text(value, s) && oneOf(s, {"LEFT", "CENTER", "RIGHT"}) && (textHorz = s, true);
+            } else if (key == "textDirection") {
+                ok = number(value, d) && d >= 0 && d <= 2 && (textDir = static_cast<int>(d), true);
+            } else {
+                const int slot = key == "textMarginLeft" ? 0 : key == "textMarginRight" ? 1 : key == "textMarginTop" ? 2 : 3;
+                ok = number(value, d) && d >= 0 && (boxPad[slot] = static_cast<std::int32_t>(std::lround(d)), true);
+            }
+        } else if (key == "locked") {
+            // 개체 보호(한글 개체 보호하기). 보호한 개체는 눌러도 고르지 않는다.
+            ok = flag(value, next.locked);
+        } else if (key == "shadow" || key == "shadowColor" || key == "shadowOffsetX" || key == "shadowOffsetY" ||
+                   key == "shadowAlpha" || key == "shadowMove") {
+            if (control->kind != model::ControlKind::Shape) {
+                why = "개체 속성 " + key + " 은 그리기 개체(도형)에만 있습니다.";
+                return {};
+            }
+            if (key == "shadow") {
+                // 한글 그림자 모양 목록은 간격 0 으로 종류만 바꾼다(숨긴 한글 2024: 열 가지 모두 간격 0).
+                ok = text(value, s) && (s == "NONE" || model::shapeShadowCode(s) != 0) &&
+                     (shadowLook.type = s, shadowLook.offsetX = 0, shadowLook.offsetY = 0, true);
+            } else if (key == "shadowColor") {
+                ok = text(value, s) && s.size() == 7 && s[0] == '#' && (shadowLook.color = s, true);
+            } else if (key == "shadowAlpha") {
+                ok = number(value, d) && d >= 0 && d <= 255 && (shadowLook.alpha = static_cast<std::uint32_t>(d), true);
+            } else if (key == "shadowMove") {
+                // 그림자 위로·아래로·왼쪽으로·오른쪽으로 이동은 283(1mm)씩, 원점은 간격 0(숨긴 한글 2024).
+                ok = text(value, s) && oneOf(s, {"up", "down", "left", "right", "original"});
+                if (ok && !shadowLook.on()) {
+                    why = "그림자가 없는 개체입니다.";
+                    return {};
+                }
+                if (ok) {
+                    if (s == "original") shadowLook.offsetX = shadowLook.offsetY = 0;
+                    else if (s == "left") shadowLook.offsetX -= 283;
+                    else if (s == "right") shadowLook.offsetX += 283;
+                    else if (s == "up") shadowLook.offsetY -= 283;
+                    else shadowLook.offsetY += 283;
+                }
+            } else {
+                std::int32_t& slot = key == "shadowOffsetX" ? shadowLook.offsetX : shadowLook.offsetY;
+                ok = number(value, d) && (slot = static_cast<std::int32_t>(d), true);
+            }
         } else if (key == "lineType" || key == "lineColor" || key == "lineWidth" || key == "fillColor") {
             if (control->kind != model::ControlKind::Shape) {
                 why = "개체 속성 " + key + " 은 도형에만 있습니다.";
@@ -375,6 +520,45 @@ EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, i
                     return {};
                 }
             }
+        } else if (key == "pictureShadow" || key == "pictureShadowColor") {
+            // 그림 효과 그림자(한글 그림 탭 그림 효과 → 그림자 목록·다른 그림자 색).
+            if (control->kind != model::ControlKind::Picture) {
+                why = "개체 속성 " + key + " 은 그림에만 있습니다.";
+                return {};
+            }
+            auto& shadow = pictureLook.effects.shadow;
+            if (key == "pictureShadow") {
+                ok = text(value, s);
+                if (ok && s == "none") {
+                    shadow.reset();
+                } else if (ok) {
+                    const PictureShadowPreset* preset = pictureShadowPreset(s);
+                    ok = preset != nullptr;
+                    if (ok) {
+                        const std::uint32_t color = shadow ? shadow->color : 0u;
+                        model::PictureEffects::Shadow next;
+                        next.style = preset->style;
+                        next.alpha = 0.5f;
+                        next.radius = preset->radius;
+                        next.direction = preset->direction;
+                        next.distance = preset->distance;
+                        next.align = preset->align;
+                        next.skewX = preset->skewX;
+                        next.scaleX = preset->scaleX;
+                        next.scaleY = preset->scaleY;
+                        next.color = color;
+                        shadow = next;
+                    }
+                }
+            } else {
+                ok = text(value, s) && s.size() == 7 && s[0] == '#';
+                if (ok && !shadow) {
+                    why = "그림자가 없는 그림입니다.";
+                    return {};
+                }
+                if (ok) shadow->color = static_cast<std::uint32_t>(std::strtoul(s.c_str() + 1, nullptr, 16));
+            }
+            pictureShadowEdited = ok;
         } else if (key == "bright" || key == "contrast" || key == "effect") {
             if (control->kind != model::ControlKind::Picture) {
                 why = "개체 속성 " + key + " 은 그림에만 있습니다.";
@@ -425,12 +609,49 @@ EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, i
     }
     *control->placement = next;
     if (control->kind == model::ControlKind::Shape) {
+        // 그림자가 왼쪽·위로 나가면 그리는 자리가 바뀐다(model::shadowLead). 개체 자리(그림자를 감싼 상자)는 그대로다.
+        control->shadow = shadowLook;
         control->strokeType = shapeLook.strokeType;
         control->strokeColor = shapeLook.strokeColor;
         control->strokeWidth = shapeLook.strokeWidth;
         if (shapeLook.fillColor != control->fillColor) {
             control->fillColor = shapeLook.fillColor == "none" ? std::string() : shapeLook.fillColor;
             control->gradColor.clear();
+        }
+    }
+    if (!control->subLists.empty()) {
+        bool textEdited = false;
+        std::int32_t* pads[4] = {&control->boxPadLeft, &control->boxPadRight, &control->boxPadTop, &control->boxPadBottom};
+        for (int i = 0; i < 4; ++i) {
+            if (*pads[i] != boxPad[i]) {
+                *pads[i] = boxPad[i];
+                textEdited = true;
+            }
+        }
+        for (model::SubList& list : control->subLists) {
+            if (!textVert.empty()) list.vertAlign = textVert;
+            // 글자 방향(한글 TextBoxHorizText·EnglishDown·EnglishUp). 한글은 글 폭(lastWidth)을 세로쓰기면 상자 높이,
+            // 가로쓰기면 상자 너비로 적는다(숨긴 한글 2024: 60×30mm 상자 17008 → 8504).
+            if (textDir >= 0 && list.textDirection != textDir) {
+                list.textDirection = static_cast<std::uint8_t>(textDir);
+                control->boxTextWidth = textDir == 0 ? control->placement->width : control->placement->height;
+                textEdited = true;
+            }
+            // 가로 정렬(한글 글상자 정렬 아홉 칸의 가로). 숨긴 한글 2024: 왼쪽은 양쪽 정렬에 한글 글자 단위(KEEP_WORD),
+            // 가운데·오른쪽은 그 정렬에 한글 어절 단위(BREAK_WORD)로 문단 모양을 바꾼다.
+            if (!textHorz.empty()) {
+                for (model::Paragraph& para : list.paragraphs) {
+                    model::ParaShape shape;
+                    if (const model::ParaShape* ps = Painter::findParaShape(doc, para.paraShapeId)) shape = *ps;
+                    shape.align = textHorz == "LEFT" ? "JUSTIFY" : textHorz;
+                    shape.breakNonLatinWord = textHorz == "LEFT" ? "KEEP_WORD" : "BREAK_WORD";
+                    para.paraShapeId = internParaShape(doc, shape);
+                }
+                textEdited = true;
+            }
+            if (!textVert.empty() || textEdited) {
+                for (model::Paragraph& para : list.paragraphs) para.lineSegs.clear();
+            }
         }
     }
     if (!order.empty()) reorderObject(doc, story, *control, order);
@@ -498,6 +719,12 @@ EditResult objectPropertiesNow(model::Document& doc, std::vector<Node>& pages, i
         };
         refit(place.width, place.scaleX, oldSpanX, newSpanX);
         refit(place.height, place.scaleY, oldSpanY, newSpanY);
+        if (pictureShadowEdited) {
+            control->picture.effects.shadow = pictureLook.effects.shadow;
+            // 풀지 못한 효과 원본은 고친 그림자와 맞지 않으므로 버리고 풀어 둔 값으로 다시 쓴다.
+            control->picture.effects.hwpRaw.clear();
+            control->picture.effects.hwpxRaw.clear();
+        }
         control->picture.bright = pictureLook.bright;
         control->picture.contrast = pictureLook.contrast;
         control->picture.effect = pictureLook.effect;
@@ -598,6 +825,112 @@ EditResult deleteSelectedObjectsNow(model::Document& doc, std::vector<Node>& pag
 }  // namespace paint_detail
 
 // 개체 회전을 켜고 끈다. 고른 개체가 없으면 끈다. 켰으면 참.
+bool startLinkTextBoxPick() {
+    PointerHold& hold = pointerHold();
+    const Node* picked = hold.selectedObject;
+    if (!picked || picked->role != "shape" || picked->ext().obj().anchorItem < 0) return false;
+    hold.linkPick = true;
+    hold.linkFromStory = picked->ext().obj().anchorStory;
+    hold.linkFromParagraph = picked->ext().obj().anchorParagraph;
+    hold.linkFromItem = picked->ext().obj().anchorItem;
+    return true;
+}
+
+bool pointEditing() { return pointerHold().pointEdit; }
+
+bool togglePointEdit() {
+    PointerHold& hold = pointerHold();
+    const Node* picked = hold.selectedObject;
+    const bool can = picked && picked->ext().obj().points.size() >= 2 && !picked->ext().obj().shaped &&
+                     (picked->ext().obj().shapeType == "polygon" || picked->ext().obj().shapeType == "curve" ||
+                      picked->ext().obj().shapeType == "line");
+    hold.pointEdit = can && !hold.pointEdit;
+    hold.rotateMode = false;
+    bumpPointerPicture();
+    return hold.pointEdit;
+}
+
+namespace paint_detail {
+
+// 끈 점을 넣는다(숨긴 한글 2024 다각형 편집: 점을 옮기면 개체 크기·회전 중심이 점들을 감싸는 상자로 바뀌고, 상자의
+// 왼쪽 위가 바뀌면 그만큼 개체 자리를 옮긴다).
+EditResult movePointNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight) {
+    PointerHold& hold = pointerHold();
+    const int index = hold.pointDrag;
+    hold.pointPending = false;
+    hold.pointDrag = -1;
+    model::Control* control = anchoredControl(doc, hold.pointStory, hold.pointParagraph, hold.pointItem);
+    if (!control || !control->placement || index < 0 || index >= static_cast<int>(control->points.size())) return {};
+    std::vector<model::ShapePoint> points = control->points;
+    points[static_cast<std::size_t>(index)] = model::ShapePoint{hold.pointX - hold.pointBoxX, hold.pointY - hold.pointBoxY};
+    std::int32_t minX = points.front().x;
+    std::int32_t minY = points.front().y;
+    std::int32_t maxX = minX;
+    std::int32_t maxY = minY;
+    for (const model::ShapePoint& p : points) {
+        minX = std::min(minX, p.x);
+        minY = std::min(minY, p.y);
+        maxX = std::max(maxX, p.x);
+        maxY = std::max(maxY, p.y);
+    }
+    // 처음 상자 안에서만 줄어드는 쪽(왼쪽·위)은 그대로 0 에 둔다.
+    minX = std::min(minX, 0);
+    minY = std::min(minY, 0);
+    for (model::ShapePoint& p : points) {
+        p.x -= minX;
+        p.y -= minY;
+    }
+    model::Placement& place = *control->placement;
+    const auto sign = [](const std::string& align) {
+        return align == "RIGHT" || align == "BOTTOM" || align == "OUTSIDE" ? -1 : align == "CENTER" ? 0 : 1;
+    };
+    if (!place.treatAsChar) {
+        place.horzOffset += sign(place.horzAlign) * minX;
+        place.vertOffset += sign(place.vertAlign) * minY;
+    }
+    place.width = static_cast<std::uint32_t>(std::max(1, maxX - minX));
+    place.height = static_cast<std::uint32_t>(std::max(1, maxY - minY));
+    place.scaleX = 1;
+    place.scaleY = 1;
+    control->points = std::move(points);
+    const int story = hold.pointStory;
+    const int paragraph = hold.pointParagraph;
+    const int item = hold.pointItem;
+    rebuildStoryMap(doc);
+    invalidateLinePlaces({}, true);
+    pages = layoutPages(doc, -1, useStoredLineHeight, useStoredLineHeight);
+    EditRelayoutResult relayout;
+    relayout.fullInvalidation = true;
+    relayout.pageListChanged = true;
+    EditResult result = makeEditResult(doc, true, true, story, paragraph, &relayout);
+    // 점 편집을 이어 간다: 그 개체를 다시 고른다.
+    for (int page = 0; page < static_cast<int>(pages.size()); ++page) {
+        if (reselectAnchoredObject(doc, pages, page, story, paragraph, item)) break;
+    }
+    hold.pointEdit = true;
+    return result;
+}
+
+EditResult pointerExtrasNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight, std::string& why) {
+    PointerHold& hold = pointerHold();
+    if (hold.pointPending) return movePointNow(doc, pages, useStoredLineHeight);
+    if (hold.tableLinePending) return tableLineNow(doc, pages, useStoredLineHeight, why);
+    if (hold.linkPending) {
+        hold.linkPending = false;
+        const ObjectSpot from{hold.linkFromStory, hold.linkFromParagraph, hold.linkFromItem};
+        const ObjectSpot to{hold.linkToStory, hold.linkToParagraph, hold.linkToItem};
+        return linkTextBoxNow(doc, pages, from, to, useStoredLineHeight, why);
+    }
+    if (hold.formPressPending) {
+        hold.formPressPending = false;
+        return pressFormNow(doc, pages, ObjectSpot{hold.formStory, hold.formParagraph, hold.formItem},
+                            useStoredLineHeight);
+    }
+    return {};
+}
+
+}  // namespace paint_detail
+
 bool toggleObjectRotateMode() {
     PointerHold& hold = pointerHold();
     const bool canRotate = hold.selectedObject && hold.objectHandles && hold.selectedObject->role != "table";

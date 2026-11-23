@@ -88,6 +88,7 @@ const char* controlKindName(ControlKind kind) {
         case ControlKind::HiddenComment: return "hiddenComment";
         case ControlKind::Dutmal: return "dutmal";
         case ControlKind::Compose: return "compose";
+        case ControlKind::Form: return "form";
     }
     return "unknown";
 }
@@ -621,6 +622,71 @@ int textArtShadowCode(const std::string& name) {
     if (name == "DROP") return 1;
     if (name == "CONTINUOUS") return 2;
     return codeOf(kTextArtShadows, name, 0);
+}
+namespace {
+constexpr const char* kShapeShadows[] = {
+    "NONE", "PARELLEL_LEFTTOP", "PARELLEL_RIGHTTOP", "PARELLEL_LEFTBOTTOM", "PARELLEL_RIGHTBOTTOM",
+    "SHEAR_LEFTTOP", "SHEAR_RIGHTTOP", "SHEAR_LEFTBOTTOM", "SHEAR_RIGHTBOTTOM",
+    "PERS_LEFTTOP", "PERS_RIGHTTOP", "PERS_LEFTBOTTOM", "PERS_RIGHTBOTTOM", "SCALE_NARROW", "SCALE_ENLARGE"};
+}  // namespace
+const char* shapeShadowName(int code) {
+    const char* name = nameAt(kShapeShadows, code);
+    return *name ? name : "NONE";
+}
+int shapeShadowCode(const std::string& name) { return codeOf(kShapeShadows, name, 0); }
+
+bool shadowPoint(int code, std::int32_t offsetX, std::int32_t offsetY, double w, double h, double& x, double& y) {
+    constexpr double kParallel = 600;
+    constexpr double kShear = 0.567;
+    constexpr double kPers = 0.926;
+    const double ox = offsetX;
+    const double oy = offsetY;
+    if (code >= 1 && code <= 4) {
+        const double dx = (code == 1 || code == 3) ? -1 : 1;
+        const double dy = (code == 1 || code == 2) ? -1 : 1;
+        x += dx * kParallel + ox;
+        y += dy * kParallel + oy;
+        return true;
+    }
+    if (code >= 5 && code <= 12) {
+        const int k = (code - 5) % 4;
+        const double dx = (k == 0 || k == 2) ? -1 : 1;
+        const double up = (k == 0 || k == 1) ? -1 : 1;
+        const bool pers = code >= 9;
+        const double rise = h - y;
+        x += dx * (pers ? kPers : kShear) * rise + ox;
+        y = h + up * (pers ? 1.0 : 0.5) * rise + oy;
+        return true;
+    }
+    if (code == 13) {
+        x = 0.75 * x - kParallel + ox;
+        y = 0.75 * y - kParallel + oy;
+        return true;
+    }
+    if (code == 14) {
+        x = w - kParallel - 1.25 * (w - x) + ox;
+        y = h - kParallel - 1.25 * (h - y) + oy;
+        return true;
+    }
+    return false;
+}
+
+void shadowLead(int code, std::int32_t offsetX, std::int32_t offsetY, double w, double h, std::int32_t& left,
+                std::int32_t& top) {
+    left = 0;
+    top = 0;
+    double minX = 0;
+    double minY = 0;
+    const double corners[4][2] = {{0, 0}, {w, 0}, {0, h}, {w, h}};
+    for (const auto& c : corners) {
+        double x = c[0];
+        double y = c[1];
+        if (!shadowPoint(code, offsetX, offsetY, w, h, x, y)) return;
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+    }
+    left = static_cast<std::int32_t>(std::lround(-minX));
+    top = static_cast<std::int32_t>(std::lround(-minY));
 }
 const char* oleObjectTypeName(int code) {
     const char* name = nameAt(kOleTypes, code);

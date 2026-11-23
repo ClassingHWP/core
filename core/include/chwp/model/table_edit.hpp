@@ -86,6 +86,24 @@ struct BorderFillAccess {
 };
 TableEdit setTableCellBorders(Table& table, int row0, int col0, int row1, int col1, CellBorderKind kind,
                               const BorderSide& line, const BorderFillAccess& fills);
+// 표 그리기 펜·표 지우개(한글 표 디자인 탭 표 그리기·표 지우개, 숨긴 한글 2024 로 확인).
+// 선은 표 안 좌표(HU, 첫 칸 왼쪽 위가 0)다. horizontal 이면 y=at 의 가로선(x from~to), 아니면 x=at 의 세로선.
+// rows·cols 는 그린 줄 높이·칸 폭이다(비면 칸 크기 값으로 푼다). near 안에 칸 경계가 있으면 그 선 위로 본다.
+struct TableLine {
+    bool horizontal = true;
+    std::int64_t at = 0;
+    std::int64_t from = 0;
+    std::int64_t to = 0;
+    std::int64_t near = 0;
+    std::vector<std::int32_t> rows;
+    std::vector<std::int32_t> cols;
+};
+// 펜: 경계가 없는 자리를 지나면 선이 지나는 칸을 그 자리에서 둘로 나눈다(일부만 지나도 칸 전체, 글은 앞 칸).
+// 경계 위면 그 선 앞(위·왼쪽) 칸의 선을 pen 으로 긋는다(앞 칸이 없는 바깥선이면 뒤 칸).
+TableEdit drawTableLine(Table& table, const TableLine& line, const BorderSide& pen, const BorderFillAccess& fills);
+// 지우개: 경계 위에서 선 앞뒤 칸이 같은 폭(높이)으로 하나씩 맞닿으면 합치고, 아니면 그 선을 양쪽 칸에서 지운다.
+TableEdit eraseTableLine(Table& table, const TableLine& line, const BorderFillAccess& fills);
+
 // 셀 테두리/배경 대화 상자(한글 CellBorderFill·CellZoneBorderFill, 숨긴 한글 2024 로 확인). 블록의 바깥 네 변
 // (top·bottom·left·right)과 안쪽 가로·세로 선(insideHorz·insideVert)을 변마다 정한다. 값이 없는 변은 그대로,
 // type 이 NONE 이면 지운다(굵기·색은 남긴다). 바깥 변은 블록 밖 맞닿은 이웃 칸의 마주 보는 변도, 안쪽 선은 양쪽

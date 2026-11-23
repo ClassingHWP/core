@@ -41,6 +41,8 @@ struct UndoRecord {
     std::vector<model::Section> sections;
     model::PerLang<std::vector<model::Font>> fonts;
     std::vector<model::Style> styles;
+    // 문서 암호(구역 칸에 함께 맞바꾼다).
+    std::string password;
     CaretMark caretBefore;  // 이 칸을 적용한 뒤 캐럿
     CaretMark caretAfter;   // 이 칸을 적용하기 전 캐럿(이어 치기 판단)
     bool closed = false;    // 되돌리기·다시 하기를 거쳤으면 더 잇지 않는다

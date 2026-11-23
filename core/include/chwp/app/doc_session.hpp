@@ -232,6 +232,22 @@ public:
     render::EditResult deleteObject(int story, int paragraph, int item, std::string* error = nullptr);
     // 개체 묶기·풀기. spots 가 비거나 spot 이 없으면 지금 고른 개체다.
     render::EditResult groupObjects(const std::vector<render::ObjectSpot>& spots, std::string* error = nullptr);
+    // 모든 보호 개체 해제, 문단 첫 글자 장식(캐럿 문단), 글상자 연결·끊기, 양식 개체 넣기(캐럿)·누르기.
+    render::EditResult unlockAllObjects();
+    render::EditResult dropCap(int style, std::int32_t spacing, std::string* error = nullptr);
+    render::EditResult linkTextBox(const render::ObjectSpot& from, const render::ObjectSpot& to,
+                                   std::string* error = nullptr);
+    render::EditResult unlinkTextBox(const render::ObjectSpot& spot, std::string* error = nullptr);
+    render::EditResult insertForm(const std::string& type, std::string* error = nullptr);
+    render::EditResult pressForm(const render::ObjectSpot& spot);
+    render::EditResult setPassword(const std::string& current, const std::string& next, const std::string& confirm,
+                                   std::string* error = nullptr);
+    bool hasPassword() const { return !doc.format.password.empty(); }
+    render::EditResult alignObjects(const std::vector<render::ObjectSpot>& spots, const std::string& mode,
+                                    std::string* error = nullptr);
+    render::EditResult replacePicture(const render::ObjectSpot& spot, const Bytes& image, std::string* error = nullptr);
+    // 뗀 뒤 남은 포인터 일(글상자 연결, 양식 누르기, 점 옮기기).
+    render::EditResult pointerExtras(std::string* error = nullptr);
     render::EditResult ungroupObject(const render::ObjectSpot* spot, std::string* error = nullptr);
     // 포인터로 한 개체 편집(그린 도형 넣기, 개체 옮기기·크기 바꾸기, 표 테두리 끌기).
     render::EditResult insertDrawnShape();

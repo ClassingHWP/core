@@ -804,7 +804,8 @@ struct AgentDocument::Impl {
         bool placed = false;
         if (Status s = placeCommand(op, placed); !s.ok()) return s;
         // 문서 전체에 거는 명령 말고는 자리가 있어야 한다(agent 는 커서를 들고 있지 않는다).
-        const bool anywhere = name == "exchangeNotes" || name == "insertShape" || name == "groupObjects";
+        const bool anywhere = name == "exchangeNotes" || name == "insertShape" || name == "groupObjects" || name == "alignObjects" || name == "documentPassword" ||
+                              name == "linkTextBox" || name == "unlockAllObjects";
         if (!placed && !anywhere) {
             return fail(Code::BadArgument, name + ": 자리(at·range·object·story·section)가 없습니다.");
         }
@@ -987,6 +988,57 @@ struct AgentDocument::Impl {
                 });
                 report.object = objectRefOf(first->story, first->paragraph, first->item);
             }
+        } else if (name == "unlockAllObjects") {
+            r = session.unlockAllObjects();
+            if (!r.documentChanged) why = "보호한 개체가 없습니다.";
+        } else if (name == "dropCap") {
+            // 문단 첫 글자 장식(한글 DropCap). at 문단의 첫 글자. style: none·double·triple·margin.
+            const std::string style = argText(op, "style");
+            const int code = style == "none" ? 0 : style == "triple" ? 2 : style == "margin" ? 3 : style == "double" || style.empty() ? 1 : -1;
+            if (code < 0) return fail(Code::BadArgument, "dropCap: style 은 none·double·triple·margin 입니다.");
+            const double spacing = argNumber(op, "spacing", 850);
+            if (spacing < 0 || spacing > 100000) return fail(Code::BadArgument, "dropCap: spacing 은 0 이상의 HU 입니다.");
+            r = session.dropCap(code, static_cast<std::int32_t>(spacing), &why);
+        } else if (name == "linkTextBox") {
+            // 글상자 연결(한글 LinkTextBox): objects 의 앞 글상자 넘치는 글이 뒤 글상자로 이어진다.
+            if (op.objects.size() != 2) return fail(Code::BadArgument, "linkTextBox: objects 에 글상자 둘을 주세요.");
+            std::vector<render::ObjectSpot> spots;
+            for (const ObjectRef& ref : op.objects) {
+                int item = -1;
+                if (Status s = objectItem(ref, item); !s.ok()) return s;
+                spots.push_back({ref.story, ref.paragraph, item});
+            }
+            r = session.linkTextBox(spots[0], spots[1], &why);
+        } else if (name == "unlinkTextBox") {
+            if (!op.hasObject) return fail(Code::BadArgument, "unlinkTextBox: object 가 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            r = session.unlinkTextBox(render::ObjectSpot{op.object.story, op.object.paragraph, item}, &why);
+        } else if (name == "documentPassword") {
+            // 문서 암호(한글 문서 암호 설정·변경/해제). password 가 비면 푼다. 암호가 있으면 current 가 맞아야 한다.
+            r = session.setPassword(argText(op, "current"), argText(op, "password"), argText(op, "password"), &why);
+        } else if (name == "alignObjects") {
+            // 여러 개체 맞춤(한글 도형 탭 맞춤·크기 같게). objects 의 마지막 개체가 기준이다.
+            if (op.objects.size() < 2) return fail(Code::BadArgument, "alignObjects: objects 에 개체를 둘 이상 주세요.");
+            std::vector<render::ObjectSpot> spots;
+            for (const ObjectRef& ref : op.objects) {
+                int item = -1;
+                if (Status s = objectItem(ref, item); !s.ok()) return s;
+                spots.push_back({ref.story, ref.paragraph, item});
+            }
+            r = session.alignObjects(spots, argText(op, "mode"), &why);
+        } else if (name == "replacePicture") {
+            // 그림 바꾸기(한글 ChangePictureDlg): object 그림의 크기·효과는 두고 그림 파일만 바꾼다.
+            if (!op.hasObject) return fail(Code::BadArgument, "replacePicture: object 가 없습니다.");
+            if (op.image.empty()) return fail(Code::BadArgument, "replacePicture: base64 나 file 이 없습니다.");
+            int item = -1;
+            if (Status s = objectItem(op.object, item); !s.ok()) return s;
+            r = session.replacePicture(render::ObjectSpot{op.object.story, op.object.paragraph, item}, op.image, &why);
+            if (r.documentChanged) report.object = objectRefOf(op.object.story, op.object.paragraph, item);
+        } else if (name == "insertForm") {
+            // 양식 개체(한글 입력 → 양식 개체): at 자리에 글자처럼 넣는다. type: btn·checkBtn·comboBox·radioBtn·edit.
+            r = session.insertForm(argText(op, "type"), &why);
+            if (r.documentChanged) objectBeforeCaret(ControlKind::Form, report);
         } else if (name == "ungroupObject") {
             if (!op.hasObject) return fail(Code::BadArgument, "ungroupObject: object 가 없습니다.");
             int item = -1;
@@ -1625,7 +1677,8 @@ std::vector<std::string> commandNames() {
                                       "columns", "caption", "bookmark", "tableToText", "textToTable", "deleteMarks",
                                       "tableProperties", "glyphGroup", "convertText", "sortParagraphs", "insertHyperlink",
                                       "copyShape", "insertShape", "objectProperties", "deleteObject", "insertEquation",
-                                      "equation", "groupObjects", "ungroupObject"};
+                                      "equation", "groupObjects", "ungroupObject", "unlockAllObjects", "dropCap",
+                                      "linkTextBox", "unlinkTextBox", "insertForm", "replacePicture", "alignObjects", "documentPassword"};
     // 쪽 탭 컨트롤(머리말·꼬리말·쪽 번호·바탕쪽·메모·교정 부호 ...)은 편집기 이름 그대로다.
     for (int k = 0; k <= static_cast<int>(render::PageControlKind::InsertProofMark); ++k) {
         names.emplace_back(render::pageControlName(static_cast<render::PageControlKind>(k)));

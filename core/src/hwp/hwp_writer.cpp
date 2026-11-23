@@ -17,6 +17,7 @@
 #include "chwp/container/cfb.hpp"
 #include "chwp/container/zip.hpp"
 #include "chwp/hwp/records.hpp"
+#include "hwp/hwp_detail.hpp"
 #include "chwp/reader.hpp"
 #include "chwp/unit.hpp"
 
@@ -843,6 +844,7 @@ constexpr std::uint32_t kCtrlBookmark = makeCtrlId('b', 'o', 'k', 'm');
 constexpr std::uint32_t kCtrlHiddenComment = makeCtrlId('t', 'c', 'm', 't');
 constexpr std::uint32_t kCtrlDutmal = makeCtrlId('t', 'd', 'u', 't');
 constexpr std::uint32_t kCtrlCompose = makeCtrlId('t', 'c', 'p', 's');
+constexpr std::uint32_t kCtrlForm = makeCtrlId('f', 'o', 'r', 'm');
 
 std::uint32_t resolveCtrlId(const Control& ctrl) {
     switch (ctrl.kind) {
@@ -866,6 +868,7 @@ std::uint32_t resolveCtrlId(const Control& ctrl) {
         case ControlKind::HiddenComment: return kCtrlHiddenComment;
         case ControlKind::Dutmal: return kCtrlDutmal;
         case ControlKind::Compose: return kCtrlCompose;
+        case ControlKind::Form: return kCtrlForm;
         case ControlKind::Field:
             if (ctrl.ctrlId.size() == 4) {
                 return makeCtrlId(ctrl.ctrlId[0], ctrl.ctrlId[1], ctrl.ctrlId[2], ctrl.ctrlId[3]);
@@ -890,6 +893,7 @@ std::uint16_t extendedCharForControl(const Control& ctrl) {
         case ControlKind::Shape:
         case ControlKind::Container:
         case ControlKind::Ole:
+        case ControlKind::Form:
         case ControlKind::Equation: return 11;
         case ControlKind::HiddenComment: return 15;
         case ControlKind::Header:
@@ -964,6 +968,8 @@ void writePlacementBytes(ByteWriter& w, const Control& ctrl) {
     else if (numbering == "EQUATION") numberingBits = 3;
     attr |= (numberingBits << 26);
     if (ctrl.caption) attr |= (1u << 29);
+    if (p.sizeProtect) attr |= (1u << 20);
+    if (p.locked) attr |= (1u << 30);
 
     w.u32(attr);
     w.i32(p.vertOffset);
@@ -1063,6 +1069,33 @@ void writeCaptionRecords(ByteWriter& stream, const Caption& cap, std::uint16_t l
     w.zeros(12);
     appendRecord(stream, tag::ListHeader, level, w.view());
     writeSubListParagraphs(stream, cap.content.paragraphs, level, bins);
+}
+
+// 문단 첫 글자 장식 종류(HWPX dropcapstyle). 1 두 줄, 2 세 줄, 3 여백. 0 은 장식이 아니다.
+std::uint32_t dropCapCode(const Control& ctrl) {
+    if (!ctrl.placement) return 0;
+    const std::string& d = ctrl.placement->dropCap;
+    if (d == "DoubleLine") return 1;
+    if (d == "TripleLine") return 2;
+    if (d == "Margin") return 3;
+    return 0;
+}
+
+// 문단 첫 글자 장식 상자의 컨트롤 데이터(한글 2024 가 쓰는 매개변수 묶음 539: 목록 0x3003 안 0x7001 = 종류).
+void writeDropCapData(ByteWriter& stream, std::uint16_t level, std::uint32_t code) {
+    ByteWriter w;
+    w.u16(0x021B);
+    w.i16(1);
+    w.u16(0);
+    w.u16(0x3003);
+    w.u16(0x8000);
+    w.u16(0x3003);
+    w.i16(1);
+    w.u16(0);
+    w.u16(0x7001);
+    w.u16(9);
+    w.u32(code);
+    appendRecord(stream, tag::CtrlData, level, w.view());
 }
 
 void writeParameterSetString(ByteWriter& stream, std::uint16_t level, std::uint16_t itemId,
@@ -1202,13 +1235,14 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
                 w.u32(0u);
                 w.u32(0u);
             }
-            // 그림자(16B) + instanceId(4B) + 여분(2B) = 22 bytes
+            // 그림자(16B) + instanceId(4B) + u8 + 투명도 u8 = 22 bytes
+            w.u32(static_cast<std::uint32_t>(shapeShadowCode(ctrl.shadow.type)));
+            w.u32(hexToColorRef(ctrl.shadow.color, 0x00B2B2B2u));
+            w.i32(ctrl.shadow.offsetX);
+            w.i32(ctrl.shadow.offsetY);
             w.u32(0u);
-            w.u32(0x00B2B2B2u);
-            w.i32(0);
-            w.i32(0);
-            w.u32(0u);
-            w.u16(0u);
+            w.u8(0);
+            w.u8(static_cast<std::uint8_t>(std::min<std::uint32_t>(ctrl.shadow.alpha, 255u)));
         } else if (st == "container") {
             w.u16(static_cast<std::uint16_t>(ctrl.children.size()));
             for (const auto& child : ctrl.children) {
@@ -1233,7 +1267,9 @@ void writeShapeComponentRecords(ByteWriter& stream, const Control& ctrl, std::ui
         w.i16(static_cast<std::int16_t>(ctrl.boxPadTop));
         w.i16(static_cast<std::int16_t>(ctrl.boxPadBottom));
         w.u32(ctrl.boxTextWidth > 0 ? ctrl.boxTextWidth : p.width);
-        w.zeros(13);
+        w.u32(sub.linkId);
+        w.u32(sub.linkNextId);
+        w.zeros(5);
         appendRecord(stream, tag::ListHeader, compLevel + 1, w.view());
         writeSubListParagraphs(stream, sub.paragraphs, compLevel + 1, bins);
     }
@@ -1763,10 +1799,22 @@ void writeControlRecords(ByteWriter& stream, const Control& ctrl, std::uint16_t 
                 writePlacementBytes(w, ctrl);
                 appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
             }
+            if (const std::uint32_t drop = dropCapCode(ctrl); drop != 0) writeDropCapData(stream, ctrlLevel + 1, drop);
             if (ctrl.caption) {
                 writeCaptionRecords(stream, *ctrl.caption, ctrlLevel + 1, bins);
             }
             writeShapeComponentRecords(stream, ctrl, ctrlLevel + 1, bins);
+            break;
+        }
+        case ControlKind::Form: {
+            {
+                ByteWriter w;
+                w.u32(kCtrlForm);
+                writePlacementBytes(w, ctrl);
+                appendRecord(stream, tag::CtrlHeader, ctrlLevel, w.view());
+            }
+            const Bytes form = detail::formRecordBytes(ctrl.form.value_or(FormObject{}));
+            appendRecord(stream, tag::FormObject, ctrlLevel + 1, ByteView(form));
             break;
         }
         case ControlKind::Equation: {

@@ -679,6 +679,7 @@ void runSoloCrew(double budgetMs);
 void beginGrind();
 void ensureScreenFrames();
 bool screenFrame(double time, void*);
+bool fireLongPress(SelectionReport* report);
 
 // 편집 하나가 끝나면 화면을 그린다. 여러 편집을 묶어 할 때는 다 하고 한 번만 그린다(gHeldFrames).
 int gHeldFrames = 0;
@@ -1711,6 +1712,41 @@ EditReport editInsertPicture(const Bytes& image) {
     return makeEditReport(res);
 }
 
+// 그림 바꾸기. 고른 그림을 파일 바이트의 그림으로 바꾼다. 무엇을 남길지는 코어가 정한다.
+EditReport editReplacePicture(const Bytes& image) {
+    int story = -1;
+    int paragraph = -1;
+    int item = -1;
+    if (!chwp::render::selectedObjectAnchor(story, paragraph, item)) {
+        EditReport report = makeEditReport(chwp::render::EditResult{});
+        report.error = "바꿀 그림을 고르십시오.";
+        return report;
+    }
+    const bool wasCrew = crewRunning();
+    if (wasCrew) pauseCrewForEdit();
+    chwp::render::PageFillGuard guard;
+    std::string why;
+    const chwp::render::EditResult res = gDoc.replacePicture(chwp::render::ObjectSpot{story, paragraph, item}, image, &why);
+    if (res.documentChanged) syncEditedDocument(res);
+    if (wasCrew) resumeCrewAfterEdit(res);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged) report.error = why;
+    return report;
+}
+
+// 문서 암호 걸기·바꾸기·풀기. 규칙(5자 이상, 지금 암호 확인)은 코어가 정한다.
+EditReport editDocumentPassword(const std::string& current, const std::string& next, const std::string& confirm) {
+    std::string why;
+    const chwp::render::EditResult res = gDoc.setPassword(current, next, confirm, &why);
+    frameAfterEdit();
+    EditReport report = makeEditReport(res);
+    if (!res.documentChanged) report.error = why;
+    return report;
+}
+
+bool documentHasPassword() { return gDoc.hasPassword(); }
+
 EditReport editPictureBullet(const Bytes& image) {
     const bool wasCrew = crewRunning();
     if (wasCrew) pauseCrewForEdit();
@@ -2461,6 +2497,95 @@ EditReport editShortcut(const std::string& command) {
         frameAfterEdit();
         return makeEditReport(chwp::render::EditResult{});
     }
+    // 표 그리기(tablePen[:종류:굵기HU:#색])·표 지우개(tableEraser). 포인터 도구만 바꾼다.
+    if (command == "tableEraser" || command == "tablePen" || command.rfind("tablePen:", 0) == 0) {
+        EditReport report = makeEditReport(chwp::render::EditResult{});
+        if (command == "tableEraser") {
+            chwp::render::toggleTableTool(2);
+        } else if (command == "tablePen") {
+            chwp::render::toggleTableTool(1);
+        } else {
+            model::BorderSide pen{"SOLID", "#000000", 34};
+            const std::string args = command.substr(9);
+            const std::size_t a = args.find(':');
+            const std::size_t b = a == std::string::npos ? std::string::npos : args.find(':', a + 1);
+            if (a != 0 && !args.empty()) pen.type = args.substr(0, a);
+            if (a != std::string::npos) {
+                const int width = std::atoi(args.c_str() + a + 1);
+                if (width > 0) pen.width = width;
+            }
+            if (b != std::string::npos && b + 1 < args.size()) pen.color = args.substr(b + 1);
+            chwp::render::toggleTableTool(1, &pen);
+        }
+        frameAfterEdit();
+        return report;
+    }
+    // 다각형 편집(점 편집)·글상자 연결 고르기·양식 편집 상태는 코어 포인터 상태만 바꾼다.
+    if (command == "pointEdit" || command == "linkTextBox" || command == "formEditState") {
+        EditReport report = makeEditReport(chwp::render::EditResult{});
+        if (command == "pointEdit") {
+            const bool was = chwp::render::pointEditing();
+            if (!chwp::render::togglePointEdit() && !was) {
+                report.error = "다각형·곡선·선을 고른 뒤 점을 편집합니다.";
+            }
+        } else if (command == "linkTextBox") {
+            if (!chwp::render::startLinkTextBoxPick()) report.error = "연결할 글상자를 먼저 고르십시오.";
+        } else {
+            chwp::render::setFormEditing(!chwp::render::formEditing());
+        }
+        frameAfterEdit();
+        return report;
+    }
+    // 모든 보호 개체 해제, 글상자 연결 끊기, 문단 첫 글자 장식(dropCap:종류[:간격]), 양식 개체 넣기(insertForm:종류).
+    if (command == "unlockAllObjects" || command == "unlinkTextBox" || command.rfind("dropCap:", 0) == 0 ||
+        command.rfind("insertForm:", 0) == 0) {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        std::string why;
+        chwp::render::EditResult res;
+        if (command == "unlockAllObjects") {
+            res = gDoc.unlockAllObjects();
+            if (!res.documentChanged) why = "보호한 개체가 없습니다.";
+        } else if (command == "unlinkTextBox") {
+            int story = -1;
+            int paragraph = -1;
+            int item = -1;
+            if (chwp::render::selectedObjectAnchor(story, paragraph, item)) {
+                res = gDoc.unlinkTextBox(chwp::render::ObjectSpot{story, paragraph, item}, &why);
+            } else {
+                why = "연결을 끊을 글상자를 고르십시오.";
+            }
+        } else if (command.rfind("dropCap:", 0) == 0) {
+            const std::string args = command.substr(8);
+            const int style = std::atoi(args.c_str());
+            const std::size_t colon = args.find(':');
+            const int spacing = colon == std::string::npos ? 850 : std::atoi(args.c_str() + colon + 1);
+            res = gDoc.dropCap(style, std::max(0, spacing), &why);
+        } else {
+            res = gDoc.insertForm(command.substr(11), &why);
+        }
+        if (res.documentChanged) syncEditedDocument(res);
+        if (wasCrew) resumeCrewAfterEdit(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.documentChanged) report.error = why;
+        return report;
+    }
+    // 여러 개체 맞춤(alignObjects:종류). 기준·규칙은 코어가 정한다.
+    if (command.rfind("alignObjects:", 0) == 0) {
+        const bool wasCrew = crewRunning();
+        if (wasCrew) pauseCrewForEdit();
+        chwp::render::PageFillGuard guard;
+        std::string why;
+        const chwp::render::EditResult res = gDoc.alignObjects({}, command.substr(13), &why);
+        if (res.documentChanged) syncEditedDocument(res);
+        if (wasCrew) resumeCrewAfterEdit(res);
+        frameAfterEdit();
+        EditReport report = makeEditReport(res);
+        if (!res.documentChanged) report.error = why;
+        return report;
+    }
     if (command == "groupObjects" || command == "ungroupObjects") {
         const bool wasCrew = crewRunning();
         if (wasCrew) pauseCrewForEdit();
@@ -3152,6 +3277,37 @@ bool inputOwnsScroll() {
 
 bool inputSettled() { return !gInput.pinchActive() && !gInput.coasting() && !gInput.panning() && !gInput.wheeling(); }
 
+// 문서 위에 뜬 도구줄(휴대폰). 아래로 스크롤하면 숨기고, 위로 스크롤하거나 맨 위(막대 자리 안)면 보인다.
+// 메뉴 판이 열려 있으면 늘 보이고, 화면 자판이 떠 있으면 숨긴다(자판 위 서식 막대가 대신한다).
+struct TopBar {
+    int css = 0;  // 0 이면 막대가 없다(PC 화면, 보기 모드)
+    bool pinned = false;
+    bool keyboard = false;
+    bool shown = true;
+    int lastY = -1;
+    int travel = 0;  // 지금 방향으로 움직인 거리(장치 픽셀, 아래가 +)
+};
+TopBar gTopBar;
+// 이만큼(CSS 픽셀) 한 방향으로 스크롤하면 막대를 숨기거나 보인다. 손이 떨려 깜박이지 않게 한다.
+constexpr double kTopBarTravelCss = 24;
+
+bool updateTopBar(int scrollY) {
+    TopBar& bar = gTopBar;
+    const double dpr = gLastPlan.dpr > 0 ? gLastPlan.dpr : 1;
+    if (bar.lastY >= 0 && scrollY != bar.lastY) {
+        const int delta = scrollY - bar.lastY;
+        if ((delta > 0) != (bar.travel > 0)) bar.travel = 0;
+        bar.travel += delta;
+    }
+    bar.lastY = scrollY;
+    if (bar.css <= 0 || bar.pinned) bar.shown = true;
+    else if (bar.keyboard) bar.shown = false;
+    else if (scrollY <= static_cast<int>(bar.css * dpr)) bar.shown = true;
+    else if (bar.travel >= kTopBarTravelCss * dpr) bar.shown = false;
+    else if (bar.travel <= -kTopBarTravelCss * dpr) bar.shown = true;
+    return bar.shown;
+}
+
 void noteCamera(int scrollX, int scrollY, int percent, bool coasting, bool pinching) {
     gCameraNoteDue = false;
     const chwp::render::ViewportState cam = gCamera.state();
@@ -3163,6 +3319,7 @@ void noteCamera(int scrollX, int scrollY, int percent, bool coasting, bool pinch
     note.pinching = pinching;
     note.ownsScroll = inputOwnsScroll();
     note.settled = inputSettled();
+    note.topBarShown = updateTopBar(scrollY);
     note.page = currentCameraPage(scrollX, scrollY, percent);
     note.pageCount = static_cast<int>(gDoc.pages.size());
     note.pageCounting = !gDoc.layoutDone();
@@ -3205,7 +3362,19 @@ void rebakeFramesWithoutGlyphs() {
     if (wasCrew) resumeCrewAfterEdit(redraw);
 }
 
+// 손가락을 움직이지 않고 누르고 있으면 오래 누르기 시간을 센다. 화면 루프는 프레임마다 부른다(화면이 아직 없어도).
+void countLongPress(double time) {
+    static double last = 0;
+    const double now = time > 0 ? time : frameNow();
+    const double dt = last > 0 ? now - last : 16;
+    last = now;
+    if (!gInput.pressWaiting() || dt <= 0) return;
+    gInput.tick(gCamera, std::min(dt, 48.0));
+    fireLongPress(nullptr);
+}
+
 bool screenFrame(double time, void*) {
+    countLongPress(time);
     rebakeFramesWithoutGlyphs();
     if (!gScreenOn || !chwp::render::screenReady()) {
         // 화면이 없으면 매끄럽게 지킬 프레임이 없다. 입력이 켜 둔 '손이 움직이는 중'을 풀어 일꾼이 쉬지 않게 한다.
@@ -5642,6 +5811,9 @@ bool paperPoint(double vx, double vy, bool clampToNearest, int& page, int& x, in
 
 // 마지막으로 누른 포인터가 Shift 와 함께였는지(InputPointer::shift).
 bool gPointerShift = false;
+// 오래 눌러 낱말을 고른 손가락. 그 손가락을 떼면 셸이 복사·잘라내기 메뉴를 띄운다.
+int gLongPressId = -1;
+double gLastTouchDownTime = 0;
 // 오른쪽 단추를 누를 때 고른 것(블록·칸 블록·개체)이 있었는지. 있으면 그 누름·뗌은 아무것도 바꾸지 않는다.
 bool gRightKeeps = false;
 
@@ -5677,6 +5849,7 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     sample.dpr = gLastPlan.dpr > 0 ? gLastPlan.dpr : 1;
     sample.viewX = outcome.x;
     sample.viewY = outcome.y;
+    sample.longPress = outcome.longPress;
     if (page >= 0 && page < static_cast<int>(gDoc.pages.size())) {
         for (const chwp::render::ViewPage& sheet : gLastPlan.pages) {
             if (sheet.index != page || sheet.w <= 0) continue;
@@ -5709,6 +5882,11 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.moveObject();
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.resizeObject();
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.rotateObject();
+        if (!drawn.documentChanged && !askSwap) {
+            std::string why;
+            drawn = gDoc.pointerExtras(&why);
+            if (!drawn.documentChanged && !why.empty()) out.notice = why;
+        }
         if (!drawn.documentChanged && !askSwap) drawn = gDoc.resizeTableBorder();
         if (drawn.documentChanged) {
             syncEditedDocument(drawn);
@@ -5774,6 +5952,11 @@ SelectionReport attachSelection(const chwp::input::PointerOutcome& outcome) {
     out.attached = true;
     out.selectPhase = outcome.tap ? 1 : static_cast<int>(outcome.phase);
     if (kind == 3 && chwp::render::takePinTap()) out.pinTap = true;
+    // 오래 눌러 고른 낱말에서 손을 떼면 그 자리에 복사·잘라내기 메뉴를 띄운다.
+    if (kind == 3 && outcome.id == gLongPressId) {
+        gLongPressId = -1;
+        out.pinTap = true;
+    }
     if (kind == 3) out.dialog = chwp::render::takeOpenDialog();
     out.active = view.active;
     out.caret = view.caret;
@@ -5849,6 +6032,15 @@ bool touchOnPin(double vx, double vy) {
     int y = 0;
     if (!paperPoint(vx, vy, false, page, x, y) || page < 0) return false;
     return chwp::render::pinUnder(page, x, y, 22.0 * huPerLogicalAt(page));
+}
+
+// 터치가 고른 개체의 옮기기 아이콘이나 손잡이 위인가. 그러면 스크롤하지 않고 개체를 옮기거나 늘린다.
+bool touchOnGrab(double vx, double vy) {
+    int page = -1;
+    int x = 0;
+    int y = 0;
+    if (!paperPoint(vx, vy, false, page, x, y) || page < 0) return false;
+    return chwp::render::touchGrabAt(page, x, y, huPerLogicalAt(page)) != 0;
 }
 
 // 마우스가 올라간 자리의 CSS 커서. 눈금자·스크롤 막대·종이 밖은 화살표다.
@@ -6275,6 +6467,65 @@ chwp::input::Camera applyEmbed(const EmbedCommand& command, bool glide) {
 
 }  // namespace
 
+// 오래 누르기가 됐으면 그 손가락을 잡아 두고 그 자리를 누른 것으로 넘긴다. 글이면 낱말을 고르고 끌면 넓히며, 뗄 때
+// 메뉴를 띄운다. 개체면 고르기만 하고 그 손가락은 뗄 때까지 쉰다(옮기기는 가운데 아이콘으로만).
+// 보기 모드에서 두 번 누르면 편집으로 들어갈 수 있다(편집 단추가 보일 때, 잠긴 문서는 아님).
+bool editTapAllowed() { return gShellReadOnly && gEditButton && !gDoc.locked(); }
+// 편집으로 들어갈 두 번째 손가락 누르기. 끌지 않고 떼면(탭) 들어간다. 끌면 스크롤이다.
+int gEditTapId = -1;
+// 두 번 눌러 편집에 들어간 뒤 편집 도구줄이 생기며 화면이 줄면 누른 자리(캐럿)가 보이게 둔다.
+// 사용자가 다시 누르거나 휠·제스처로 움직이면 그만둔다.
+bool gRevealCaretOnResize = false;
+
+void revealPointerCaret() {
+    const chwp::render::PointerCursor cursor = chwp::render::pointerCursor();
+    if (!cursor.caret || cursor.story < 0) return;
+    chwp::render::EditResult res;
+    res.handled = true;
+    res.cursor = cursor;
+    res.caret = chwp::render::caretForCursor(gDoc.doc, gDoc.pages,
+                                             chwp::model::CursorPos{cursor.story, cursor.paragraph, cursor.offset});
+    revealCaretNow(res);
+}
+
+// 보기·편집 모드를 바꾼다. 눈금자는 편집에서만 보인다(켠 값은 그대로 둔다).
+void setViewMode(bool view) {
+    gShellReadOnly = view;
+    gEditTapId = -1;
+    chwp::render::setReadOnly(view || gDoc.locked());
+    gCamera.setRulers(gRulersWanted && !chwp::render::readOnly());
+    gViewportDirty = true;
+}
+
+bool fireLongPress(SelectionReport* report) {
+    int id = -1;
+    double x = 0;
+    double y = 0;
+    if (!gInput.takeLongPress(id, x, y)) return false;
+    gInput.holdSelection(id);
+    chwp::input::PointerOutcome outcome;
+    outcome.select = true;
+    outcome.longPress = true;
+    outcome.phase = chwp::input::Phase::Down;
+    outcome.x = x;
+    outcome.y = y;
+    outcome.id = id;
+    outcome.device = static_cast<int>(chwp::input::Device::Touch);
+    outcome.time = gLastTouchDownTime + chwp::input::PointerInput::kLongPressMs;
+    const SelectionReport pressed = attachSelection(outcome);
+    if (report) *report = pressed;
+    if (!chwp::render::selectedObjectKind(gDoc.doc).empty() && !chwp::render::pointerCursor().hasSelection) {
+        chwp::input::PointerOutcome up = outcome;
+        up.longPress = false;
+        up.phase = chwp::input::Phase::Up;
+        attachSelection(up);
+        gInput.ignorePointer(id);
+    } else {
+        gLongPressId = id;
+    }
+    return true;
+}
+
 InputReport input(const InputMessage& msg) {
     const std::string& type = msg.type;
     // 마우스 오른쪽 단추(상황 메뉴): 고른 것이 있으면 그대로 둔다(메뉴가 그것에 걸린다). 없으면 왼쪽 누름처럼 그 자리에
@@ -6295,6 +6546,16 @@ InputReport input(const InputMessage& msg) {
     }
     chwp::input::Camera camera;
     chwp::input::PointerOutcome outcome;
+    bool longPressed = false;
+    SelectionReport longPressReport;
+    // 보기 모드의 두 번 누르기가 편집으로 들어간다. 캐럿은 보기 모드 그대로 그 자리에 두고(한 번 누르기),
+    // 모드는 고르기를 마친 뒤 바꾼다(눈금자가 생기면 쪽 자리가 바뀐다).
+    bool enterEdit = false;
+    // 셸의 scroll 은 화면이 줄며 생긴 제자리 알림일 수 있어 그만두는 까닭으로 보지 않는다.
+    if ((type == "pointer" && msg.pointer.phase.value_or(1) == 1) || type == "wheel" || type == "wheelRaw" ||
+        type == "gesture") {
+        gRevealCaretOnResize = false;
+    }
     if (type == "pointer") {
         // 누를 때의 Shift 는 이 포인터의 고르기 판단(여러 개체 고르기)에 쓴다.
         if (msg.pointer.phase.value_or(1) == 1) gPointerShift = msg.pointer.shift;
@@ -6306,15 +6567,40 @@ InputReport input(const InputMessage& msg) {
         event.y = msg.pointer.y;
         event.time = msg.pointer.t;
         event.button = msg.pointer.button;
+        if (event.device != chwp::input::Device::Mouse && event.phase == chwp::input::Phase::Down) {
+            gLastTouchDownTime = event.time;
+        }
         outcome = gInput.pointer(gCamera, event);
         outcome.id = event.id;
         outcome.device = static_cast<int>(event.device);
         outcome.time = event.time;
+        const double dpr = gLastPlan.dpr > 0 ? gLastPlan.dpr : 1;
+        const bool repeated = event.phase == chwp::input::Phase::Down &&
+                              chwp::render::repeatedTouchDown(event.x, event.y, event.time, dpr,
+                                                              static_cast<int>(event.device), event.id);
+        // 마우스는 누르는 그 자리에서 들어가고(끌면 편집 모드의 블록), 손가락은 떼어 탭일 때 들어간다.
+        bool editTap = false;
+        if (repeated && editTapAllowed() && event.button == 0) {
+            if (event.device == chwp::input::Device::Mouse) {
+                chwp::render::forgetClickChain();
+                enterEdit = true;
+            } else {
+                gEditTapId = event.id;
+                editTap = true;
+            }
+        }
+        if (event.id == gEditTapId &&
+            (event.phase == chwp::input::Phase::Up || event.phase == chwp::input::Phase::Cancel)) {
+            gEditTapId = -1;
+            if (outcome.tap && editTapAllowed()) {
+                chwp::render::forgetClickChain();
+                enterEdit = true;
+            }
+        }
         if (event.device != chwp::input::Device::Mouse && event.phase == chwp::input::Phase::Down &&
             gInput.touchCount() == 1 && !gInput.pinchActive() &&
-            (touchOnPin(event.x, event.y) || chwp::render::drawTool() != 0 ||
-             chwp::render::repeatedTouchDown(event.x, event.y, event.time, gLastPlan.dpr > 0 ? gLastPlan.dpr : 1,
-                                               static_cast<int>(event.device), event.id))) {
+            (touchOnPin(event.x, event.y) || touchOnGrab(event.x, event.y) || chwp::render::drawTool() != 0 ||
+             chwp::render::tableTool() != 0 || (repeated && !editTap))) {
             gInput.holdSelection(event.id);
             outcome.select = true;
             outcome.x = event.x;
@@ -6363,6 +6649,7 @@ InputReport input(const InputMessage& msg) {
     } else if (type == "tick") {
         camera = gInput.tick(gCamera, msg.dt);
         if (const auto end = gWheel.endIfDue(frameNow())) camera = gInput.wheel(gCamera, *end);
+        longPressed = fireLongPress(&longPressReport);
     } else if (type == "wheelRaw") {
         chwp::input::RawWheel raw;
         raw.dx = msg.dx;
@@ -6381,12 +6668,13 @@ InputReport input(const InputMessage& msg) {
         const chwp::render::ViewportState before = gCamera.state();
         gCamera.setViewport(msg.cssW, msg.cssH, msg.dpr);
         const chwp::render::ViewPlan probe = gCamera.plan(false);
-        const chwp::render::ViewportState after = gCamera.state();
         if (probe.viewW != gLastPlan.viewW || probe.viewH != gLastPlan.viewH || probe.percent != gLastPlan.percent ||
-            probe.scrollX != gLastPlan.scrollX || probe.scrollY != gLastPlan.scrollY || after.fitPage != before.fitPage ||
-            after.fitWidth != before.fitWidth) {
+            probe.scrollX != gLastPlan.scrollX || probe.scrollY != gLastPlan.scrollY || gCamera.state().fitPage != before.fitPage ||
+            gCamera.state().fitWidth != before.fitWidth) {
             gViewportDirty = true;
         }
+        if (gRevealCaretOnResize && (probe.viewW != gLastPlan.viewW || probe.viewH != gLastPlan.viewH)) revealPointerCaret();
+        const chwp::render::ViewportState after = gCamera.state();
         camera = gInput.tick(gCamera, 0);
         camera.scrollChanged = after.scrollX != before.scrollX || after.scrollY != before.scrollY;
         camera.zoomChanged = after.percent != before.percent || after.fitPage != before.fitPage || after.fitWidth != before.fitWidth;
@@ -6442,11 +6730,25 @@ InputReport input(const InputMessage& msg) {
         chwp::render::setSelectionPins(msg.on);
         frameAfterEdit();
         camera = gInput.tick(gCamera, 0);
-    } else if (type == "readOnly" || type == "rulers" || type == "rulersToggle") {
+    } else if (type == "topBar") {
+        const chwp::render::ViewportState before = gCamera.state();
+        gTopBar.css = std::max(0, msg.cssH);
+        gTopBar.pinned = msg.on;
+        gTopBar.keyboard = msg.keyboard;
+        gTopBar.travel = 0;
+        gCamera.setTopSpace(gTopBar.css);
+        const chwp::render::ViewportState after = gCamera.state();
+        gViewportDirty = true;
+        camera = gInput.tick(gCamera, 0);
+        camera.scrollChanged = after.scrollX != before.scrollX || after.scrollY != before.scrollY;
+        camera.zoomChanged = after.percent != before.percent;
+        camera.handled = true;
+    } else if (type == "mode" || type == "readOnly" || type == "rulers" || type == "rulersToggle") {
         // 눈금자는 사용자가 켠 값(처음은 켬)이고, 보기 전용이면 숨긴다. 켠 값은 그대로 둔다.
-        if (type == "readOnly") {
-            gShellReadOnly = msg.on;
-            chwp::render::setReadOnly(msg.on || gDoc.locked());
+        if (type == "mode" || type == "readOnly") {
+            gShellReadOnly = type == "mode" ? msg.mode == "view" : msg.on;
+            gEditTapId = -1;
+            chwp::render::setReadOnly(gShellReadOnly || gDoc.locked());
         }
         else if (type == "rulers") gRulersWanted = msg.on;
         else gRulersWanted = !gRulersWanted;
@@ -6488,10 +6790,31 @@ InputReport input(const InputMessage& msg) {
     out.settled = inputSettled();
     out.rulersWanted = gRulersWanted;
     out.editButton = gEditButton;
-    out.needsTick = gInput.coasting() || gWheel.pending();
+    out.needsTick = gInput.coasting() || gWheel.pending() || gInput.pressWaiting();
     if (type == "pointer" || type == "pointers") {
         out.pointer = true;
         out.selection = attachSelection(outcome);
+    } else if (longPressed) {
+        out.pointer = true;
+        out.selection = longPressReport;
+    }
+    if (enterEdit) {
+        setViewMode(false);
+        gRevealCaretOnResize = true;
+        out.camera = gInput.tick(gCamera, 0);
+        gCamera.scrollbars(out.barX, out.barY);
+        out.modeByInput = true;
+    }
+    out.mode = gShellReadOnly ? "view" : "edit";
+    out.topBarShown = updateTopBar(out.camera.scrollY);
+    if (editTapAllowed()) {
+        const chwp::render::ClickChainSpot spot = chwp::render::clickChainSpot(gLastPlan.dpr > 0 ? gLastPlan.dpr : 1);
+        if (spot.open) {
+            out.editTapUntil = spot.until;
+            out.editTapX = spot.x;
+            out.editTapY = spot.y;
+            out.editTapReach = spot.reach;
+        }
     }
     return out;
 }

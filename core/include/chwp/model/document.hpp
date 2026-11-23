@@ -465,6 +465,13 @@ struct Placement {
     std::int32_t marginRight = 0;
     std::int32_t marginTop = 0;
     std::int32_t marginBottom = 0;
+    // 개체 보호(한글 개체 보호하기, HWPX lock, HWP 공통 속성 30번 비트). 보호한 개체는 눌러도 고르지 않는다.
+    bool locked = false;
+    // 크기 보호(HWPX sz@protect, HWP 공통 속성 20번 비트). 문단 첫 글자 장식 상자가 켠다.
+    bool sizeProtect = false;
+    // 문단 첫 글자 장식(HWPX dropcapstyle: DoubleLine, TripleLine, Margin. HWP 는 개체의 컨트롤 데이터 539).
+    // 비어 있으면 장식이 아니다.
+    std::string dropCap;
     bool flipHorizontal = false;  // hp:flip. 상자 안에서 좌우를 뒤집는다.
     bool flipVertical = false;
     // 회전각(도, 0~359, 한글 개체 회전·회전각). width·height 는 돌리기 전 크기이고, 쪽에서 차지하는 상자(sz)와
@@ -534,6 +541,10 @@ struct SubList {
     bool masterFront = false;
     std::uint32_t textWidth = 0;   // 머리말/꼬리말 글 영역. 0이면 본문 너비
     std::uint32_t textHeight = 0;  // 머리말/꼬리말 글 영역. 0이면 머리말·꼬리말 여백
+    // 글상자 연결(HWPX linkListIDRef·linkListNextIDRef, HWP 목록 머리 너비 뒤 두 u32). 연결한 글상자의 글은 모두
+    // 첫 글상자에 있고, 넘치는 줄이 다음 번호의 글상자로 이어진다. 0 이면 연결이 없다.
+    std::uint32_t linkId = 0;
+    std::uint32_t linkNextId = 0;
     std::vector<Paragraph> paragraphs;
 };
 
@@ -606,7 +617,8 @@ enum class ControlKind {
     HiddenComment,// tcmt
     Dutmal,       // tdut : 덧말
     Compose,      // tcps : 글자 겹침
-    FieldEnd      // 필드 끝. 앞의 Field(하이퍼링크 등)의 범위가 여기서 끝난다. 글자 칸은 없다
+    FieldEnd,     // 필드 끝. 앞의 Field(하이퍼링크 등)의 범위가 여기서 끝난다. 글자 칸은 없다
+    Form          // form : 양식 개체(명령 단추·선택 상자·콤보 상자·라디오 단추·입력 상자)
 };
 const char* controlKindName(ControlKind kind);
 // 글맵시 값의 HWP 번호 ↔ HWPX 이름(한글 2024 로 HWPX 를 열어 HWP 로 저장해 쟀다).
@@ -813,6 +825,76 @@ struct VideoInfo {
     std::string tag;
 };
 
+// 그리기 개체 그림자(HWPX hp:shadow, HWP 개체 요소 선·채우기 뒤 종류 u32·색 u32·간격 X·Y i32, 끝 바이트 투명도).
+// 종류 번호: 0 NONE, 1~4 PARELLEL_LEFTTOP·RIGHTTOP·LEFTBOTTOM·RIGHTBOTTOM, 5~8 SHEAR_(같은 차례),
+// 9~12 PERS_(같은 차례), 13 SCALE_NARROW, 14 SCALE_ENLARGE(한글 2024 로 저장해 확인).
+struct ShapeShadow {
+    std::string type = "NONE";
+    std::string color = "#B2B2B2";
+    std::int32_t offsetX = 0;
+    std::int32_t offsetY = 0;
+    std::uint32_t alpha = 0;  // 0 불투명, 255 투명
+    [[nodiscard]] bool on() const { return !type.empty() && type != "NONE"; }
+};
+const char* shapeShadowName(int code);
+int shapeShadowCode(const std::string& name);
+// 그림자 자리. 도형 상자(w×h) 안의 점 (x, y)를 그림자 위의 점으로 옮긴다(숨긴 한글 2024 의 PDF 로 잰 값).
+// - 평행: 방향마다 600 을 더한 이동 (방향·600 + 간격).
+// - 기울임: 아래 변에 붙여 높이를 반으로 줄이고, 먼 끝을 높이의 0.567 만큼 왼쪽·오른쪽으로 민다.
+//   위쪽 종류는 위로, 아래쪽 종류는 아래로 뻗는다.
+// - 원근: 기울임과 같되 높이는 그대로이고 0.926 만큼 민다.
+// - 작게: 0.75 배를 왼쪽 위에 붙여 (−600, −600) 옮긴다. 크게: 1.25 배를 오른쪽 아래에 붙여 (−600, −600) 옮긴다.
+// 기울임·원근·작게·크게도 간격만큼 더 옮긴다. 그림자가 없으면 거짓이다.
+bool shadowPoint(int code, std::int32_t offsetX, std::int32_t offsetY, double w, double h, double& x, double& y);
+// 그림자가 도형 상자의 왼쪽·위로 나간 길이(0 이상). 한글은 개체 자리를 그림자까지 감싼 상자의 왼쪽 위로 보고
+// 도형을 이만큼 오른쪽·아래로 옮겨 그린다.
+void shadowLead(int code, std::int32_t offsetX, std::int32_t offsetY, double w, double h, std::int32_t& left,
+                std::int32_t& top);
+
+// 양식 개체(한글 입력 → 양식 개체). HWPX hp:btn·hp:checkBtn·hp:radioBtn·hp:comboBox·hp:edit, HWP 컨트롤 'form' 아래
+// 양식 레코드의 속성 글(CommonSet·CharShapeSet·ButtonSet·ComboBoxSet·EditSet). 이름은 HWPX 요소 이름이다.
+struct FormObject {
+    std::string type;  // btn, checkBtn, radioBtn, comboBox, edit, listBox, scrollBar
+    std::string name;  // PushButton1, CheckBox1 ...
+    std::string caption;
+    std::string groupName;
+    std::string command;
+    std::string foreColor = "#000000";
+    std::string backColor = "#F0F0F0";
+    bool tabStop = true;
+    int tabOrder = 0;
+    bool editable = true;
+    bool enabled = true;
+    int borderType = 0;  // 0 없음, 4 단추(돋움), 5 들어감
+    bool drawFrame = true;
+    bool printable = true;
+    std::uint32_t charShapeId = 0;
+    bool followContext = false;
+    bool autoSize = false;
+    bool wordWrap = false;
+    // 단추(선택 상자·라디오 단추): 0 해제, 1 선택, 2 회색.
+    int value = 0;
+    std::string radioGroupName;
+    bool triState = false;
+    int backStyle = 1;  // 0 TRANSPARENT, 1 OPAQUE
+    // 콤보 상자
+    int listBoxRows = 10;
+    int listBoxWidth = 0;
+    bool editEnable = true;
+    std::vector<std::pair<std::string, std::string>> items;  // (보이는 글, 값)
+    // 콤보·입력 상자 글
+    std::string text;
+    // 입력 상자
+    bool multiLine = false;
+    std::string passwordChar;
+    std::int32_t maxLength = 2147483647;
+    int scrollBars = 0;
+    int tabKeyBehavior = 0;
+    bool numOnly = false;
+    bool readOnly = false;
+    int alignText = 0;  // 0 LEFT, 1 CENTER, 2 RIGHT
+};
+
 struct Control {
     ControlKind kind = ControlKind::Unknown;
     std::string ctrlId;     // HWP 4글자 컨트롤 ID (HWPX 는 대응되는 ID 로 변환)
@@ -927,6 +1009,8 @@ struct Control {
     std::optional<TextArt> textArt;
     std::optional<OleInfo> ole;
     std::optional<VideoInfo> video;
+    ShapeShadow shadow;              // 그리기 개체 그림자
+    std::optional<FormObject> form;  // ControlKind::Form
     // HWPX 에서 우리가 풀지 않는 개체(차트 hp:switch, hp:video, hp:ole, hp:textart)의 원본 XML 과 딸린 묶음 항목
     // (Chart/chart1.xml 등). 저장할 때 위치·크기·묶음 id 만 고쳐 그대로 쓴다. 그리기는 binItemId(미리 보기)로 한다.
     std::string hwpxXml;

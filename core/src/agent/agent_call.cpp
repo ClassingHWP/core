@@ -921,6 +921,24 @@ Status callApply(Call& c) {
             s.message = "op " + std::to_string(i) + ": " + s.message;
             return s;
         }
+        // replacePicture 의 그림은 base64 나 file 이다. file 은 아래에서 셸이 읽는다.
+        if (op.kind == OpKind::Command && op.command == "replacePicture") {
+            for (auto it = op.args.begin(); it != op.args.end();) {
+                const std::string* text = std::get_if<std::string>(&it->second);
+                if (it->first == "base64" && text) {
+                    if (!decodeBase64(*text, op.image)) return bad("op " + std::to_string(i) + ": base64 를 풀지 못했습니다.");
+                    it = op.args.erase(it);
+                } else if (it->first == "file" && text) {
+                    if (!c.readFile) return bad("op " + std::to_string(i) + ": 이 셸은 file 을 읽지 못합니다. base64 로 주세요.");
+                    if (!c.readFile(*text, op.image)) {
+                        return bad("op " + std::to_string(i) + ": 그림 파일 " + *text + " 을 읽지 못했습니다.");
+                    }
+                    it = op.args.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         // insertPicture 의 file 은 셸이 읽는다(파일 읽기는 플랫폼 일이다).
         if (op.kind == OpKind::InsertPicture && op.image.empty()) {
             if (!c.readFile) return bad("op " + std::to_string(i) + ": 이 셸은 file 을 읽지 못합니다. base64 로 주세요.");

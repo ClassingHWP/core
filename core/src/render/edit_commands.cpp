@@ -66,7 +66,7 @@ bool isInlineObjectControl(const model::Control& ctrl) {
     return ctrl.placement && ctrl.placement->treatAsChar &&
            (ctrl.kind == ControlKind::Shape || ctrl.kind == ControlKind::Picture ||
             ctrl.kind == ControlKind::Table || ctrl.kind == ControlKind::Container ||
-            ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole);
+            ctrl.kind == ControlKind::Equation || ctrl.kind == ControlKind::Ole || ctrl.kind == ControlKind::Form);
 }
 
 // 각주·미주 번호와 덧말·글자 겹치기는 글자 한 칸이다. 앞뒤에 커서가 서고, 지우면 그 컨트롤이 빠진다.

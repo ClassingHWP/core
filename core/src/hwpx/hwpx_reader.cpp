@@ -533,6 +533,7 @@ private:
     Paragraph parseParagraph(const pugi::xml_node& p);
     void parseRun(const pugi::xml_node& run, Run& out);
     SubList parseSubList(const pugi::xml_node& subList);
+    Control parseForm(const pugi::xml_node& node, std::string_view name);
     Control parseSecPr(const pugi::xml_node& node);
     bool parseCtrl(const pugi::xml_node& node, Control& out);
     Control parseObject(const pugi::xml_node& node);
@@ -1347,6 +1348,12 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
                 markTrack(item);
                 out.items.push_back(std::move(item));
             }
+        } else if (name == "btn" || name == "checkBtn" || name == "radioBtn" || name == "comboBox" || name == "edit" ||
+                   name == "listBox" || name == "scrollBar") {
+            flush();
+            InlineItem item = InlineItem::makeControl(parseForm(c, name));
+            markTrack(item);
+            out.items.push_back(std::move(item));
         } else if (name == "dutmal") {
             flush();
             Control control;
@@ -1378,6 +1385,62 @@ void Parser::parseRun(const pugi::xml_node& run, Run& out) {
     flush();
 }
 
+// 양식 개체(hp:btn·hp:checkBtn·hp:radioBtn·hp:comboBox·hp:edit). 한글 2024 가 저장한 속성 이름 그대로다.
+Control Parser::parseForm(const pugi::xml_node& node, std::string_view name) {
+    Control c;
+    c.kind = ControlKind::Form;
+    c.ctrlId = "form";
+    c.placement = readPlacement(node);
+    FormObject f;
+    f.type = std::string(name);
+    f.name = str(node, "name");
+    f.caption = str(node, "caption");
+    f.groupName = str(node, "groupName");
+    f.command = str(node, "command");
+    if (const std::string v = str(node, "foreColor"); !v.empty()) f.foreColor = v;
+    if (const std::string v = str(node, "backColor"); !v.empty()) f.backColor = v;
+    f.tabStop = node.attribute("tabStop").as_int(1) != 0;
+    f.tabOrder = node.attribute("tabOrder").as_int(0);
+    f.editable = node.attribute("editable").as_int(1) != 0;
+    f.enabled = node.attribute("enabled").as_int(1) != 0;
+    f.borderType = node.attribute("borderTypeIDRef").as_int(0);
+    f.drawFrame = node.attribute("drawFrame").as_int(1) != 0;
+    f.printable = node.attribute("printable").as_int(1) != 0;
+    if (auto pr = child(node, "formCharPr")) {
+        f.charShapeId = u32(pr, "charPrIDRef");
+        f.followContext = pr.attribute("followContext").as_int(0) != 0;
+        f.autoSize = pr.attribute("autoSz").as_int(0) != 0;
+        f.wordWrap = pr.attribute("wordWrap").as_int(0) != 0;
+    }
+    const std::string value = str(node, "value");
+    f.value = value == "CHECKED" ? 1 : value == "INDETERMINATE" ? 2 : 0;
+    f.radioGroupName = str(node, "radioGroupName");
+    f.triState = node.attribute("triState").as_int(0) != 0;
+    f.backStyle = str(node, "backStyle") == "TRANSPARENT" ? 0 : 1;
+    f.listBoxRows = node.attribute("listBoxRows").as_int(10);
+    f.listBoxWidth = node.attribute("listBoxWidth").as_int(0);
+    f.editEnable = node.attribute("editEnable").as_int(1) != 0;
+    for (auto item : node.children()) {
+        if (is(item, "listItem")) f.items.emplace_back(str(item, "displayText"), str(item, "value"));
+    }
+    // 항목이 하나뿐이고 비어 있으면 한글이 새 콤보 상자에 넣는 빈 항목이다.
+    if (f.items.size() == 1 && f.items[0].first.empty() && f.items[0].second.empty()) f.items.clear();
+    if (f.type == "comboBox") f.text = str(node, "selectedValue");
+    if (auto text = child(node, "text")) f.text = collectText(text);
+    f.multiLine = node.attribute("multiLine").as_int(0) != 0;
+    f.passwordChar = str(node, "passwordChar");
+    f.maxLength = node.attribute("maxLength").as_int(2147483647);
+    const std::string bars = str(node, "scrollBars");
+    f.scrollBars = bars == "HORIZONTAL" ? 1 : bars == "VERTICAL" ? 2 : bars == "BOTH" ? 3 : 0;
+    f.tabKeyBehavior = str(node, "tabKeyBehavior") == "INSERT_TAB" ? 1 : 0;
+    f.numOnly = node.attribute("numOnly").as_int(0) != 0;
+    f.readOnly = node.attribute("readOnly").as_int(0) != 0;
+    const std::string align = str(node, "alignText");
+    f.alignText = align == "CENTER" ? 1 : align == "RIGHT" ? 2 : 0;
+    c.form = std::move(f);
+    return c;
+}
+
 SubList Parser::parseSubList(const pugi::xml_node& subList) {
     SubList out;
     if (const std::string align = str(subList, "vertAlign"); !align.empty()) out.vertAlign = align;
@@ -1387,6 +1450,8 @@ SubList Parser::parseSubList(const pugi::xml_node& subList) {
     }
     out.textWidth = u32(subList, "textWidth");
     out.textHeight = u32(subList, "textHeight");
+    out.linkId = u32(subList, "linkListIDRef");
+    out.linkNextId = u32(subList, "linkListNextIDRef");
     for (auto p : subList.children()) {
         if (is(p, "p")) out.paragraphs.push_back(parseParagraph(p));
     }
@@ -1721,13 +1786,6 @@ bool Parser::parseCtrl(const pugi::xml_node& node, Control& c) {
         c.ctrlId = name == "memo" ? "memo" : "tcmt";
         if (auto sub = child(node, "subList")) c.subLists.push_back(parseSubList(sub));
         if (c.subLists.empty()) c.text = collectText(node);
-    } else if (name == "button" || name == "radioButton" || name == "checkButton" || name == "comboBox" ||
-               name == "edit" || name == "listBox" || name == "scrollBar") {
-        c.kind = ControlKind::Unknown;
-        c.ctrlId = "form";
-        c.shapeType = std::string(name);
-        c.name = str(node, "name");
-        c.text = collectText(node);
     } else {
         c.kind = ControlKind::Unknown;
         c.ctrlId = std::string(name);
@@ -1742,6 +1800,8 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
     p.textWrap = str(node, "textWrap");
     if (const std::string flow = str(node, "textFlow"); !flow.empty()) p.textFlow = flow;
     p.numberingType = str(node, "numberingType");
+    p.locked = i32(node, "lock") != 0;
+    if (const std::string drop = str(node, "dropcapstyle"); !drop.empty() && drop != "None") p.dropCap = drop;
     std::uint32_t orgW = 0;
     std::uint32_t orgH = 0;
     if (auto org = child(node, "orgSz")) {
@@ -1753,6 +1813,7 @@ Placement Parser::readPlacement(const pugi::xml_node& node) {
     if (auto sz = child(node, "sz")) {
         p.width = u32(sz, "width");
         p.height = u32(sz, "height");
+        p.sizeProtect = i32(sz, "protect") != 0;
     }
     // curSz 가 0이면 배율 적용 전과 같다. 0이 아니어도 앞쪽 배율만 들어 있을 수 있다.
     bool widthIsCurrent = false;
@@ -1905,6 +1966,13 @@ Control Parser::parseObject(const pugi::xml_node& node) {
         int imageMode = -1;
         readFill(brush, c.fillColor, c.gradColor, c.gradAngle, imageId, imageMode);
         if (!imageId.empty()) c.binItemId = imageId;
+    }
+    if (auto shadow = child(node, "shadow")) {
+        c.shadow.type = shapeShadowName(shapeShadowCode(str(shadow, "type")));
+        if (const std::string color = str(shadow, "color"); !color.empty()) c.shadow.color = color;
+        c.shadow.offsetX = i32(shadow, "offsetX");
+        c.shadow.offsetY = i32(shadow, "offsetY");
+        c.shadow.alpha = u32(shadow, "alpha");
     }
     std::uint32_t orgW = 0;
     std::uint32_t orgH = 0;

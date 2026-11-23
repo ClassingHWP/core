@@ -200,6 +200,18 @@ view 의 `kind` 는 개체 갈래(`picture`·`shape`·`table`·`equation`)다. �
 묶음은 문서 차례로 첫 개체 자리에 놓이고 그 놓기 값을 받으며, 응답 `object` 가 새 묶음 이름이다(나머지 개체 이름은 당겨진다).
 같은 쪽 개체만 묶고, 글자처럼 취급한 개체·표·수식은 묶지 않는다. `{"op":"ungroupObject","object":"1:0:0"}` 는 묶음을 풀어
 안 개체를 그 자리에 꺼낸다.
+도형(그리기 개체)의 `shadow` 는 그림자 종류다: `NONE`, `PARELLEL_LEFTTOP`·`PARELLEL_RIGHTTOP`·`PARELLEL_LEFTBOTTOM`·
+`PARELLEL_RIGHTBOTTOM`(평행), `SHEAR_LEFTTOP`·`SHEAR_RIGHTTOP`(뒤)·`SHEAR_LEFTBOTTOM`·`SHEAR_RIGHTBOTTOM`(앞),
+`PERS_*`(원근), `SCALE_NARROW`(작게)·`SCALE_ENLARGE`(크게). 종류를 주면 한글 그림자 모양 목록처럼 간격이 0 이 된다.
+`shadowColor`(`"#RRGGBB"`), `shadowOffsetX`·`shadowOffsetY`(HU), `shadowAlpha`(0~255), `shadowMove`(`up`·`down`·`left`·`right`
+는 1mm 씩, `original` 은 간격 0)도 있다. 그림자가 왼쪽·위로 나가면 한글처럼 도형이 그만큼 오른쪽·아래에 그려진다.
+그림의 `pictureShadow` 는 한글 그림 효과 그림자 목록이다: `outer1`~`outer9`(바깥쪽: 오른쪽 아래·아래·왼쪽 아래·오른쪽·가운데·
+왼쪽·오른쪽 위·위·왼쪽 위), `inner1`~`inner9`(안쪽: 왼쪽 위·위·오른쪽 위·왼쪽·가운데·오른쪽·왼쪽 아래·아래·오른쪽 아래),
+`perspective1`~`perspective5`(원근감), `none`. 목록에 없는 그림자는 `custom` 으로 읽힌다. `pictureShadowColor`(`"#RRGGBB"`)는 그림자 색이다.
+글상자는 `textMarginLeft`·`textMarginRight`·`textMarginTop`·`textMarginBottom`(안쪽 여백 HU, 한글 목록: 없음 0·좁게 283·보통 567·넓게 1134),
+`textVertAlign`(`TOP`·`CENTER`·`BOTTOM`), `textHorzAlign`(`LEFT`·`CENTER`·`RIGHT`, 글상자 안 모든 문단), `textDirection`
+(0 가로쓰기, 1 세로쓰기 영문 눕힘, 2 세로쓰기 영문 세움)을 갖는다(한글 도형 탭 글상자 여백·글상자 정렬·글자 방향).
+`locked`(참거짓)는 개체 보호다. 보호한 개체는 편집기에서 눌러도 골라지지 않는다. `{"op":"unlockAllObjects"}` 는 문서의 모든 보호를 푼다.
 
 ### 글자처럼 취급(`treatAsChar: true`)
 
@@ -366,6 +378,14 @@ view 의 `kind` 는 개체 갈래(`picture`·`shape`·`table`·`equation`)다. �
 | `deleteObject` | `object` | 개체를 지운다(표면 칸 글까지) |
 | `groupObjects` | `objects`(개체 이름 둘 이상) | 띄운 그림·도형을 한 묶음으로(한글 개체 묶기). 응답 `object` 가 새 묶음이다 |
 | `ungroupObject` | `object` | 묶음을 풀어 안 개체를 그 자리에 꺼낸다(한글 개체 풀기) |
+| `unlockAllObjects` | | 문서의 모든 개체 보호를 푼다(한글 모든 보호 개체 해제하기) |
+| `dropCap` | `at`, `style`(`double`·`triple`·`margin`·`none`), `spacing`(HU, 기본 850) | 그 문단 첫 글자를 장식 글상자로 뺀다(한글 문단 첫 글자 장식). 상자 크기는 글자 크기 + 줄 간격 × (줄 수 − 1), 여백은 세 줄 크기를 왼쪽 여백에 둔다. `none` 은 장식을 풀어 글자를 되돌린다 |
+| `linkTextBox` | `objects`(글상자 둘: 앞, 뒤) | 앞 글상자에 넘치는 줄이 뒤 글상자 맨 위부터 이어진다(한글 글상자 연결). 글은 앞 글상자에 모이고 줄 간격까지 들어가는 줄만 그 상자에 남는다 |
+| `unlinkTextBox` | `object`(앞 글상자) | 다음 글상자 연결을 끊는다 |
+| `replacePicture` | `object`, `base64` 또는 `file` | 그림 바꾸기(한글 그림 바꾸기). 크기·자리·밝기·대비·효과·그림자는 그대로 두고 그림 파일만 바꾼다 |
+| `alignObjects` | `objects`, `mode` | 여러 개체 맞춤(한글 도형 탭 맞춤). **마지막 개체가 기준**이다. `mode`: `left`·`center`·`right`·`top`·`middle`·`bottom`(맞춤), `hspace`·`vspace`(양 끝을 두고 간격 같게, 셋 이상), `width`·`height`·`size`(크기 같게). 글자처럼 취급한 개체는 옮기지 않는다 |
+| `documentPassword` | `password`, `current` | 문서 암호(한글 문서 암호 설정·변경/해제). 5자 이상이고, 저장하면 HWP·HWPX 가 이 암호로 잠긴다. 이미 암호가 있으면 `current` 가 맞아야 하고, `password` 를 비우면 푼다 |
+| `insertForm` | `at`, `type`(`btn`·`checkBtn`·`comboBox`·`radioBtn`·`edit`) | 양식 개체를 글자처럼 넣는다(한글 입력 → 양식 개체). 이름(`CheckBox1` 등)과 글(`선택 상자1`)은 종류마다 번호를 매긴다 |
 
 `header` 등 쪽 탭 명령은 `{"op":"pageControl","control":"header",...}` 로도 부를 수 있다.
 값을 모르면 먼저 `view` 로 읽는다.

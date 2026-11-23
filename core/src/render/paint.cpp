@@ -1015,6 +1015,20 @@ std::int32_t objectInkBleed(const Node& node) {
             bleed = std::max(bleed, pointed ? width * 5 : width);
         }
     }
+    // 그리기 개체 그림자는 상자 밖으로 나간다. 네 모서리를 그림자 자리로 옮겨 가장 멀리 나간 길이를 더한다.
+    if (node.kind == NodeKind::Object && node.ext().obj().shadowType != 0) {
+        const ObjectExtra& obj = node.ext().obj();
+        const double corners[4][2] = {{0, 0}, {static_cast<double>(node.width), 0}, {0, static_cast<double>(node.height)},
+                                      {static_cast<double>(node.width), static_cast<double>(node.height)}};
+        double reach = 0;
+        for (const auto& c : corners) {
+            double x = c[0];
+            double y = c[1];
+            model::shadowPoint(obj.shadowType, obj.shadowX, obj.shadowY, node.width, node.height, x, y);
+            reach = std::max({reach, -x, -y, x - node.width, y - node.height});
+        }
+        bleed = std::max<std::int32_t>(bleed, static_cast<std::int32_t>(std::ceil(reach)) + bleed);
+    }
     for (const Node& child : node.children) {
         if (child.kind != NodeKind::Cell) continue;
         take(child.ext().borderLeft);
@@ -3025,6 +3039,24 @@ void computeNodeHuBounds(Node& node, std::int32_t ox, std::int32_t oy, bool inOb
         for (const auto& pt : node.ext().obj().points) {
             h = fnvMix64(h, static_cast<std::uint64_t>(pt.x));
             h = fnvMix64(h, static_cast<std::uint64_t>(pt.y));
+        }
+        // 그리기 개체 그림자와 양식 개체(값·글·이름)가 바뀌면 다시 그린다.
+        const ObjectExtra& look = node.ext().obj();
+        h = fnvMix64(h, static_cast<std::uint64_t>(look.shadowType));
+        h = fnvMixStr64(h, look.shadowColor);
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(look.shadowX)));
+        h = fnvMix64(h, static_cast<std::uint64_t>(static_cast<std::uint32_t>(look.shadowY)));
+        h = fnvMix64(h, static_cast<std::uint64_t>(look.shadowAlpha));
+        if (look.form) {
+            const model::FormObject& f = look.form->form;
+            h = fnvMix64(h, static_cast<std::uint64_t>(f.value) | (look.form->hint ? 0x100ULL : 0ULL));
+            h = fnvMixStr64(h, f.type);
+            h = fnvMixStr64(h, f.caption);
+            h = fnvMixStr64(h, f.text);
+            h = fnvMixStr64(h, f.name);
+            h = fnvMixStr64(h, f.backColor);
+            h = fnvMixStr64(h, f.foreColor);
+            for (const FormLook::Glyph& g : look.form->glyphs) h = fnvMix64(h, static_cast<std::uint64_t>(g.cp) ^ (static_cast<std::uint64_t>(g.x) << 21));
         }
 
         std::int32_t maxY = node.height;
@@ -5080,6 +5112,7 @@ CaretStatus caretStatus(const model::Document& doc, const std::vector<Node>& pag
     CaretStatus st;
     st.sectionCount = static_cast<int>(doc.sections.size());
     st.overwrite = overwrite();
+    st.formEditing = formEditing();
     // 블록이면 끄는 쪽 끝(focus)을 센다. 커서가 없으면 마지막으로 놓은 캐럿을 쓴다.
     const PointerCursor cur = pointerCursor();
     const PointerHold& hold = pointerHold();
@@ -7030,6 +7063,26 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
         drawPin(hold.pinStart);
         drawPin(hold.pinEnd);
     }
+    // 표 그리기·지우개로 끄는 동안 그을(지울) 선을 보인다. 더 길게 끈 방향으로 곧게 편다.
+    if (hold.tableLineDrag && hold.tableLinePage >= 0) {
+        if (const ViewPage* page = sheetOf(pages, hold.tableLinePage);
+            page && page->w > 0 && page->h > 0 && page->widthHu > 0 && page->heightHu > 0) {
+            const float sx = static_cast<float>(page->w) / static_cast<float>(page->widthHu);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(page->heightHu);
+            const float ox = static_cast<float>(page->x - scrollX);
+            const float oy = static_cast<float>(page->y - scrollY);
+            const bool across = std::abs(hold.tableLineX1 - hold.tableLineX0) >= std::abs(hold.tableLineY1 - hold.tableLineY0);
+            const std::int32_t x1 = across ? hold.tableLineX1 : hold.tableLineX0;
+            const std::int32_t y1 = across ? hold.tableLineY0 : hold.tableLineY1;
+            SkPaint pen;
+            pen.setAntiAlias(true);
+            pen.setStyle(SkPaint::kStroke_Style);
+            pen.setStrokeWidth(hold.tableTool == 2 ? 3.f : 1.5f);
+            pen.setColor(hold.tableTool == 2 ? SkColorSetARGB(160, 220, 60, 60) : SkColorSetARGB(255, 40, 90, 200));
+            canvas->drawLine(ox + static_cast<float>(hold.tableLineX0) * sx, oy + static_cast<float>(hold.tableLineY0) * sy,
+                             ox + static_cast<float>(x1) * sx, oy + static_cast<float>(y1) * sy, pen);
+        }
+    }
     // 표 칸 경계선을 끄는 동안 새 선 자리를 점선으로 보인다.
     if (hold.borderDrag != 0 && hold.borderPage >= 0) {
         if (const ViewPage* page = sheetOf(pages, hold.borderPage);
@@ -7192,7 +7245,43 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
         // 개체 회전(숨긴 한글 2024): 손잡이는 돌린 모양의 네 꼭짓점에 초록 점, 가운데에 표시를 둔다. 끄는 동안은
         // 개체와 손잡이를 그대로 두고 돌아갈 모양을 점선으로 보인다.
         double corners[4][2];
-        if (page && page->w > 0 && page->h > 0 && hold.rotateMode && objectCorners(hold, corners)) {
+        const Node* pointShape = hold.pointEdit ? hold.selectedObject : nullptr;
+        if (page && page->w > 0 && page->h > 0 && pointShape && pointShape->ext().obj().points.size() >= 2) {
+            // 다각형 편집(숨긴 한글 2024): 꼭짓점마다 파란 네모 손잡이. 끄는 동안은 옮긴 점으로 이은 모양을 점선으로 보인다.
+            const float sx = static_cast<float>(page->w) / static_cast<float>(hold.caretPageW);
+            const float sy = static_cast<float>(page->h) / static_cast<float>(std::max<std::int32_t>(hold.caretPageH, 1));
+            const auto screen = [&](double hx, double hy) {
+                return SkPoint::Make(static_cast<float>(page->x - scrollX) + static_cast<float>(hx) * sx,
+                                     static_cast<float>(page->y - scrollY) + static_cast<float>(hy) * sy);
+            };
+            const std::vector<model::ShapePoint>& pts = pointShape->ext().obj().points;
+            const auto at = [&](std::size_t i) {
+                if (hold.pointDrag == static_cast<int>(i)) return screen(hold.pointX, hold.pointY);
+                return screen(box.x + pts[i].x, box.y + pts[i].y);
+            };
+            if (hold.pointDrag >= 0) {
+                SkPathBuilder ghost;
+                for (std::size_t i = 0; i < pts.size(); ++i) {
+                    if (i == 0) ghost.moveTo(at(i));
+                    else ghost.lineTo(at(i));
+                }
+                SkPaint dotted;
+                dotted.setAntiAlias(true);
+                dotted.setStyle(SkPaint::kStroke_Style);
+                dotted.setStrokeWidth(1.f);
+                dotted.setColor(SkColorSetARGB(255, 80, 80, 80));
+                const SkScalar dashes[2] = {2.f, 2.f};
+                dotted.setPathEffect(SkDashPathEffect::Make(dashes, 0));
+                canvas->drawPath(ghost.detach(), dotted);
+            }
+            SkPaint blue;
+            blue.setColor(SkColorSetARGB(255, 74, 123, 216));
+            const float half = std::max(3.f, 3.5f * sx);
+            for (std::size_t i = 0; i < pts.size(); ++i) {
+                const SkPoint pt = at(i);
+                canvas->drawRect(SkRect::MakeLTRB(pt.x() - half, pt.y() - half, pt.x() + half, pt.y() + half), blue);
+            }
+        } else if (page && page->w > 0 && page->h > 0 && hold.rotateMode && objectCorners(hold, corners)) {
             const float sx = static_cast<float>(page->w) / static_cast<float>(hold.caretPageW);
             const float sy = static_cast<float>(page->h) / static_cast<float>(std::max<std::int32_t>(hold.caretPageH, 1));
             const auto screen = [&](double hx, double hy) {
@@ -7258,10 +7347,43 @@ void drawCaret(SkCanvas* canvas, skgpu::graphite::Recorder* recorder, const std:
             edge.setStyle(SkPaint::kStroke_Style);
             edge.setStrokeWidth(1.f);
             edge.setColor(SK_ColorBLACK);
-            const float rad = std::max(3.5f, 4.f * sx);
+            // 터치로 골랐으면 손가락으로 잡을 만큼 손잡이를 키운다(화면에서 같은 크기).
+            const float unit = static_cast<float>(dpr > 0 ? dpr : 1);
+            const float rad = hold.touchMode ? 6.f * unit : std::max(3.5f, 4.f * sx);
             for (const auto& pt : pts) {
                 canvas->drawCircle(pt[0], pt[1], rad, paint);
                 canvas->drawCircle(pt[0], pt[1], rad, edge);
+            }
+            // 터치 옮기기 아이콘: 가운데 동그라미에 상하좌우 화살표. 이 아이콘을 끌 때만 개체가 옮겨진다.
+            if (touchMovable(hold) && !hold.moving && hold.resizeHandle < 0) {
+                const float r = static_cast<float>(kTouchMoveIcon) * unit;
+                SkPaint disc;
+                disc.setAntiAlias(true);
+                disc.setColor(SkColorSetARGB(235, 255, 255, 255));
+                SkPaint ring;
+                ring.setAntiAlias(true);
+                ring.setStyle(SkPaint::kStroke_Style);
+                ring.setStrokeWidth(1.f * unit);
+                ring.setColor(SkColorSetARGB(255, 60, 110, 220));
+                canvas->drawCircle(xm, ym, r, disc);
+                canvas->drawCircle(xm, ym, r, ring);
+                SkPaint arrow;
+                arrow.setAntiAlias(true);
+                arrow.setStyle(SkPaint::kStroke_Style);
+                arrow.setStrokeWidth(1.75f * unit);
+                arrow.setStrokeCap(SkPaint::kRound_Cap);
+                arrow.setStrokeJoin(SkPaint::kRound_Join);
+                arrow.setColor(SkColorSetARGB(255, 60, 110, 220));
+                const float arm = r * 0.62f;
+                const float head = r * 0.24f;
+                canvas->drawLine(xm - arm, ym, xm + arm, ym, arrow);
+                canvas->drawLine(xm, ym - arm, xm, ym + arm, arrow);
+                SkPathBuilder heads;
+                heads.moveTo(xm - arm + head, ym - head).lineTo(xm - arm, ym).lineTo(xm - arm + head, ym + head);
+                heads.moveTo(xm + arm - head, ym - head).lineTo(xm + arm, ym).lineTo(xm + arm - head, ym + head);
+                heads.moveTo(xm - head, ym - arm + head).lineTo(xm, ym - arm).lineTo(xm + head, ym - arm + head);
+                heads.moveTo(xm - head, ym + arm - head).lineTo(xm, ym + arm).lineTo(xm + head, ym + arm - head);
+                canvas->drawPath(heads.detach(), arrow);
             }
         }
         // 여러 개체 고르기로 더한 개체에도 손잡이를 둔다. 끄는 동안은 끈 만큼 옮긴 자리에 테두리만 보인다.

@@ -200,6 +200,10 @@ class PageView {
     bool rulers() const { return rulers_; }
     int rulerPixels() const;
     bool inRuler(double x, double y) const;
+    // 화면 위에 떠서 문서를 덮는 막대(휴대폰 도구줄)의 높이(CSS 픽셀). 맨 위에서는 첫 쪽이 막대 아래에 오도록
+    // 그만큼 위를 비운다. 막대가 숨어도 자리는 그대로 두어 쪽이 움직이지 않는다.
+    void setTopSpace(int css);
+    int topSpacePixels() const;
     PageGridMode gridMode() const { return gridMode_; }
     int gridCols() const { return gridCols_; }
     int gridRows() const { return gridRows_; }
@@ -294,6 +298,7 @@ class PageView {
     int pageStepY_ = 0;
     bool rulers_ = false;
     int rulerPx_ = 0;
+    int topSpaceCss_ = 0;
     std::vector<PageSpec> specs_;
     std::vector<Sheet> sheets_;
     std::vector<RowBand> rows_;

@@ -254,6 +254,45 @@ struct PointerHold {
     // 그림이 아닌 개체(표·도형·글상자)의 크기 조절. 뗄 때 resizeObjectPending 이 켜지고 editResizeObject 가 반영한다.
     // 표는 그린 줄 높이·칸 폭(resizeRows·resizeCols)을 비율대로 늘린다.
     bool resizeObjectPending = false;
+    // 누름을 아래 일(글상자 연결 고르기·양식 누르기·점 끌기)이 맡았다. 뗄 때까지 다른 일은 하지 않는다.
+    bool specialPress = false;
+    // 글상자 연결 고르기(한글 LinkTextBox): 켜면 다음에 누른 글상자로 잇는다. 뗀 뒤 linkPending 이면 문서에 넣는다.
+    bool linkPick = false;
+    int linkFromStory = -1;
+    int linkFromParagraph = -1;
+    int linkFromItem = -1;
+    bool linkPending = false;
+    int linkToStory = -1;
+    int linkToParagraph = -1;
+    int linkToItem = -1;
+    // 양식 누르기(양식 편집 상태가 꺼졌을 때 선택 상자·라디오 단추).
+    bool formPressPending = false;
+    int formStory = -1;
+    int formParagraph = -1;
+    int formItem = -1;
+    // 표 그리기 펜(1)·표 지우개(2)(한글 표 디자인 탭). 켜 두면 표 안에서 끈 선으로 칸을 나누거나 선을 지운다.
+    // 끄는 동안 tableLineX0~Y1(쪽 좌표)이 선이고, 떼면 tableLinePending 이 켜진다. 표 자리·그린 줄 높이·칸 폭은 누를 때 적는다.
+    int tableTool = 0;
+    model::BorderSide tablePen{"SOLID", "#000000", 34};
+    bool tableLineDrag = false;
+    bool tableLinePending = false;
+    int tableLinePage = -1;
+    std::int32_t tableLineX0 = 0, tableLineY0 = 0, tableLineX1 = 0, tableLineY1 = 0;
+    std::int32_t tableOriginX = 0, tableOriginY = 0;
+    int tableStory = -1, tableParagraph = -1, tableItem = -1;
+    std::vector<std::int32_t> tableRows, tableCols;
+    // 점 편집(한글 다각형 편집): 고른 다각형·곡선의 꼭짓점을 끌어 옮긴다. pointDrag 는 끄는 점 번호다.
+    bool pointEdit = false;
+    int pointDrag = -1;
+    int pointPage = -1;
+    std::int32_t pointX = 0;  // 끄는 점의 쪽 자리
+    std::int32_t pointY = 0;
+    std::int32_t pointBoxX = 0;  // 끌기 시작할 때 개체 상자 자리(쪽 좌표)
+    std::int32_t pointBoxY = 0;
+    bool pointPending = false;
+    int pointStory = -1;
+    int pointParagraph = -1;
+    int pointItem = -1;
     // 개체 회전(한글 회전 단추의 개체 회전). 켜면 고른 개체의 손잡이를 끌어 가운데를 중심으로 돌린다. 뗄 때 돌린 각을 넣는다.
     bool rotateMode = false;
     bool rotateDragging = false;
@@ -314,6 +353,7 @@ struct PointerHold {
         std::int32_t height = 0;
     };
     std::vector<PickedObject> multiPicked;
+    bool touchMode = false;  // 마지막으로 누른 것이 터치·펜이다. 손잡이를 크게 그리고 옮기기 아이콘을 둔다
     bool shiftDown = false;  // 지금 누른 포인터가 Shift 와 함께인지(셸이 준 값)
     bool drawing = false;
     bool drawPending = false;
@@ -605,6 +645,25 @@ struct PlacedBox {
 bool placedObjectBox(const model::Document& doc, const std::vector<Node>& pages, int story, int paragraph, int item,
                      PlacedBox& out);
 // 개체 묶기·풀기(한글 Group·Ungroup). 자리는 글 묶음·문단·항목 순번이다.
+// object_extra_commands.cpp: 개체 보호 해제, 문단 첫 글자 장식, 글상자 연결, 양식 개체.
+EditResult unlockAllObjectsNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
+// 뗀 뒤 남은 포인터 일(글상자 연결, 양식 누르기, 점 옮기기)을 문서에 넣는다. 할 일이 없으면 handled 가 거짓이다.
+EditResult pointerExtrasNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight, std::string& why);
+EditResult dropCapNow(model::Document& doc, std::vector<Node>& pages, int style, std::int32_t spacing,
+                      bool useStoredLineHeight, std::string& why);
+EditResult linkTextBoxNow(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& from, const ObjectSpot& to,
+                          bool useStoredLineHeight, std::string& why);
+EditResult unlinkTextBoxNow(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                            bool useStoredLineHeight, std::string& why);
+EditResult insertFormNow(model::Document& doc, std::vector<Node>& pages, const std::string& type,
+                         bool useStoredLineHeight, std::string& why);
+EditResult pressFormNow(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot,
+                        bool useStoredLineHeight);
+EditResult tableLineNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight, std::string& why);
+EditResult alignObjectsNow(model::Document& doc, std::vector<Node>& pages, const std::vector<ObjectSpot>& spots,
+                           const std::string& mode, bool useStoredLineHeight, std::string& why);
+EditResult replacePictureNow(model::Document& doc, std::vector<Node>& pages, const ObjectSpot& spot, const Bytes& image,
+                             bool useStoredLineHeight, std::string& why);
 EditResult groupObjectsNow(model::Document& doc, std::vector<Node>& pages, std::vector<ObjectSpot> spots,
                            bool useStoredLineHeight, std::string& why);
 EditResult ungroupObjectNow(model::Document& doc, std::vector<Node>& pages, int story, int paragraph, int item,
@@ -612,6 +671,14 @@ EditResult ungroupObjectNow(model::Document& doc, std::vector<Node>& pages, int 
 EditResult rotateObjectNow(model::Document& doc, std::vector<Node>& pages, bool useStoredLineHeight);
 // 고른 개체의 네 꼭짓점(쪽 HU, 왼쪽 위부터 시계 방향). 돌리거나 기울인 개체는 돌린 모양의 꼭짓점이다.
 bool objectCorners(const PointerHold& hold, double out[4][2]);
+// 터치 손잡이 크기(CSS px). 손가락으로 잡는 반지름이고, 그리는 점은 이보다 작다.
+constexpr double kTouchHandleReach = 22.0;
+// 터치 옮기기 아이콘. 그리는 반지름과 잡는 반지름(CSS px)이다.
+constexpr double kTouchMoveIcon = 18.0;
+constexpr double kTouchMoveReach = 26.0;
+// 터치로 고른 개체에 옮기기 아이콘을 두는가, 그 아이콘 위인가.
+bool touchMovable(const PointerHold& hold);
+bool touchMoveIconAt(const PointerHold& hold, int page, int px, int py, double huPerLogical);
 // 지금 고른 개체들(첫 개체와 여러 개체 고르기). 고른 개체가 없으면 비어 있다.
 std::vector<ObjectSpot> selectedObjectSpots();
 bool reselectAnchoredObject(const model::Document& doc, const std::vector<Node>& pages, int page, int story,

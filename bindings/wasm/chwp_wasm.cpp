@@ -115,6 +115,7 @@ val packCaretStatus(const chwp::render::CaretStatus& st) {
     out.set("note", st.note);
     out.set("master", st.master);
     out.set("object", st.object);
+    out.set("formEditing", st.formEditing);
     out.set("overwrite", st.overwrite);
     return out;
 }
@@ -502,6 +503,7 @@ app::InputMessage parseInput(const val& msg) {
     m.rows = inputInt(msg, "rows", 1);
     if (defined(msg["fit"])) m.fit = msg["fit"].as<bool>();
     m.on = inputFlag(msg, "on");
+    m.keyboard = inputFlag(msg, "keyboard");
     return m;
 }
 
@@ -532,6 +534,13 @@ val packInput(const app::InputReport& report) {
     out.set("tapSlop", report.tapSlop);
     out.set("rulersWanted", report.rulersWanted);
     out.set("editButton", report.editButton);
+    out.set("mode", report.mode);
+    out.set("modeByInput", report.modeByInput);
+    out.set("editTapUntil", report.editTapUntil);
+    out.set("editTapX", report.editTapX);
+    out.set("editTapY", report.editTapY);
+    out.set("editTapReach", report.editTapReach);
+    out.set("topBarShown", report.topBarShown);
     out.set("scrollChanged", camera.scrollChanged);
     out.set("zoomChanged", camera.zoomChanged);
     out.set("coasting", camera.coasting);
@@ -693,6 +702,7 @@ void notifyCamera(const app::CameraNote& n) {
     note.set("dpr", n.dpr);
     note.set("ownsScroll", n.ownsScroll);
     note.set("settled", n.settled);
+    note.set("topBarShown", n.topBarShown);
     hook(note);
 }
 
@@ -829,6 +839,10 @@ val licenseFontSwaps() {
 val openDocument(const val& input) { return packOpen(app::openDocument(toBytes(input))); }
 val newDocument() { return packOpen(app::newDocument()); }
 val unlockDocument(const std::string& password) { return packOpen(app::unlockDocument(password)); }
+val editDocumentPassword(const std::string& current, const std::string& next, const std::string& confirm) {
+    return packEditReport(app::editDocumentPassword(current, next, confirm));
+}
+bool documentHasPassword() { return app::documentHasPassword(); }
 
 val viewApply(const val& msg) { return packView(app::applyView(parseViewPatch(msg))); }
 
@@ -991,6 +1005,7 @@ val editTable(const std::string& kind, bool after, int count, int rows, int cols
     return packEditReport(app::editTable(kind, after, count, rows, cols, border, color, lineType, lineWidth, lineColor));
 }
 val editInsertPicture(const val& input) { return packEditReport(app::editInsertPicture(toBytes(input))); }
+val editReplacePicture(const val& input) { return packEditReport(app::editReplacePicture(toBytes(input))); }
 val editPictureBullet(const val& input) { return packEditReport(app::editPictureBullet(toBytes(input))); }
 
 // chosenVal 은 셸에서 고른 {막힌 글꼴: 바꿀 글꼴}이다.
@@ -1240,6 +1255,8 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("memoryInUse", +[]() { return static_cast<double>(mallinfo().uordblks); });
     emscripten::function("openDocument", &openDocument);
     emscripten::function("unlockDocument", &unlockDocument);
+    emscripten::function("editDocumentPassword", &editDocumentPassword);
+    emscripten::function("documentHasPassword", &documentHasPassword);
     emscripten::function("newDocument", &newDocument);
     emscripten::function("setFontCatalog", &setFontCatalog);
     emscripten::function("setFontLicenseSwaps", &setFontLicenseSwaps);
@@ -1331,6 +1348,7 @@ EMSCRIPTEN_BINDINGS(chwp) {
     emscripten::function("editFindReplace", &editFindReplace);
     emscripten::function("setDrawTool", &chwp::render::setDrawTool);
     emscripten::function("editInsertPicture", &editInsertPicture);
+    emscripten::function("editReplacePicture", &editReplacePicture);
     emscripten::function("editPictureBullet", &editPictureBullet);
     emscripten::function("editRedo", &editRedo);
     emscripten::function("editStyle", &editStyle);

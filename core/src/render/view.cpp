@@ -235,8 +235,9 @@ void PageView::layout() {
     viewH_ = std::max(1, roundPositive(static_cast<double>(cssH_) * dpr_));
     // 눈금자는 뷰포트 위쪽과 왼쪽 띠다. 쪽은 그 띠를 뺀 자리에 맞추고, 다 놓은 뒤 띠만큼 민다.
     rulerPx_ = rulerPixels();
+    const int topPx = topSpacePixels();
     const int roomW = std::max(1, viewW_ - rulerPx_);
-    const int roomH = std::max(1, viewH_ - rulerPx_);
+    const int roomH = std::max(1, viewH_ - rulerPx_ - topPx);
     sheets_.clear();
     rows_.clear();
     if (!stacked_) {
@@ -561,6 +562,10 @@ void PageView::layout() {
         if (contentW_ > 0) contentW_ += rulerPx_;
         if (contentH_ > 0) contentH_ += rulerPx_;
     }
+    if (topPx > 0) {
+        for (Sheet& sheet : sheets_) sheet.y += topPx;
+        if (contentH_ > 0) contentH_ += topPx;
+    }
     maxScrollX_ = std::max(0, contentW_ - viewW_);
     maxScrollY_ = std::max(0, contentH_ - viewH_);
     scrollX_ = std::clamp(scrollX_, 0, maxScrollX_);
@@ -576,9 +581,11 @@ void PageView::reset() {
     for (const Tile& tile : tiles_) drops_.push_back(tile.id);
     std::vector<int> drops = std::move(drops_);
     const bool rulers = rulers_;
+    const int topSpace = topSpaceCss_;
     *this = PageView{};
     drops_ = std::move(drops);
     rulers_ = rulers;
+    topSpaceCss_ = topSpace;
 }
 
 void PageView::setViewport(int cssW, int cssH, double dpr) {
@@ -700,6 +707,25 @@ int PageView::rulerPixels() const {
     return rulers_ ? std::max(1, roundPositive(static_cast<double>(kRulerCss) * dpr_)) : 0;
 }
 
+int PageView::topSpacePixels() const {
+    return topSpaceCss_ > 0 ? roundPositive(static_cast<double>(topSpaceCss_) * dpr_) : 0;
+}
+
+void PageView::setTopSpace(int css) {
+    css = std::max(0, css);
+    if (topSpaceCss_ == css) return;
+    const int oldTop = topSpacePixels();
+    topSpaceCss_ = css;
+    layout();
+    // 맨 위가 아니면 빈 자리가 늘어난 만큼 스크롤을 옮겨 보던 자리가 그대로 남게 한다.
+    const int shift = topSpacePixels() - oldTop;
+    scrollY_ = std::clamp(scrollY_ + (scrollY_ > 0 ? shift : 0), 0, maxScrollY_);
+    lastScrollY_ = scrollY_;
+    zoomAnchorValid_ = false;
+    ++generation_;
+    inflight_ = {};
+}
+
 int PageView::fitWidthPercent() const {
     const int vW = std::max(1, roundPositive(static_cast<double>(cssW_) * dpr_) - rulerPixels());
     int cols = 1;
@@ -740,7 +766,7 @@ int PageView::fitWidthPercent() const {
 
 int PageView::fitPagePercent() const {
     const int vW = std::max(1, roundPositive(static_cast<double>(cssW_) * dpr_) - rulerPixels());
-    const int vH = std::max(1, roundPositive(static_cast<double>(cssH_) * dpr_) - rulerPixels());
+    const int vH = std::max(1, roundPositive(static_cast<double>(cssH_) * dpr_) - rulerPixels() - topSpacePixels());
     int cols = 1;
     int rows = 1;
     if (stacked_ && !specs_.empty()) {
